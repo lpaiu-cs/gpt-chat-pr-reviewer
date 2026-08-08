@@ -12,6 +12,8 @@ export interface ReviewResult {
   comments: ReviewComment[];
   /** ChatGPT 원본 응답 전문 */
   raw: string;
+  /** JSON 추출·파싱 성공 여부. false 면 게시해서는 안 된다. */
+  parsed: boolean;
 }
 
 export interface PRInfo {

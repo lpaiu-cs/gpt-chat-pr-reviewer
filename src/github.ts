@@ -105,8 +105,9 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
 
 /** PR 의 현재 상태 + 리뷰 스레드를 한 번의 GraphQL 호출로 가져온다. */
 export function fetchPRSyncData(owner: string, repo: string, number: number): PRSyncData {
+  // -F (대문자) 만 @- stdin 확장을 지원한다. -f 는 "@-" 를 문자열 그대로 보낸다.
   const raw = execSync(
-    `gh api graphql -F owner=${owner} -F name=${repo} -F num=${number} -f query=@-`,
+    `gh api graphql -F owner=${owner} -F name=${repo} -F num=${number} -F query=@-`,
     { encoding: 'utf-8', input: SYNC_QUERY, maxBuffer: 10 * 1024 * 1024 },
   );
   const pr = JSON.parse(raw).data.repository.pullRequest;

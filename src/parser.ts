@@ -11,18 +11,28 @@ export function parseGPTResponse(raw: string): ReviewResult {
   if (json) {
     try {
       const obj = JSON.parse(json);
-      return {
-        summary: String(obj.summary ?? '리뷰 요약 없음'),
-        approval: normalizeApproval(obj.approval),
-        comments: normalizeComments(obj.comments),
-        raw,
-      };
+      // summary/comments 중 하나도 없으면 리뷰 JSON 이 아니라고 본다
+      if (obj && (obj.summary !== undefined || obj.comments !== undefined)) {
+        return {
+          summary: String(obj.summary ?? '리뷰 요약 없음'),
+          approval: normalizeApproval(obj.approval),
+          comments: normalizeComments(obj.comments),
+          raw,
+          parsed: true,
+        };
+      }
     } catch {
-      /* JSON.parse 실패 — fallback */
+      /* JSON.parse 실패 */
     }
   }
 
-  return { summary: raw.slice(0, 3000), approval: 'comment', comments: [], raw };
+  // 파싱 실패 — 호출부가 게시를 거부해야 한다.
+  return { summary: raw.slice(0, 3000), approval: 'comment', comments: [], raw, parsed: false };
+}
+
+/** GPT 가 PR 접근 실패를 보고했는지 판별. */
+export function isAccessFailure(r: ReviewResult): boolean {
+  return r.parsed && r.summary.trim().toUpperCase().startsWith('ACCESS_FAILED');
 }
 
 // ── JSON 추출 ───────────────────────────────────────────────

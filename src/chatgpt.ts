@@ -69,23 +69,60 @@ export class ChatGPTDriver {
     await p.goto(this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   }
 
+  /**
+   * 실제 인증 여부를 판별한다.
+   *
+   * 주의: 로그아웃 상태의 chatgpt.com 도 입력창(#prompt-textarea)을 그대로 노출하므로
+   * DOM 요소 존재만으로는 판별할 수 없다. 앱 자신이 쓰는 세션 엔드포인트를 우선 확인하고,
+   * 실패 시 세션 쿠키 → 로그인 버튼 부재 순으로 폴백한다.
+   */
   async isLoggedIn(): Promise<boolean> {
     const p = this.requirePage();
+
+    // 1) 공식 세션 엔드포인트 — 로그인 시 { user: {...} }, 로그아웃 시 {}
     try {
-      await p.waitForSelector(this.cfg.selectors.loggedInIndicator, { timeout: 12_000 });
-      return true;
+      const authed = await p.evaluate(async () => {
+        const r = await fetch('/api/auth/session', { credentials: 'include' });
+        if (!r.ok) return null;
+        const j = await r.json().catch(() => null);
+        return !!(j && (j as any).user);
+      });
+      if (authed !== null) return authed;
     } catch {
-      return false;
+      /* 네비게이션 중 등 — 폴백 */
     }
+
+    // 2) 세션 쿠키
+    try {
+      const cookies = (await this.ctx?.cookies()) ?? [];
+      if (cookies.some((c) => c.name === '__Secure-next-auth.session-token' && c.value)) {
+        return true;
+      }
+    } catch {
+      /* 폴백 */
+    }
+
+    // 3) 로그인 버튼이 보이면 로그아웃 상태
+    const loginBtn = p.locator(
+      '[data-testid="login-button"], button:has-text("Log in"), button:has-text("로그인")',
+    );
+    return (await loginBtn.count()) === 0;
   }
 
   /** 사용자가 직접 로그인할 때까지 (최대 10분) 대기. */
   async waitForManualLogin(): Promise<void> {
-    const p = this.requirePage();
     console.log(chalk.yellow('\n  ⏳ ChatGPT에 로그인해주세요 (브라우저 창 확인).'));
     console.log(chalk.yellow('     로그인이 완료되면 자동으로 계속됩니다.\n'));
-    await p.waitForSelector(this.cfg.selectors.loggedInIndicator, { timeout: 600_000 });
-    console.log(chalk.green('  ✓ 로그인 확인!'));
+
+    const deadline = Date.now() + 600_000;
+    while (Date.now() < deadline) {
+      if (await this.isLoggedIn()) {
+        console.log(chalk.green('  ✓ 로그인 확인!'));
+        return;
+      }
+      await this.requirePage().waitForTimeout(3_000);
+    }
+    throw new Error('로그인 대기 시간 초과 (10분)');
   }
 
   // ── 대화 ──────────────────────────────────────────────────
@@ -144,13 +181,30 @@ export class ChatGPTDriver {
     return null;
   }
 
+  /** 입력창에 실제 텍스트가 들어갔는지 확인. */
+  private async inputHasText(page: Page): Promise<boolean> {
+    const t = await page
+      .locator(this.cfg.selectors.textInput)
+      .first()
+      .innerText()
+      .catch(() => '');
+    return t.trim().length > 0;
+  }
+
   /** ProseMirror contenteditable 에 텍스트를 삽입한다. */
   private async fillPrompt(page: Page, text: string): Promise<void> {
     const sel = this.cfg.selectors;
-    const input = page.locator(sel.textInput);
+    const input = page.locator(sel.textInput).first();
     await input.click();
+    await page.keyboard.press('Control+A');
+    await page.keyboard.press('Delete');
 
-    // 방법 1: 합성 paste 이벤트
+    // 방법 1: CDP insertText — contenteditable 에 가장 안정적이고 빠르다
+    await page.keyboard.insertText(text);
+    await page.waitForTimeout(200);
+    if (await this.inputHasText(page)) return;
+
+    // 방법 2: 합성 paste 이벤트
     const pasted = await page.evaluate(
       ({ selector, t }: { selector: string; t: string }) => {
         const el = document.querySelector(selector) as HTMLElement | null;
@@ -164,34 +218,48 @@ export class ChatGPTDriver {
       },
       { selector: sel.textInput, t: text },
     );
-
     if (pasted) {
       await page.waitForTimeout(300);
-      const content = await input.innerText().catch(() => '');
-      if (content.trim().length > 0) return; // 성공
+      if (await this.inputHasText(page)) return;
     }
 
-    // 방법 2: keyboard.type fallback
-    console.log(chalk.dim('  paste 실패 — keyboard.type 로 재시도'));
+    // 방법 3: keyboard.type
+    console.log(chalk.dim('  insertText·paste 실패 — keyboard.type 로 재시도'));
     await input.click();
-    await page.keyboard.press('Control+A');
-    await page.keyboard.type(text, { delay: 2 });
+    await page.keyboard.type(text, { delay: 1 });
+    if (!(await this.inputHasText(page))) {
+      throw new Error('프롬프트 입력 실패 — textInput 셀렉터를 확인하세요');
+    }
   }
 
   private async clickSend(page: Page): Promise<void> {
-    const sel = this.cfg.selectors;
     // 전송 버튼이 활성화될 때까지 잠시 대기
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(600);
 
-    const sendBtn = page.locator(sel.sendButton).first();
-    try {
-      await sendBtn.waitFor({ state: 'visible', timeout: 5_000 });
-      await sendBtn.click();
-    } catch {
-      // 버튼을 못 찾으면 Enter 로 대체
-      console.log(chalk.dim('  send 버튼 미발견 — Enter 로 전송'));
-      await page.keyboard.press('Enter');
+    // 설정된 셀렉터를 먼저, 그다음 알려진 후보들을 순서대로 시도
+    const candidates = [
+      this.cfg.selectors.sendButton,
+      '#composer-submit-button',
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label*="Send"]',
+      'button[aria-label*="보내기"]',
+    ];
+
+    for (const c of candidates) {
+      const btn = page.locator(c).first();
+      try {
+        if (await btn.isVisible({ timeout: 1_500 })) {
+          await btn.click();
+          return;
+        }
+      } catch {
+        /* 다음 후보 */
+      }
     }
+
+    console.log(chalk.dim('  send 버튼 미발견 — Enter 로 전송'));
+    await page.keyboard.press('Enter');
   }
 
   /**
@@ -213,6 +281,17 @@ export class ChatGPTDriver {
       throw new Error('ChatGPT 응답이 시작되지 않음 (60초 초과)');
     }
 
+    // 메시지 컨테이너 전체를 읽으면 "Edit"·복사 버튼 같은 UI 텍스트가 섞인다.
+    // 본문(.markdown)이 있으면 그쪽을 읽고, 없을 때만 컨테이너로 폴백한다.
+    const readLatest = async (): Promise<string> => {
+      const msg = page.locator(sel.assistantMessage).last();
+      const body = msg.locator(sel.messageContent).last();
+      if ((await body.count()) > 0) {
+        return body.innerText().catch(() => '');
+      }
+      return msg.innerText().catch(() => '');
+    };
+
     // 스트리밍이 끝날 때까지 폴링
     let lastText = '';
     let stable = 0;
@@ -220,11 +299,7 @@ export class ChatGPTDriver {
 
     while (stable < 3 && Date.now() - t0 < timeout) {
       await page.waitForTimeout(3_000);
-      const cur = await page
-        .locator(sel.assistantMessage)
-        .last()
-        .innerText()
-        .catch(() => '');
+      const cur = await readLatest();
 
       if (cur.length > 0 && cur === lastText) {
         stable++;

@@ -6,6 +6,7 @@
 
 import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/machine.js';
 import { createContext } from '../src/state/store.js';
+import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import type { PRInfo, PRState } from '../src/types.js';
 
 let passed = 0;
@@ -108,6 +109,25 @@ const fakePR: PRInfo = {
   assert(m.includes('stateDiagram-v2'), 'mermaid 다이어그램 생성');
   assert(m.includes('class AWAITING_AUTHOR current'), '현재 상태 강조 포함');
   assert(m.includes('REVIEWING --> QUOTA_BLOCKED: QUOTA_EXCEEDED'), '전이 테이블 반영');
+}
+
+// ── 시나리오 6: 파서 — 리뷰 아닌 응답 거부 ─────────────────
+
+{
+  const good = parseGPTResponse('```json\n{"summary":"ok","approval":"approve","comments":[]}\n```');
+  assert(good.parsed && good.approval === 'approve', '정상 JSON 파싱');
+
+  // 실제로 관측된 오작동: GPT 가 지침 문서를 다듬어 답한 경우
+  const prose = parseGPTResponse('코드 리뷰 지침\n\n[P1] 버그·보안\n원하시면 더 짧게 바꿀 수 있습니다.');
+  assert(!prose.parsed, '산문 응답은 parsed=false (게시 거부)');
+
+  // JSON 이지만 리뷰 스키마가 아닌 경우
+  const wrong = parseGPTResponse('```json\n{"title":"something"}\n```');
+  assert(!wrong.parsed, '리뷰 스키마가 아닌 JSON 은 parsed=false');
+
+  const denied = parseGPTResponse('{"summary":"ACCESS_FAILED","approval":"comment","comments":[]}');
+  assert(denied.parsed && isAccessFailure(denied), 'ACCESS_FAILED 감지');
+  assert(!isAccessFailure(good), '정상 응답은 ACCESS_FAILED 아님');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

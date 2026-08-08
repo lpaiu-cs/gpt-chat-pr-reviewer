@@ -8,7 +8,7 @@
  */
 
 import chalk from 'chalk';
-import type { AppConfig, PRContext } from './types.js';
+import type { AppConfig, PRContext, ReviewResult } from './types.js';
 import { fire } from './state/machine.js';
 import { saveContext } from './state/store.js';
 import {
@@ -17,7 +17,7 @@ import {
   type SyncThread,
 } from './github.js';
 import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
-import { parseGPTResponse } from './parser.js';
+import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub } from './poster.js';
 import { loadInstructions } from './instructions.js';
 
@@ -155,15 +155,56 @@ function buildPrompt(cfg: AppConfig, ctx: PRContext, round: number, instructions
     ].join('\n');
   }
 
+  // 지침은 "리뷰의 제약"임을 명시한다. 이 래핑이 없으면 GPT 가 지침 문서 자체를
+  // 주제로 착각해 리뷰 대신 지침을 다듬어 응답하는 경우가 있다.
+  const instructionBlock = instructions
+    ? [
+        '',
+        '## 리뷰 지침',
+        '아래 지침에 따라 리뷰하세요. 지침 자체를 요약·평가·개선하지 마세요.',
+        '',
+        instructions,
+      ].join('\n')
+    : '';
+
   return cfg.promptTemplate
-    .replace(/\{\{instructions\}\}/g, instructions ? `## 사용자 맞춤 지침\n${instructions}` : '')
+    .replace(/\{\{instructions\}\}/g, instructionBlock)
     .replace(/\{\{url\}\}/g, ctx.prUrl)
     .replace(/\{\{round\}\}/g, String(round))
-    .replace(/\{\{previous\}\}/g, previous)
+    .replace(/\{\{previous\}\}/g, previous ? `\n${previous}` : '')
     .replace(/\n{3,}/g, '\n\n'); // 빈 치환으로 생긴 과잉 공백 정리
 }
 
 // ── 리뷰 라운드 실행 ────────────────────────────────────────
+
+/** 응답이 리뷰로 인정되지 않아 게시를 거부했을 때. */
+export class ReviewRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReviewRejectedError';
+  }
+}
+
+/**
+ * 응답을 PR 에 게시해도 되는지 검증한다.
+ * 실패 시 원인을 출력하고 false 를 반환한다.
+ */
+function assertReviewable(result: ReviewResult): boolean {
+  if (!result.parsed) {
+    console.log(chalk.red('  ✗ 응답에서 리뷰 JSON 을 찾지 못했습니다 — 게시하지 않습니다.'));
+    console.log(chalk.dim('    GPT 가 리뷰 대신 다른 답변을 했을 가능성이 높습니다.'));
+    console.log(chalk.dim(`    원본 응답 앞부분: ${result.raw.slice(0, 200).replace(/\s+/g, ' ')}…`));
+    return false;
+  }
+  if (isAccessFailure(result)) {
+    console.log(chalk.red('  ✗ GPT 가 PR 에 접근하지 못했습니다 (ACCESS_FAILED).'));
+    console.log(
+      chalk.dim('    비공개 레포라면 ChatGPT 설정에서 GitHub 커넥터를 연결했는지 확인하세요.'),
+    );
+    return false;
+  }
+  return true;
+}
 
 export type RoundOutcome = 'posted' | 'clean' | 'quota' | 'failed' | 'dry';
 
@@ -194,6 +235,7 @@ export async function runRound(
     await driver.startNewChat();
     const raw = await driver.sendAndCollect(prompt);
     const result = parseGPTResponse(raw);
+    if (!assertReviewable(result)) return 'dry';
     console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
     await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, true);
     console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
@@ -208,6 +250,13 @@ export async function runRound(
     await driver.startNewChat();
     const raw = await driver.sendAndCollect(prompt);
     const result = parseGPTResponse(raw);
+
+    // 리뷰가 아닌 응답을 PR 에 게시하지 않는다.
+    if (!assertReviewable(result)) {
+      throw new ReviewRejectedError(
+        result.parsed ? 'GPT 가 PR 에 접근하지 못했습니다' : 'GPT 응답에서 리뷰 JSON 을 찾지 못했습니다',
+      );
+    }
     console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
 
     await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, false);
