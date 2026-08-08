@@ -232,14 +232,23 @@ export async function runRound(
 
   // ── dry-run: 상태 전이 없이 결과만 ──
   if (opts.dryRun) {
-    await driver.startNewChat();
-    const raw = await driver.sendAndCollect(prompt);
-    const result = parseGPTResponse(raw);
-    if (!assertReviewable(result)) return 'dry';
-    console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
-    await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, true);
-    console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
-    return 'dry';
+    try {
+      await driver.startNewChat();
+      const raw = await driver.sendAndCollect(prompt);
+      const result = parseGPTResponse(raw);
+      if (!assertReviewable(result)) return 'failed';
+      console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
+      await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, true);
+      console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
+      return 'dry';
+    } catch (e) {
+      if (e instanceof QuotaLimitError) {
+        console.log(chalk.yellow(`  ⚠ 쿼터 한도 — ${e.message}`));
+        return 'quota';
+      }
+      console.error(chalk.red('  ✗ 리뷰 실패:'), String(e).replace(/^Error:\s*/, '').slice(0, 300));
+      return 'failed';
+    }
   }
 
   // ── 실제 라운드 ──

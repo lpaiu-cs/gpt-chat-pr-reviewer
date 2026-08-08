@@ -218,14 +218,29 @@ program
   .option('--force', 'REVIEW_DUE 가 아니어도 강제로 라운드 실행', false)
   .option('--headless', '헤드리스 모드로 실행', false)
   .option('--instructions <file>', '이번 실행에만 사용할 지침 파일')
+  .option('--timeout <minutes>', '응답 대기 시간 (분)')
   .action(
     async (
       pr: string,
-      opts: { dryRun: boolean; force: boolean; headless: boolean; instructions?: string },
+      opts: {
+        dryRun: boolean;
+        force: boolean;
+        headless: boolean;
+        instructions?: string;
+        timeout?: string;
+      },
     ) => {
       banner();
       const cfg = loadConfig();
       if (opts.headless) cfg.headless = true;
+      if (opts.timeout) {
+        const min = Number(opts.timeout);
+        if (!Number.isFinite(min) || min <= 0) {
+          console.log(chalk.red(`  ✗ --timeout 값이 올바르지 않습니다: ${opts.timeout}\n`));
+          return;
+        }
+        cfg.responseTimeoutMs = min * 60_000;
+      }
       ensureDataDir(cfg);
 
       const ctx = loadOrCreateContext(cfg, pr);
@@ -498,5 +513,12 @@ program
   });
 
 // ── run ──
+
+// commander 의 async 액션에서 발생한 오류가 스택 트레이스로 노출되지 않도록 한다.
+process.on('unhandledRejection', (err) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(chalk.red('\n  ✗ 오류:'), msg, '\n');
+  process.exit(1);
+});
 
 program.parse();

@@ -17,6 +17,17 @@ export class QuotaLimitError extends Error {
   }
 }
 
+/** 스트림이 끊겼을 때 ChatGPT 가 표시하는 안내 문구. */
+const INTERRUPT_PATTERNS: RegExp[] = [
+  /connection interrupted/i,
+  /waiting for the complete answer/i,
+  /연결이 (중단|끊)/,
+  /완전한 (답변|응답)을 기다/,
+];
+
+/** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
+const MAX_RELOAD_RECOVERIES = 3;
+
 /** 화면 텍스트에서 쿼터/한도 안내를 감지하기 위한 패턴. */
 const QUOTA_PATTERNS: RegExp[] = [
   /reached (?:your|the)[^.]{0,40}limit/i,
@@ -340,36 +351,92 @@ export class ChatGPTDriver {
       return msg.innerText().catch(() => '');
     };
 
-    // 스트리밍이 끝날 때까지 폴링
     let lastText = '';
     let stable = 0;
+    let recoveries = 0;
+    let lastLogAt = Date.now();
     const t0 = Date.now();
 
-    while (stable < 3 && Date.now() - t0 < timeout) {
+    while (Date.now() - t0 < timeout) {
       await page.waitForTimeout(3_000);
-      const cur = await readLatest();
 
+      const cur = await readLatest();
       if (cur.length > 0 && cur === lastText) {
         stable++;
       } else {
         stable = 0;
         lastText = cur;
       }
+
+      const streaming = await this.isStreaming(page);
+
+      // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일
+      if (!streaming && lastText.trim().length > 0 && stable >= 3) {
+        console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
+        return lastText;
+      }
+
+      // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
+      // 대화를 새로고침하면 완성본을 가져올 수 있다.
+      if (!streaming && (await this.hasInterruptedBanner(page))) {
+        if (recoveries >= MAX_RELOAD_RECOVERIES) {
+          throw new Error(
+            `연결 중단이 반복됩니다 (${recoveries}회 복구 시도). 브라우저 창에서 상태를 확인하세요.`,
+          );
+        }
+        recoveries++;
+        console.log(
+          chalk.yellow(
+            `  ⚠ 연결 중단 감지 — 대화를 새로고침해 완성된 응답을 가져옵니다 (${recoveries}/${MAX_RELOAD_RECOVERIES})`,
+          ),
+        );
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+        await page.waitForTimeout(6_000);
+        stable = 0;
+        lastText = '';
+        continue;
+      }
+
+      // 진행 상황 — 멈춘 것처럼 보이지 않게 30초마다 출력
+      if (Date.now() - lastLogAt > 30_000) {
+        lastLogAt = Date.now();
+        const sec = Math.round((Date.now() - t0) / 1000);
+        const state = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
+        console.log(
+          chalk.dim(`    …${sec}초 경과 · ${state} · ${lastText.length.toLocaleString()}자`),
+        );
+      }
     }
 
-    if (lastText.trim().length === 0) {
-      // 빈 응답 — 쿼터 한도 가능성 확인
-      const quota = await this.detectQuotaLimit(page);
-      if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
-      throw new Error('ChatGPT 응답이 비어 있음');
-    }
-
-    if (stable < 3) {
+    // ── 타임아웃 ──
+    if (lastText.trim().length > 0) {
       console.log(chalk.yellow('  ⚠ 응답 타임아웃 — 현재까지 수신된 텍스트를 사용합니다.'));
-    } else {
-      console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
+      return lastText;
     }
 
-    return lastText;
+    const quota = await this.detectQuotaLimit(page);
+    if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
+    throw new Error(
+      `응답을 수신하지 못했습니다 (${Math.round(timeout / 60_000)}분 대기). ` +
+        '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
+    );
+  }
+
+  /** 생성 중지 버튼이 있으면 아직 스트리밍 중. */
+  private async isStreaming(page: Page): Promise<boolean> {
+    try {
+      return (await page.locator(this.cfg.selectors.stopButton).count()) > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** "Connection interrupted" 배너 감지. */
+  private async hasInterruptedBanner(page: Page): Promise<boolean> {
+    const body = await page
+      .locator('body')
+      .innerText()
+      .catch(() => '');
+    return INTERRUPT_PATTERNS.some((re) => re.test(body.slice(-4_000)));
   }
 }

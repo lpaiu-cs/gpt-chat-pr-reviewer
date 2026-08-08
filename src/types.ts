@@ -121,6 +121,8 @@ export interface ChatGPTSelectors {
   textInput: string;
   /** 전송 버튼 */
   sendButton: string;
+  /** 생성 중지 버튼 — 존재하면 아직 스트리밍 중이라는 신호 */
+  stopButton: string;
   /** 어시스턴트 메시지 컨테이너 */
   assistantMessage: string;
   /** 어시스턴트 메시지 안의 본문(마크다운) 영역 */

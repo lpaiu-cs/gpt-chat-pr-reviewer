@@ -8,6 +8,7 @@ const CONFIG_FILE = 'pr-review.config.json';
 const DEFAULT_SELECTORS: ChatGPTSelectors = {
   textInput: '#prompt-textarea',
   sendButton: 'button[data-testid="send-button"]',
+  stopButton: 'button[data-testid="stop-button"], button[aria-label*="Stop"]',
   assistantMessage: '[data-message-author-role="assistant"]',
   messageContent: '.markdown',
   newChatButton: 'a[data-discover="true"]',
@@ -66,7 +67,7 @@ const DEFAULT_CONFIG: AppConfig = {
   headless: false,
   browserChannel: 'chrome',
   chatgptUrl: 'https://chatgpt.com',
-  responseTimeoutMs: 300_000, // 5분
+  responseTimeoutMs: 900_000, // 15분 — 추론 모드 + 커넥터 탐색은 오래 걸린다
   selectors: DEFAULT_SELECTORS,
   promptTemplate: DEFAULT_PROMPT,
   customInstructionsFile: './instructions.md',
