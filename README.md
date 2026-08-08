@@ -71,7 +71,7 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
 - Node.js 20+
 - [`gh` CLI](https://cli.github.com/) — 인증 완료 상태 (`gh auth login`)
 - 데스크톱 Chrome
-- ChatGPT 계정
+- ChatGPT 계정 — **비공개 레포를 리뷰하려면 ChatGPT 설정에서 GitHub 커넥터를 연결**하세요. 연결하면 권한 있는 private 레포도 읽습니다.
 
 ## 설치
 
@@ -172,7 +172,7 @@ npm run build   # dist/ 생성
 
 - **ChatGPT UI 변경에 취약합니다.** 셀렉터가 깨지면 `pr-review.config.json`의 `selectors`에서 오버라이드하세요.
 - **CAPTCHA는 자동 우회하지 않습니다.** 발생 시 직접 해결해야 합니다. 헤드리스 모드는 봇 감지에 걸릴 확률이 높습니다.
-- **리뷰 품질은 GPT가 PR을 얼마나 잘 읽느냐에 달려 있습니다.** 비공개 레포는 GPT가 URL로 접근할 수 없으므로 이 방식이 동작하지 않습니다.
+- **리뷰 품질은 GPT가 PR을 얼마나 잘 읽느냐에 달려 있습니다.** 비공개 레포는 ChatGPT에 GitHub 커넥터가 연결되어 있어야 읽을 수 있습니다.
 - 라인 번호가 부정확한 경우 인라인 대신 리뷰 본문에 포함됩니다.
 
 ## 주의

@@ -4,3 +4,7 @@ data/
 browser-profile/
 *.tsbuildinfo
 .env
+
+# 사용자별 설정 — `pr-review init` 으로 생성됩니다
+pr-review.config.json
+instructions.md
