@@ -7,6 +7,8 @@
 import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/machine.js';
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
+import { resolveEvent } from '../src/poster.js';
+import { ghErrorMessage } from '../src/github.js';
 import type { PRInfo, PRState } from '../src/types.js';
 
 let passed = 0;
@@ -128,6 +130,41 @@ const fakePR: PRInfo = {
   const denied = parseGPTResponse('{"summary":"ACCESS_FAILED","approval":"comment","comments":[]}');
   assert(denied.parsed && isAccessFailure(denied), 'ACCESS_FAILED 감지');
   assert(!isAccessFailure(good), '정상 응답은 ACCESS_FAILED 아님');
+}
+
+// ── 시나리오 7: 셀프 리뷰 이벤트 하향 ──────────────────────
+
+{
+  // GitHub 은 본인 PR 에 APPROVE / REQUEST_CHANGES 를 허용하지 않는다 (422)
+  const selfChanges = resolveEvent('request_changes', true);
+  assert(selfChanges.event === 'COMMENT' && selfChanges.downgraded, '셀프: request_changes → COMMENT');
+
+  const selfApprove = resolveEvent('approve', true);
+  assert(selfApprove.event === 'COMMENT' && selfApprove.downgraded, '셀프: approve → COMMENT');
+
+  const selfComment = resolveEvent('comment', true);
+  assert(selfComment.event === 'COMMENT' && !selfComment.downgraded, '셀프: comment 는 그대로');
+
+  const otherChanges = resolveEvent('request_changes', false);
+  assert(
+    otherChanges.event === 'REQUEST_CHANGES' && !otherChanges.downgraded,
+    '타인 PR: request_changes 유지',
+  );
+  assert(resolveEvent('approve', false).event === 'APPROVE', '타인 PR: approve 유지');
+}
+
+// ── 시나리오 8: gh 오류 메시지 추출 ────────────────────────
+
+{
+  const e = Object.assign(new Error('Command failed: gh api ...\ngh: Unprocessable Entity'), {
+    stdout:
+      '{"message":"Unprocessable Entity","errors":["Review Can not request changes on your own pull request"],"status":"422"}',
+  });
+  const msg = ghErrorMessage(e);
+  assert(msg.includes('own pull request'), 'gh 오류에서 실제 사유 추출');
+  assert(!msg.includes('at genericNodeError'), '스택 트레이스 미포함');
+
+  assert(ghErrorMessage(new Error('plain failure')) === 'plain failure', '일반 Error 는 첫 줄');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

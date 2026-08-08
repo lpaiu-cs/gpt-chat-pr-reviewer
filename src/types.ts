@@ -97,6 +97,8 @@ export interface PRContext {
   repo: string;
   prNumber: number;
   title: string;
+  /** PR 작성자 — 셀프 리뷰 판별에 쓰인다 (구버전 컨텍스트에는 없을 수 있음) */
+  author?: string;
   state: PRState;
   /** 완료된 리뷰 라운드 수 */
   round: number;

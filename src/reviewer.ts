@@ -14,6 +14,7 @@ import { saveContext } from './state/store.js';
 import {
   fetchPRSyncData,
   getViewerLogin,
+  getPRInfo,
   type SyncThread,
 } from './github.js';
 import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
@@ -206,6 +207,21 @@ function assertReviewable(result: ReviewResult): boolean {
   return true;
 }
 
+/**
+ * PR 작성자 == 리뷰 계정 인지 판별한다.
+ * 구버전 컨텍스트에는 author 가 없으므로 필요 시 조회해 채운다.
+ */
+function resolveSelfReview(ctx: PRContext): boolean {
+  try {
+    if (!ctx.author) {
+      ctx.author = getPRInfo(ctx.owner, ctx.repo, ctx.prNumber).author;
+    }
+    return !!ctx.author && ctx.author === getViewerLogin();
+  } catch {
+    return false; // 판별 실패 시 원래 판정대로 시도하고, 거부되면 poster 가 폴백한다
+  }
+}
+
 export type RoundOutcome = 'posted' | 'clean' | 'quota' | 'failed' | 'dry';
 
 export interface RunRoundOptions {
@@ -238,7 +254,10 @@ export async function runRound(
       const result = parseGPTResponse(raw);
       if (!assertReviewable(result)) return 'failed';
       console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
-      await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, true);
+      await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
+        dryRun: true,
+        isSelfReview: resolveSelfReview(ctx),
+      });
       console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
       return 'dry';
     } catch (e) {
@@ -246,7 +265,8 @@ export async function runRound(
         console.log(chalk.yellow(`  ⚠ 쿼터 한도 — ${e.message}`));
         return 'quota';
       }
-      console.error(chalk.red('  ✗ 리뷰 실패:'), String(e).replace(/^Error:\s*/, '').slice(0, 300));
+      const msg = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 300);
+      console.error(chalk.red('  ✗ 리뷰 실패:'), msg);
       return 'failed';
     }
   }
@@ -268,7 +288,9 @@ export async function runRound(
     }
     console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
 
-    await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, false);
+    await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
+      isSelfReview: resolveSelfReview(ctx),
+    });
 
     // 게시 직후 head SHA · 새 스레드 동기화
     let headSha = ctx.headShaAtLastReview;
@@ -310,7 +332,7 @@ export async function runRound(
       return 'quota';
     }
 
-    const msg = String(e).slice(0, 300);
+    const msg = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 300);
     fire(ctx, 'REVIEW_FAILED', { note: msg, patch: { lastError: msg } });
     saveContext(cfg, ctx);
     console.error(chalk.red('  ✗ 리뷰 실패:'), msg);

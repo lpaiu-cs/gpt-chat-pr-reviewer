@@ -127,6 +127,31 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
   };
 }
 
+/**
+ * execSync 로 실행한 gh 명령의 오류에서 읽을 수 있는 메시지를 뽑는다.
+ * GitHub API 오류 본문(JSON)이 stdout 으로 오므로 그걸 우선 파싱한다.
+ */
+export function ghErrorMessage(e: unknown): string {
+  const err = e as { stdout?: unknown; message?: unknown };
+  const out = typeof err?.stdout === 'string' ? err.stdout : '';
+  try {
+    const j = JSON.parse(out);
+    const details = Array.isArray(j.errors)
+      ? j.errors
+          .map((x: unknown) =>
+            typeof x === 'string' ? x : ((x as { message?: string })?.message ?? JSON.stringify(x)),
+          )
+          .join('; ')
+      : '';
+    const msg = [j.message, details].filter(Boolean).join(' — ');
+    if (msg) return j.status ? `${msg} (HTTP ${j.status})` : msg;
+  } catch {
+    /* JSON 아님 — 아래로 */
+  }
+  const raw = e instanceof Error ? e.message : String(e);
+  return raw.split('\n').find((l) => l.trim()) ?? raw;
+}
+
 let viewerLoginCache: string | null = null;
 
 /** 현재 gh 인증 계정의 로그인 아이디 (캐시됨). */

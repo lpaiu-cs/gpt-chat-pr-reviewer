@@ -29,6 +29,7 @@ export function createContext(pr: PRInfo): PRContext {
     repo: pr.repo,
     prNumber: pr.number,
     title: pr.title,
+    author: pr.author,
     state: 'REVIEW_DUE',
     round: 0,
     requestedCount: 0,
