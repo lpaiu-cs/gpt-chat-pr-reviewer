@@ -219,6 +219,7 @@ program
   .option('--headless', '헤드리스 모드로 실행', false)
   .option('--instructions <file>', '이번 실행에만 사용할 지침 파일')
   .option('--timeout <minutes>', '응답 대기 시간 (분)')
+  .option('--from-cache', 'ChatGPT 재호출 없이 마지막 저장 응답으로 게시만 재시도', false)
   .action(
     async (
       pr: string,
@@ -226,6 +227,7 @@ program
         dryRun: boolean;
         force: boolean;
         headless: boolean;
+        fromCache: boolean;
         instructions?: string;
         timeout?: string;
       },
@@ -265,16 +267,26 @@ program
         }
       }
 
-      await withDriver(cfg, async (driver) => {
-        const outcome = await runRound(cfg, driver, ctx, {
-          dryRun: opts.dryRun,
-          instructionsFile: opts.instructions,
-        });
+      const roundOpts = {
+        dryRun: opts.dryRun,
+        instructionsFile: opts.instructions,
+        fromCache: opts.fromCache,
+      };
+      const reportState = (outcome: string) => {
         if (outcome !== 'dry') {
           console.log(`\n  현재 상태: ${stateBadge(ctx.state)}`);
           console.log(chalk.dim(`  다음 액션: ${NEXT_ACTION_HINTS[ctx.state]}`));
         }
-      });
+      };
+
+      if (opts.fromCache) {
+        // 캐시 재시도는 ChatGPT 를 쓰지 않으므로 브라우저를 띄우지 않는다.
+        reportState(await runRound(cfg, null, ctx, roundOpts));
+      } else {
+        await withDriver(cfg, async (driver) => {
+          reportState(await runRound(cfg, driver, ctx, roundOpts));
+        });
+      }
       console.log();
     },
   );

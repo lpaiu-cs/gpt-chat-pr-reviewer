@@ -21,6 +21,7 @@ import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub } from './poster.js';
 import { loadInstructions } from './instructions.js';
+import { saveResponse, loadLatestResponse } from './cache.js';
 
 // ── 스레드 동기화 ───────────────────────────────────────────
 
@@ -141,19 +142,35 @@ export function syncPR(cfg: AppConfig, ctx: PRContext): void {
 
 // ── 프롬프트 구성 ───────────────────────────────────────────
 
+/** 이전 라운드 현황에 실을 스레드 최대 개수. */
+const MAX_PREVIOUS_THREADS = 30;
+
 function buildPrompt(cfg: AppConfig, ctx: PRContext, round: number, instructions: string): string {
   let previous = '';
-  if (round > 1 && ctx.threads.length > 0) {
-    const lines = ctx.threads.map((t) => {
-      const status = t.isResolved ? '해결됨' : t.authorReplied ? '답변만 있음' : '미해결';
-      return `- [${status}] ${t.path}:${t.line ?? '?'} — ${t.snippet}`;
-    });
-    previous = [
-      '## 이전 라운드 코멘트 현황',
-      ...lines,
-      '',
-      '위 코멘트가 실제로 반영되었는지 확인하고, 미반영 항목은 다시 지적해주세요.',
-    ].join('\n');
+  if (round > 1) {
+    // 직전 라운드에서 우리가 남긴 것 + 아직 미해결로 남은 과거 항목만 싣는다.
+    // 전체를 싣으면 이전 리뷰 세션에서 넘어온 해결된 스레드까지 수십 개가 붙어
+    // 프롬프트가 비대해지고 초점이 흐려진다.
+    const relevant = ctx.threads.filter((t) => t.round === ctx.round || !t.isResolved);
+    const shown = relevant.slice(0, MAX_PREVIOUS_THREADS);
+
+    if (shown.length > 0) {
+      const lines = shown.map((t) => {
+        const status = t.isResolved ? '해결됨' : t.authorReplied ? '답변만 있음' : '미해결';
+        return `- [${status}] ${t.path}:${t.line ?? '?'} — ${t.snippet}`;
+      });
+      const omitted = relevant.length - shown.length;
+      previous = [
+        '## 이전 라운드 코멘트 현황',
+        ...lines,
+        ...(omitted > 0 ? [`- (그 외 ${omitted}건 생략)`] : []),
+        '',
+        '위 코멘트가 실제로 반영되었는지 확인하고, 미반영 항목은 다시 지적해주세요.',
+      ].join('\n');
+      if (omitted > 0) {
+        console.log(chalk.dim(`  이전 라운드 현황 ${relevant.length}건 중 ${shown.length}건만 프롬프트에 포함`));
+      }
+    }
   }
 
   // 지침은 "리뷰의 제약"임을 명시한다. 이 래핑이 없으면 GPT 가 지침 문서 자체를
@@ -227,15 +244,47 @@ export type RoundOutcome = 'posted' | 'clean' | 'quota' | 'failed' | 'dry';
 export interface RunRoundOptions {
   dryRun?: boolean;
   instructionsFile?: string;
+  /** ChatGPT 를 호출하지 않고 마지막 저장 응답을 재사용한다. */
+  fromCache?: boolean;
+}
+
+/**
+ * 리뷰 원본 응답을 확보한다.
+ * 새로 받은 응답은 즉시 저장해, 게시 실패 시 대화 한도를 다시 쓰지 않고
+ * --from-cache 로 재시도할 수 있게 한다.
+ */
+async function obtainRaw(
+  cfg: AppConfig,
+  driver: ChatGPTDriver | null,
+  ctx: PRContext,
+  prompt: string,
+  round: number,
+  fromCache: boolean,
+): Promise<string> {
+  if (fromCache) {
+    const hit = loadLatestResponse(cfg, ctx);
+    if (!hit) {
+      throw new Error('캐시된 응답이 없습니다. --from-cache 없이 먼저 리뷰를 실행하세요.');
+    }
+    console.log(chalk.dim(`  캐시 사용: ${hit.path}`));
+    return hit.raw;
+  }
+
+  if (!driver) throw new Error('브라우저 드라이버가 없습니다');
+  await driver.startNewChat();
+  const raw = await driver.sendAndCollect(prompt);
+  console.log(chalk.dim(`  응답 저장: ${saveResponse(cfg, ctx, round, raw)}`));
+  return raw;
 }
 
 /**
  * 리뷰 라운드 1회 실행. 컨텍스트는 REVIEW_DUE 상태여야 한다.
  * dry-run 은 상태를 전이시키지 않고 결과만 출력한다.
+ * fromCache 인 경우 driver 는 null 이어도 된다.
  */
 export async function runRound(
   cfg: AppConfig,
-  driver: ChatGPTDriver,
+  driver: ChatGPTDriver | null,
   ctx: PRContext,
   opts: RunRoundOptions = {},
 ): Promise<RoundOutcome> {
@@ -249,8 +298,7 @@ export async function runRound(
   // ── dry-run: 상태 전이 없이 결과만 ──
   if (opts.dryRun) {
     try {
-      await driver.startNewChat();
-      const raw = await driver.sendAndCollect(prompt);
+      const raw = await obtainRaw(cfg, driver, ctx, prompt, round, !!opts.fromCache);
       const result = parseGPTResponse(raw);
       if (!assertReviewable(result)) return 'failed';
       console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
@@ -276,8 +324,7 @@ export async function runRound(
   saveContext(cfg, ctx);
 
   try {
-    await driver.startNewChat();
-    const raw = await driver.sendAndCollect(prompt);
+    const raw = await obtainRaw(cfg, driver, ctx, prompt, round, !!opts.fromCache);
     const result = parseGPTResponse(raw);
 
     // 리뷰가 아닌 응답을 PR 에 게시하지 않는다.

@@ -120,13 +120,24 @@ npm run dev -- watch
 | 명령 | 설명 |
 |---|---|
 | `setup` | ChatGPT 최초 로그인 (브라우저 프로필 생성) |
+| `whoami` | 현재 프로필의 ChatGPT 로그인 상태 확인 |
 | `init` | 설정 파일 + 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 리뷰 지침 파일 열기 |
-| `review <pr>` | 리뷰 라운드 실행 — `--dry-run` `--force` `--headless` `--instructions <file>` |
+| `review <pr>` | 리뷰 라운드 실행 — `--dry-run` `--force` `--headless` `--timeout <분>` `--from-cache` `--instructions <file>` |
 | `watch` | 레포 폴링 → 동기화 → 자동 리뷰 — `--once` `--headless` `--dry-run` |
 | `status [pr]` | PR 상태 조회 — `--json` |
 | `graph [pr]` | 상태 머신 mermaid 다이어그램 출력 |
 | `rounds <pr>` | 리뷰 라운드 이력 |
+
+### 응답 캐시
+
+받은 응답은 `data/responses/`에 즉시 저장됩니다. 게시 단계에서 실패했을 때 (라인 불일치, 권한 오류 등) ChatGPT 대화 한도를 다시 쓰지 않고 게시만 재시도할 수 있습니다.
+
+```bash
+npm run dev -- review <pr-url> --from-cache
+```
+
+이 경우 브라우저를 아예 띄우지 않습니다.
 
 `review`는 상태를 존중합니다. `AWAITING_AUTHOR`인 PR에 실행하면 대기 중임을 알리고 종료하며, `--force`로만 강제 실행됩니다.
 

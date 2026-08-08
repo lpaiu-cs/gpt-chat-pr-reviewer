@@ -191,8 +191,9 @@ export class ChatGPTDriver {
     const p = this.requirePage();
     await p.goto(this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
-    // 기존 입력 잔여물 제거
-    await p.waitForTimeout(500);
+    // 새 대화 진입 시 뜨는 안내 모달을 닫고, 하이드레이션이 끝날 여유를 준다
+    await p.keyboard.press('Escape').catch(() => {});
+    await p.waitForTimeout(1_000);
   }
 
   /**
@@ -250,11 +251,50 @@ export class ChatGPTDriver {
     return t.trim().length > 0;
   }
 
-  /** ProseMirror contenteditable 에 텍스트를 삽입한다. */
-  private async fillPrompt(page: Page, text: string): Promise<void> {
+  /**
+   * 입력창에 포커스를 준다.
+   *
+   * 모달·오버레이·하이드레이션 지연으로 실제 클릭이 actionable 하지 않을 수 있으므로
+   * (관측: locator.click 30초 타임아웃) 클릭이 실패하면 JS 포커스로 대체한다.
+   */
+  private async focusInput(page: Page): Promise<void> {
     const sel = this.cfg.selectors;
     const input = page.locator(sel.textInput).first();
-    await input.click();
+    await input.waitFor({ state: 'visible', timeout: 20_000 });
+
+    try {
+      await input.click({ timeout: 10_000 });
+      return;
+    } catch {
+      console.log(chalk.dim('  입력창 클릭 실패 — 모달 해제 후 JS 포커스로 대체'));
+    }
+
+    // 떠 있는 모달·팝오버를 닫아본다
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(500);
+
+    try {
+      await input.click({ timeout: 5_000 });
+      return;
+    } catch {
+      /* JS 포커스로 진행 */
+    }
+
+    const focused = await page.evaluate((selector: string) => {
+      const el = document.querySelector(selector) as HTMLElement | null;
+      if (!el) return false;
+      el.focus();
+      return document.activeElement === el || el.contains(document.activeElement);
+    }, sel.textInput);
+
+    if (!focused) {
+      throw new Error('프롬프트 입력창에 포커스할 수 없습니다 — 브라우저 화면 상태를 확인하세요');
+    }
+  }
+
+  /** ProseMirror contenteditable 에 텍스트를 삽입한다. */
+  private async fillPrompt(page: Page, text: string): Promise<void> {
+    await this.focusInput(page);
     await page.keyboard.press('Control+A');
     await page.keyboard.press('Delete');
 
@@ -275,7 +315,7 @@ export class ChatGPTDriver {
           new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
         );
       },
-      { selector: sel.textInput, t: text },
+      { selector: this.cfg.selectors.textInput, t: text },
     );
     if (pasted) {
       await page.waitForTimeout(300);
@@ -284,7 +324,7 @@ export class ChatGPTDriver {
 
     // 방법 3: keyboard.type
     console.log(chalk.dim('  insertText·paste 실패 — keyboard.type 로 재시도'));
-    await input.click();
+    await this.focusInput(page);
     await page.keyboard.type(text, { delay: 1 });
     if (!(await this.inputHasText(page))) {
       throw new Error('프롬프트 입력 실패 — textInput 셀렉터를 확인하세요');
