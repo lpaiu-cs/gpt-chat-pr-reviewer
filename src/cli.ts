@@ -62,10 +62,12 @@ async function withDriver(
   try {
     await driver.launch();
     await driver.navigateToChatGPT();
-    if (!(await driver.isLoggedIn())) {
+    const user = await driver.getSessionUser();
+    if (!user) {
       console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
       return;
     }
+    console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
     await fn(driver);
   } finally {
     await driver.close();
@@ -136,8 +138,9 @@ program
     await driver.launch();
     await driver.navigateToChatGPT();
 
-    if (await driver.isLoggedIn()) {
-      console.log(chalk.green('  ✓ 이미 로그인되어 있습니다!'));
+    const existing = await driver.getSessionUser();
+    if (existing) {
+      console.log(chalk.green(`  ✓ 이미 로그인되어 있습니다 — ${existing.email ?? existing.name}`));
     } else {
       await driver.waitForManualLogin();
     }
@@ -145,6 +148,36 @@ program
     console.log(chalk.green('\n  ✓ 설정 완료 — 브라우저 프로필이 저장되었습니다.'));
     console.log(chalk.dim('    이후 review / watch 명령에서 자동으로 이 세션을 재사용합니다.\n'));
     await driver.close();
+  });
+
+// ── whoami ──
+
+program
+  .command('whoami')
+  .description('현재 브라우저 프로필의 ChatGPT 로그인 상태 확인')
+  .option('--headless', '헤드리스 모드로 확인', false)
+  .action(async (opts: { headless: boolean }) => {
+    banner();
+    const cfg = loadConfig();
+    if (opts.headless) cfg.headless = true;
+
+    const driver = new ChatGPTDriver(cfg);
+    try {
+      await driver.launch();
+      await driver.navigateToChatGPT();
+      const user = await driver.getSessionUser();
+
+      if (user) {
+        console.log(chalk.green(`  ✓ 로그인됨 — ${user.email ?? user.name}`));
+        console.log(chalk.dim('    review / watch 를 실행할 수 있습니다.\n'));
+      } else {
+        console.log(chalk.red('  ✗ 로그아웃 상태입니다 (익명 세션).'));
+        console.log(chalk.dim('    이 상태로는 비공개 레포를 읽을 수 없습니다.'));
+        console.log(chalk.dim('    `npm run dev -- setup` 으로 로그인하세요.\n'));
+      }
+    } finally {
+      await driver.close();
+    }
   });
 
 // ── init ──
@@ -255,11 +288,13 @@ program
     await driver.launch();
     await driver.navigateToChatGPT();
 
-    if (!(await driver.isLoggedIn())) {
+    const user = await driver.getSessionUser();
+    if (!user) {
       console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
       await driver.close();
       return;
     }
+    console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
 
     const loop = async () => {
       let quotaHit = false;

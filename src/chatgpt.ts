@@ -69,44 +69,74 @@ export class ChatGPTDriver {
     await p.goto(this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   }
 
+  /** 현재 페이지가 ChatGPT 오리진에 있는지. */
+  private isOnChatGPT(page: Page): boolean {
+    try {
+      const h = new URL(page.url()).hostname;
+      return h === 'chatgpt.com' || h.endsWith('.chatgpt.com') || h.endsWith('.openai.com');
+    } catch {
+      return false; // about:blank 등
+    }
+  }
+
+  /** ChatGPT 세션 쿠키 보유 여부 — 페이지 위치와 무관하게 판별 가능. */
+  private async hasSessionCookie(): Promise<boolean> {
+    try {
+      const cookies = (await this.ctx?.cookies()) ?? [];
+      return cookies.some(
+        (c) =>
+          c.name.includes('next-auth.session-token') &&
+          c.domain.includes('chatgpt.com') &&
+          !!c.value,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 로그인된 계정 정보를 반환한다 (로그아웃이면 null).
+   * ChatGPT 오리진에 있을 때만 조회 가능하다.
+   */
+  async getSessionUser(): Promise<{ email?: string; name?: string } | null> {
+    const p = this.requirePage();
+    if (!this.isOnChatGPT(p)) return null;
+    try {
+      return await p.evaluate(async () => {
+        const r = await fetch('/api/auth/session', { credentials: 'include' });
+        if (!r.ok) return null;
+        const j = (await r.json().catch(() => null)) as any;
+        if (!j?.user) return null;
+        return { email: j.user.email, name: j.user.name };
+      });
+    } catch {
+      return null; // 네비게이션 중 등
+    }
+  }
+
   /**
    * 실제 인증 여부를 판별한다.
    *
-   * 주의: 로그아웃 상태의 chatgpt.com 도 입력창(#prompt-textarea)을 그대로 노출하므로
-   * DOM 요소 존재만으로는 판별할 수 없다. 앱 자신이 쓰는 세션 엔드포인트를 우선 확인하고,
-   * 실패 시 세션 쿠키 → 로그인 버튼 부재 순으로 폴백한다.
+   * 주의 1: 로그아웃 상태의 chatgpt.com 도 입력창(#prompt-textarea)을 그대로 노출하므로
+   *         DOM 요소 존재만으로는 판별할 수 없다.
+   * 주의 2: OAuth 진행 중에는 accounts.google.com 등 외부 오리진에 있게 된다.
+   *         "ChatGPT 로그인 버튼이 안 보인다" 는 인증의 근거가 될 수 없다.
+   *         (이 휴리스틱 때문에 구글 로그인 화면에서 인증됨으로 오판한 적이 있다)
    */
   async isLoggedIn(): Promise<boolean> {
     const p = this.requirePage();
 
-    // 1) 공식 세션 엔드포인트 — 로그인 시 { user: {...} }, 로그아웃 시 {}
-    try {
-      const authed = await p.evaluate(async () => {
-        const r = await fetch('/api/auth/session', { credentials: 'include' });
-        if (!r.ok) return null;
-        const j = await r.json().catch(() => null);
-        return !!(j && (j as any).user);
-      });
-      if (authed !== null) return authed;
-    } catch {
-      /* 네비게이션 중 등 — 폴백 */
+    // ChatGPT 오리진에 있으면 세션 엔드포인트가 가장 정확하다.
+    if (this.isOnChatGPT(p)) {
+      const user = await this.getSessionUser();
+      if (user) return true;
+      // 엔드포인트가 응답했는데 user 가 없으면 로그아웃.
+      // 단, 차단·오류로 조회 자체가 실패했을 수 있어 쿠키로 한 번 더 확인한다.
+      return this.hasSessionCookie();
     }
 
-    // 2) 세션 쿠키
-    try {
-      const cookies = (await this.ctx?.cookies()) ?? [];
-      if (cookies.some((c) => c.name === '__Secure-next-auth.session-token' && c.value)) {
-        return true;
-      }
-    } catch {
-      /* 폴백 */
-    }
-
-    // 3) 로그인 버튼이 보이면 로그아웃 상태
-    const loginBtn = p.locator(
-      '[data-testid="login-button"], button:has-text("Log in"), button:has-text("로그인")',
-    );
-    return (await loginBtn.count()) === 0;
+    // 외부 오리진(OAuth 진행 중 등) — 쿠키로만 판단한다.
+    return this.hasSessionCookie();
   }
 
   /** 사용자가 직접 로그인할 때까지 (최대 10분) 대기. */
@@ -115,12 +145,30 @@ export class ChatGPTDriver {
     console.log(chalk.yellow('     로그인이 완료되면 자동으로 계속됩니다.\n'));
 
     const deadline = Date.now() + 600_000;
+    let notified = false;
+
     while (Date.now() < deadline) {
-      if (await this.isLoggedIn()) {
-        console.log(chalk.green('  ✓ 로그인 확인!'));
+      const p = this.requirePage();
+
+      // OAuth 등 외부 오리진에 있는 동안은 완료로 보지 않는다.
+      if (!this.isOnChatGPT(p)) {
+        if (!notified) {
+          console.log(chalk.dim(`     (${new URL(p.url()).hostname} 에서 인증 진행 중…)`));
+          notified = true;
+        }
+        await p.waitForTimeout(3_000);
+        continue;
+      }
+      notified = false;
+
+      const user = await this.getSessionUser();
+      if (user) {
+        const who = user.email ?? user.name ?? '계정 확인됨';
+        console.log(chalk.green(`  ✓ 로그인 확인 — ${who}`));
         return;
       }
-      await this.requirePage().waitForTimeout(3_000);
+
+      await p.waitForTimeout(3_000);
     }
     throw new Error('로그인 대기 시간 초과 (10분)');
   }
