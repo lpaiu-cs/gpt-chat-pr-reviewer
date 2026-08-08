@@ -1,0 +1,41 @@
+{
+  "name": "gpt-chat-pr-reviewer",
+  "version": "0.2.0",
+  "description": "ChatGPT 웹 대화창(chat)을 이용한 상태 머신 기반 GitHub PR 자동 리뷰",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lpaiu-cs/gpt-chat-pr-reviewer.git"
+  },
+  "keywords": [
+    "chatgpt",
+    "code-review",
+    "pull-request",
+    "playwright",
+    "state-machine"
+  ],
+  "type": "module",
+  "bin": {
+    "pr-review": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "setup": "tsx src/cli.ts setup",
+    "review": "tsx src/cli.ts review",
+    "watch": "tsx src/cli.ts watch",
+    "status": "tsx src/cli.ts status",
+    "smoke": "tsx scripts/smoke-machine.ts"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
