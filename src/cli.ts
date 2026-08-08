@@ -102,6 +102,13 @@ function stateBadge(state: PRState): string {
   }
 }
 
+/** ms 를 사람이 읽을 수 있는 간격 표기로 (초 단위 폴링도 표시 가능하게). */
+function formatDuration(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}초`;
+  const min = ms / 60_000;
+  return Number.isInteger(min) ? `${min}분` : `${min.toFixed(1)}분`;
+}
+
 /** OS 기본 편집기로 파일 열기 (실패해도 무시). */
 function openInEditor(file: string): void {
   try {
@@ -378,12 +385,35 @@ program
       return;
     }
 
-    const intervalMin = Math.round(cfg.watchIntervalMs / 60_000);
-    console.log(chalk.dim(`\n  ${intervalMin}분마다 재스캔합니다. Ctrl+C 로 종료.\n`));
-    const timer = setInterval(loop, cfg.watchIntervalMs);
+    // 사이클이 끝난 뒤에 다음 스캔을 예약한다.
+    //
+    // setInterval 은 리뷰 한 건이 폴링 간격보다 오래 걸릴 때 (실측 9~15분 vs 5분)
+    // 사이클을 겹치게 만들었다. 겹친 사이클들은 같은 PR 을 동시에 리뷰해 중복
+    // 리뷰를 게시하고, 브라우저 페이지 하나를 서로 다투다 전송·수신에도 실패했다.
+    let stopped = false;
+    let timer: NodeJS.Timeout | null = null;
+
+    const scheduleNext = (): void => {
+      if (stopped) return;
+      timer = setTimeout(async () => {
+        if (stopped) return;
+        try {
+          await loop();
+        } catch (e) {
+          console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
+        }
+        scheduleNext(); // 이번 사이클이 끝난 뒤에만 다음 예약
+      }, cfg.watchIntervalMs);
+    };
+
+    console.log(
+      chalk.dim(`\n  각 스캔 종료 후 ${formatDuration(cfg.watchIntervalMs)} 뒤 재스캔합니다. Ctrl+C 로 종료.\n`),
+    );
+    scheduleNext();
 
     const cleanup = async () => {
-      clearInterval(timer);
+      stopped = true;
+      if (timer) clearTimeout(timer);
       await driver.close();
       process.exit(0);
     };
