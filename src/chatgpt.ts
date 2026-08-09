@@ -59,6 +59,12 @@ const INTERRUPT_PATTERNS: RegExp[] = [
 /** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
 const MAX_RELOAD_RECOVERIES = 3;
 
+/** 응답이 시작도 안 한 채 조용할 때 한도를 다시 확인하는 주기. */
+const QUOTA_RECHECK_MS = 30_000;
+
+/** 전송 전, 진행 중인 생성이 끝나기를 기다리는 폴링 간격. */
+const IDLE_POLL_MS = 3_000;
+
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
 const SETTLE_STABLE_READS = 3;
 const SETTLE_POLL_MS = 500;
@@ -326,6 +332,13 @@ export class ChatGPTDriver {
     onSent?: (conversationUrl: string | null) => void,
   ): Promise<string> {
     const p = this.requirePage();
+
+    // ── 진행 중인 생성이 끝나기를 기다린다 ──
+    // 생성 중에 프롬프트를 넣으면 전송 버튼 자리가 **중지 버튼**이라 진행 중인
+    // 응답을 끊는다 (ChatGPT 가 중단 여부를 되묻는다). 우리 쪽에서 라운드를 실패로
+    // 접었어도 브라우저는 아직 답을 만들고 있을 수 있으므로 — 실제로 그렇게
+    // 사고가 났다 — 보내기 전에 반드시 확인한다.
+    await this.waitUntilIdle(p);
 
     // ── 기존 어시스턴트 메시지 수 기록 ──
     // 이어가는 대화에서는 지난 응답들이 순차적으로 렌더링되므로, 개수가 멎기 전에
@@ -601,17 +614,17 @@ export class ChatGPTDriver {
     const sel = this.cfg.selectors;
     const timeout = this.cfg.responseTimeoutMs;
 
-    // 새 어시스턴트 메시지가 나타날 때까지 대기
+    // 응답 시작을 **따로 기다리지 않는다.** 예전에는 여기서 60초 안에 어시스턴트
+    // 노드가 안 뜨면 실패로 던졌는데, 추론 모드는 첫 노드가 뜨기까지 몇 분이 걸린다
+    // ("Worked for 8m30s"). 정상 응답을 절단하고 라운드를 버린 뒤 같은 질문을 다시
+    // 보내게 되므로, 이 프로젝트에서 가장 비싼 실패 방향이다.
+    //
+    // 예산은 responseTimeoutMs 하나로 통일한다. 아래 루프가 노드가 없는 동안에도
+    // 빈 문자열을 읽으며 돌고, 완료 조건이 "내용이 있고 안정" 이라 조기 종료하지
+    // 않는다. 한도 감지는 루프 안에서 주기적으로 한다 (예전엔 60초 catch 에만
+    // 있어서, 그 시점을 넘기면 한도를 영영 못 봤다).
     progress.phase('waiting');
     console.log(chalk.dim('  응답 대기 중...'));
-    try {
-      await page.locator(sel.assistantMessage).nth(messageCountBefore).waitFor({ timeout: 60_000 });
-    } catch {
-      // 응답이 안 오는 이유가 쿼터 한도인지 먼저 확인
-      const quota = await this.detectQuotaLimit(page);
-      if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
-      throw new Error('ChatGPT 응답이 시작되지 않음 (60초 초과)');
-    }
 
     // **기다린 그 노드를 읽는다.** `.last()` 로 읽으면 안 된다 — 위에서 기다린 건
     // nth(messageCountBefore) 인데 DOM 에 다른 어시스턴트 노드가 섞이면 둘이
@@ -637,6 +650,7 @@ export class ChatGPTDriver {
     let stable = 0;
     let recoveries = 0;
     let lastLogAt = Date.now();
+    let lastQuotaCheckAt = Date.now();
     const t0 = Date.now();
 
     while (Date.now() - t0 < timeout) {
@@ -665,6 +679,15 @@ export class ChatGPTDriver {
 
       const streaming = await this.isStreaming(page);
       const phase = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
+
+      // 아직 아무것도 안 나왔고 생성 중도 아니면 한도에 막힌 것일 수 있다.
+      // 예전에는 이 검사가 "60초 시작 타임아웃" catch 에만 있어서, 그 시점을
+      // 넘기면 한도를 영영 못 보고 15분을 기다렸다.
+      if (!streaming && !lastText && Date.now() - lastQuotaCheckAt > QUOTA_RECHECK_MS) {
+        lastQuotaCheckAt = Date.now();
+        const quota = await this.detectQuotaLimit(page);
+        if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
+      }
 
       // 터미널은 30초마다 한 줄이지만 UI 는 폴링마다 갱신한다 — 이 구간이 2~15분
       // 이라 "멈춘 건지 도는 건지" 를 실시간으로 보여주는 게 관측의 핵심이다.
@@ -720,6 +743,30 @@ export class ChatGPTDriver {
       `응답을 수신하지 못했습니다 (${Math.round(timeout / 60_000)}분 대기). ` +
         '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
     );
+  }
+
+  /**
+   * 진행 중인 생성이 끝날 때까지 기다린다 (전송 직전 가드).
+   *
+   * 우리 라운드가 실패로 끝나도 브라우저의 생성은 계속된다. 그 위에 새 프롬프트를
+   * 넣으면 **남의 답을 끊는다** — 대화 한도를 쓰고 만든 답을 버리는 셈이라, 기다려서
+   * 라운드가 느려지는 것보다 훨씬 비싸다. 예산은 응답 대기와 같은 값을 쓴다.
+   */
+  private async waitUntilIdle(page: Page): Promise<void> {
+    if (!(await this.isStreaming(page))) return;
+
+    console.log(chalk.yellow('  ⚠ 이전 응답이 아직 생성 중입니다 — 끊지 않도록 기다립니다.'));
+    progress.phase('waiting');
+    const deadline = Date.now() + this.cfg.responseTimeoutMs;
+    while (await this.isStreaming(page)) {
+      if (Date.now() > deadline) {
+        throw new Error(
+          '이전 응답이 계속 생성 중이라 전송을 보류했습니다 — 끊지 않기 위해 라운드를 넘깁니다.',
+        );
+      }
+      await page.waitForTimeout(IDLE_POLL_MS);
+    }
+    console.log(chalk.dim('  이전 생성이 끝났습니다 — 전송을 계속합니다.'));
   }
 
   /** 생성 중지 버튼이 있으면 아직 스트리밍 중. */
