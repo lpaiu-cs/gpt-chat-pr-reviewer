@@ -326,6 +326,19 @@ const fakePR: PRInfo = {
   const p3 = planConversation(cfg, tracked, 3);
   assert(p3.action === 'resume', '상한 직전 라운드까지는 이어서 진행');
 
+  // 리뷰 지적 [P1]: dry-run 이 저장된 대화에 프롬프트를 끼워 넣으면, 라운드도 상태도
+  // 남지 않은 채 다음 실제 라운드가 같은 회차의 dry-run 응답이 섞인 대화를 물려받는다.
+  const pd = planConversation(cfg, tracked, 2, { dryRun: true });
+  assert(pd.action === 'new' && pd.reason === 'dry-run', 'dry-run 은 일회성 새 대화를 쓴다');
+  assert(
+    tracked.conversationUrl === CONV && tracked.conversationStartRound === 1,
+    'dry-run 계획은 저장된 대화 참조를 건드리지 않는다',
+  );
+  assert(
+    planConversation(cfg, tracked, 2).action === 'resume',
+    'dry-run 이후에도 실제 라운드는 그대로 복귀한다',
+  );
+
   // conversationStartRound 가 없는 구버전 컨텍스트도 안전하게 이어 쓴다
   const legacy = createContext(fakePR);
   legacy.conversationUrl = CONV;

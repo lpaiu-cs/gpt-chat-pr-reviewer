@@ -28,6 +28,11 @@ const INTERRUPT_PATTERNS: RegExp[] = [
 /** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
 const MAX_RELOAD_RECOVERIES = 3;
 
+/** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
+const SETTLE_STABLE_READS = 3;
+const SETTLE_POLL_MS = 500;
+const SETTLE_MAX_MS = 15_000;
+
 /** 대화를 열 수 없을 때 ChatGPT 가 본문에 표시하는 문구 (삭제·타 계정 등). */
 const CONVERSATION_GONE_PATTERNS: RegExp[] = [
   /unable to load (?:the )?conversation/i,
@@ -308,18 +313,31 @@ export class ChatGPTDriver {
 
   /**
    * 어시스턴트 메시지 개수가 더 늘지 않을 때까지 기다렸다가 그 값을 반환한다.
-   * 새 대화(0건)에서는 즉시 확정되므로 사실상 비용이 없다.
+   *
+   * 한 번 같았다고 끝내면 안 된다. 복귀가 느린 대화에서는 과거 응답 1건만 뜬 채로
+   * 잠시 멎었다가 나머지가 뒤늦게 붙는데, 그 사이에 개수를 확정하면 늦게 도착한
+   * **과거 응답을 새 응답의 시작으로 오인**한다. 연속으로 여러 번 같아야 확정한다.
+   * 새 대화(0건)에서도 판정은 거치지만 몇 초짜리라 라운드 시간에 비해 무시할 수준.
    */
   private async countSettledMessages(page: Page): Promise<number> {
     const loc = page.locator(this.cfg.selectors.assistantMessage);
+    const deadline = Date.now() + SETTLE_MAX_MS;
     let last = -1;
-    for (let i = 0; i < 12; i++) {
+    let stable = 0;
+
+    while (Date.now() < deadline) {
       const cur = await loc.count().catch(() => last);
-      if (cur === last) return cur;
+      stable = cur === last ? stable + 1 : 0;
       last = cur;
-      await page.waitForTimeout(500);
+      if (stable >= SETTLE_STABLE_READS) return cur;
+      await page.waitForTimeout(SETTLE_POLL_MS);
     }
-    return last; // 계속 늘어나는 중 — 마지막 관측값으로 진행
+
+    // 계속 늘어나는 중 — 마지막 관측값으로 진행하되 조용히 넘어가지는 않는다
+    console.log(
+      chalk.yellow(`  ⚠ 기존 메시지 수가 안정되지 않았습니다 — ${last}건 기준으로 진행합니다.`),
+    );
+    return last;
   }
 
   /** 화면 하단 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */

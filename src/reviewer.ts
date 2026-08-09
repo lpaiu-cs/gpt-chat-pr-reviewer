@@ -206,7 +206,7 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
  */
 export type ConversationPlan =
   | { action: 'resume'; url: string; roundsUsed: number }
-  | { action: 'new'; reason: 'first' | 'rotate'; roundsUsed: number };
+  | { action: 'new'; reason: 'first' | 'rotate' | 'dry-run'; roundsUsed: number };
 
 /**
  * 저장된 대화를 이어 쓸지, 새로 열지 결정한다 (순수 함수).
@@ -219,7 +219,14 @@ export function planConversation(
   cfg: AppConfig,
   ctx: PRContext,
   round: number,
+  opts: { dryRun?: boolean } = {},
 ): ConversationPlan {
+  // dry-run 은 부작용이 없어야 한다. 저장된 대화로 복귀하면 라운드도 상태도 남기지
+  // 않은 채 그 대화에 프롬프트만 끼워 넣게 되고, 다음 실제 라운드는 같은 회차의
+  // dry-run 응답이 이미 섞인 대화를 이어받는다. watch --dry-run 이면 사이클마다
+  // 쌓이는데 라운드 번호는 그대로라 회전 조건에도 걸리지 않는다.
+  if (opts.dryRun) return { action: 'new', reason: 'dry-run', roundsUsed: 0 };
+
   const url = ctx.conversationUrl;
   if (!url) return { action: 'new', reason: 'first', roundsUsed: 0 };
 
@@ -246,8 +253,9 @@ async function enterConversation(
   driver: ChatGPTDriver,
   ctx: PRContext,
   round: number,
+  opts: RunRoundOptions,
 ): Promise<boolean> {
-  const plan = planConversation(cfg, ctx, round);
+  const plan = planConversation(cfg, ctx, round, { dryRun: opts.dryRun });
 
   if (plan.action === 'resume') {
     if (await driver.resumeChat(plan.url)) {
@@ -264,6 +272,9 @@ async function enterConversation(
       chalk.dim(`  대화 누적 ${plan.roundsUsed}라운드 — 컨텍스트 한도를 피해 새 대화로 전환합니다.`),
     );
     releaseConversation(ctx);
+  } else if (plan.reason === 'dry-run') {
+    // 저장된 대화 참조는 그대로 둔다 — 건드리지 않는 것이 목적이다
+    console.log(chalk.dim('  dry-run — 저장된 대화 대신 일회성 새 대화에서 실행합니다.'));
   }
 
   await driver.startNewChat();
@@ -462,13 +473,14 @@ async function obtainRaw(
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
-  const continued = await enterConversation(cfg, driver, ctx, round);
+  const continued = await enterConversation(cfg, driver, ctx, round, opts);
   const raw = await driver.sendAndCollect(buildPrompt(cfg, ctx, round, instructions, continued));
 
-  rememberConversation(driver, ctx, round);
-  // 게시 도중 죽더라도 대화를 잃지 않게 URL 확보 즉시 저장한다.
-  // dry-run 은 "상태 변화 없음" 이 원칙이므로 저장하지 않는다.
-  if (!opts.dryRun) saveContext(cfg, ctx);
+  // dry-run 의 일회성 대화는 기록하지 않는다 — 다음 라운드가 물려받으면 안 된다.
+  if (!opts.dryRun) {
+    rememberConversation(driver, ctx, round);
+    saveContext(cfg, ctx); // 게시 도중 죽더라도 대화를 잃지 않게 확보 즉시 저장
+  }
 
   console.log(chalk.dim(`  응답 저장: ${saveResponse(cfg, ctx, round, raw)}`));
   return raw;
