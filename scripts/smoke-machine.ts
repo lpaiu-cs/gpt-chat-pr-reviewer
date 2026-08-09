@@ -26,7 +26,7 @@ import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
   globToRegExp,
-  invalidSkipEntries,
+  invalidPRRefs,
   matchesScope,
   nextRepoCache,
   passesFilters,
@@ -665,16 +665,50 @@ const fakePR: PRInfo = {
     'skip 제외 사유가 다른 조건에 가려지지 않는다',
   );
 
-  // 형식이 틀리면 아무것도 매치하지 않아 조용히 무효가 된다 — 시작 시 잡아야 한다.
-  assert(invalidSkipEntries({ skip: ['owner/repo#12'] }).length === 0, '정상 형식은 통과');
+  // ── only: 리뷰 대상 한정 (skip 의 반대) ──
+  const only = ['LPAIU-CS/OSK-System#12'];
+  assert(passesFilters(pr(), { only }).ok, 'only 목록의 PR 은 통과 (대소문자 무시)');
+  assert(!passesFilters(pr({ number: 13 }), { only }).ok, 'only 목록 밖은 제외');
+  assert(passesFilters(pr({ number: 13 }), { only: [] }).ok, '빈 only 는 제한하지 않는다');
+  assert(passesFilters(pr({ number: 13 }), {}).ok, 'only 가 없으면 제한하지 않는다');
   assert(
-    invalidSkipEntries({ skip: ['owner/repo', '#12', 'owner/repo#', 'owner#12'] }).length === 4,
+    passesFilters(pr({ number: 13 }), { only }).reason === 'only 목록 밖',
+    'only 제외 사유가 붙는다',
+  );
+
+  // skip 이 only 를 이긴다 — "확실히 하지 말 것" 이 "이것만 할 것" 보다 강하다.
+  assert(
+    !passesFilters(pr(), { only, skip }).ok &&
+      passesFilters(pr(), { only, skip }).reason === 'skip 목록',
+    '같은 PR 이 양쪽에 있으면 skip 이 이긴다',
+  );
+
+  // only 를 통과한 뒤에는 나머지 조건이 그대로 적용된다 (only 는 면제권이 아니다).
+  assert(
+    !passesFilters(pr({ isDraft: true }), { only }).ok,
+    'only 를 통과해도 draft 제외는 그대로 적용된다',
+  );
+  assert(
+    !passesFilters(pr({ number: 13 }), { only, authors: ['lpaiu-cs'] }).ok,
+    '작성자가 맞아도 only 밖이면 제외',
+  );
+
+  // 형식이 틀리면 아무것도 매치하지 않아 조용히 무효가 된다 — 시작 시 잡아야 한다.
+  // 결과는 정반대로 갈린다: skip 오타는 리뷰돼 버리고, only 오타는 전부 멈춘다.
+  assert(invalidPRRefs({ skip: ['owner/repo#12'] }).length === 0, '정상 형식은 통과');
+  assert(
+    invalidPRRefs({ skip: ['owner/repo', '#12', 'owner/repo#', 'owner#12'] }).length === 4,
     '번호·소유자가 빠진 항목은 형식 오류',
   );
-  assert(invalidSkipEntries(undefined).length === 0, 'skip 이 없으면 오류도 없다');
+  assert(invalidPRRefs(undefined).length === 0, 'skip 이 없으면 오류도 없다');
   assert(
-    invalidSkipEntries({ skip: [' owner/repo#12 '] }).length === 0,
+    invalidPRRefs({ skip: [' owner/repo#12 '] }).length === 0,
     '여백만 있는 차이는 오류가 아니다 (판정과 같은 기준)',
+  );
+  assert(invalidPRRefs({ only: ['owner/repo'] }).length === 1, 'only 도 형식을 검사한다');
+  assert(
+    invalidPRRefs({ skip: ['bad1'], only: ['bad2'] }).join(' ') === 'skip: "bad1" only: "bad2"',
+    '어느 목록의 어떤 항목이 틀렸는지 알려준다',
   );
 }
 

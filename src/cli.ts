@@ -31,7 +31,7 @@ import {
   admitsNewPR,
   createRepoSource,
   describeScope,
-  invalidSkipEntries,
+  invalidPRRefs,
   matchesScope,
   passesFilters,
   resolveWatchScope,
@@ -415,10 +415,10 @@ program
 
     // 형식이 틀린 skip 항목은 아무것도 매치하지 않아 조용히 무효가 된다.
     // 제외한 줄 알았던 PR 이 리뷰되면 되돌릴 수 없으므로 시작할 때 짚어준다.
-    const badSkip = invalidSkipEntries(scope.filters);
-    if (badSkip.length > 0) {
+    const badRefs = invalidPRRefs(scope.filters);
+    if (badRefs.length > 0) {
       console.log(
-        chalk.yellow(`  ⚠ filters.skip 형식 오류 ${badSkip.length}건 — 제외되지 않습니다: ${badSkip.join(', ')}`),
+        chalk.yellow(`  ⚠ filters 형식 오류 ${badRefs.length}건 — 무시됩니다: ${badRefs.join(', ')}`),
       );
       console.log(chalk.dim("    'owner/repo#12' 형식이어야 합니다."));
     }
