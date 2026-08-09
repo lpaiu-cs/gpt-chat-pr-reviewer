@@ -22,7 +22,14 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
-import { acquireLock, readLock, readLockPort, lockPort, LockHeldError } from '../src/lock.js';
+import {
+  acquireLock,
+  readLock,
+  readLockPort,
+  lockPort,
+  LockHeldError,
+  LockPortBusyError,
+} from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
@@ -1343,6 +1350,27 @@ const fakePR: PRInfo = {
   assert(readLock(fresh)?.port === pinned, '정해진 포트는 다음 실행에서도 그대로다');
   again2();
   rmSync(fresh, { recursive: true, force: true });
+
+  // 리뷰 지적 [P2]: `wx` 는 **생성**만 배타적이다. 진 쪽이 EEXIST 를 받고 읽었을 때
+  // 파일이 아직 비어 있을 수 있는데, 거기서 자기 후보로 진행하면 둘이 서로 다른
+  // 포트를 잡아 잠금이 분열한다. 빈 파일은 자기 후보로 대체하지 않고 거절해야 한다.
+  const broken = mkdtempSync(path.join(tmpdir(), 'pr-review-lock4-'));
+  writeFileSync(path.join(broken, 'lock.port'), '');
+  let refused = false;
+  try {
+    await acquireLock(broken, 'watch');
+  } catch (e) {
+    refused = e instanceof LockPortBusyError;
+  }
+  assert(refused, '빈 lock.port 는 자기 후보로 대체하지 않고 거절한다');
+
+  // 유효한 값이 있으면 후보 계산을 건너뛰고 **그 값**을 따른다 (승자 추종).
+  const followed = lockPort(broken, 7);
+  writeFileSync(path.join(broken, 'lock.port'), String(followed));
+  const follower = await acquireLock(broken, 'watch');
+  assert(readLock(broken)?.port === followed, '기록된 포트를 그대로 따른다');
+  follower();
+  rmSync(broken, { recursive: true, force: true });
 
   rmSync(dir, { recursive: true, force: true });
   rmSync(other, { recursive: true, force: true });

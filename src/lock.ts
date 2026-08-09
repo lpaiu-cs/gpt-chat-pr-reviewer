@@ -40,8 +40,10 @@
  * 그래서 걷는 일은 획득 경로에서 들어냈다:
  *
  *   1. **포트 선정** — `lock.port` 가 없을 때 딱 한 번. 시퀀스를 걸으며 실제로
- *      바인딩되는 포트를 찾아 `wx` 로 못 박는다. 동시에 정해도 진 쪽이 이긴 쪽의
- *      값을 다시 읽으므로 모두 같은 포트로 수렴한다.
+ *      바인딩되는 포트를 찾아 못 박는다. 동시에 정해도 진 쪽이 **이긴 쪽의 값**을
+ *      따르므로 모두 같은 포트로 수렴한다 (자기 후보로 진행하면 잠금이 둘이 된다).
+ *      게시는 임시 파일 + `link` 로 원자화한다 — `wx` 는 생성만 배타적이라 진 쪽이
+ *      아직 비어 있는 파일을 읽을 수 있다.
  *   2. **포트 획득** — 정해진 **한 포트에서만** 다툰다. 모호하면 그 자리에서
  *      재시도하고, 끝내 안 되면 **거절한다.** 옆으로 새지 않는다.
  *
@@ -52,8 +54,8 @@
  */
 
 import { createServer, connect, type Server, type Socket } from 'node:net';
-import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, linkSync } from 'node:fs';
 import path from 'node:path';
 
 export interface LockInfo {
@@ -124,6 +126,9 @@ const RETRY_MS = 100;
 const PROBE_TIMEOUT_MS = 1_000;
 /** 인사말만 받고 안 끊는 접속자를 정리한다 (잠금 소켓은 서비스가 아니다). */
 const GREET_IDLE_MS = 5_000;
+/** 승자가 쓴 포트 값이 보일 때까지 기다리는 시간. 안 보이면 거절한다. */
+const PORTFILE_READ_ATTEMPTS = 20;
+const PORTFILE_READ_MS = 50;
 
 function greeting(dataDir: string, info: LockInfo): string {
   return [MAGIC, dirKey(dataDir).toString('hex'), JSON.stringify(info)].join(' ') + NEWLINE;
@@ -210,10 +215,61 @@ async function canBind(port: number): Promise<boolean> {
 }
 
 /**
- * 이 dataDir 이 쓸 포트를 **한 번만** 정해 `lock.port` 에 못 박는다.
+ * 정해진 포트를 게시한다. 이미 정해져 있으면 **그 값**을 돌려준다.
  *
- * 여럿이 동시에 정해도 `wx` 가 하나만 통과시키고 진 쪽은 이긴 값을 다시 읽으므로
- * 모두 같은 포트로 수렴한다. 이후 실행은 걷지 않고 이 파일만 읽는다.
+ * `wx` 만으로는 부족하다. 배타적인 건 **생성**뿐이고 내용 쓰기는 그 뒤에 따로 일어나,
+ * 진 쪽이 `EEXIST` 를 받고 읽었을 때 파일이 아직 비어 있을 수 있다. 그때 자기 후보로
+ * 진행하면 둘이 서로 다른 포트를 잡아 **잠금이 분열한다** — 이 잠금이 막으려던 바로
+ * 그 사고다. 쓰다 죽어 남은 빈 파일도 같은 분기를 탄다.
+ *
+ * 그래서 내용을 임시 파일에 **먼저 완성**한 뒤 `link` 로 원자적으로 게시한다.
+ * `link` 는 대상이 있으면 실패하므로 배타성과 완전성을 한 번에 준다. 하드링크를
+ * 못 쓰는 파일시스템에서만 `wx` 로 물러서고, 어느 경로든 마지막은 같다:
+ * **유효한 값이 보일 때까지 기다렸다 그 값을 따른다. 없으면 거절한다.**
+ */
+async function publishPort(dataDir: string, port: number): Promise<number> {
+  const target = portFile(dataDir);
+  const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}`;
+  try {
+    writeFileSync(tmp, String(port), 'utf-8');
+    try {
+      linkSync(tmp, target);
+      return port;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+        // 하드링크를 못 쓰는 파일시스템 — 배타 생성으로 물러선다. 이 경로만
+        // 내용 게시가 원자적이지 않으므로, 읽는 쪽의 대기가 그 틈을 덮는다.
+        try {
+          writeFileSync(target, String(port), { encoding: 'utf-8', flag: 'wx' });
+          return port;
+        } catch {
+          /* 남이 먼저 만들었다 — 아래에서 그 값을 기다린다 */
+        }
+      }
+    }
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* 임시 파일이 남아도 다음 실행이 새 이름을 쓴다 */
+    }
+  }
+
+  // 남이 먼저 정했다 — **그 값**을 따라야 한다. 자기 후보로 진행하면 잠금이 둘이 된다.
+  for (let i = 0; i < PORTFILE_READ_ATTEMPTS; i++) {
+    const settled = readLockPort(dataDir);
+    if (settled !== null) return settled;
+    await new Promise((r) => setTimeout(r, PORTFILE_READ_MS));
+  }
+  throw new LockPortBusyError(
+    [port],
+    `${target} 가 비었거나 깨졌습니다 (쓰다 만 잔여물일 수 있습니다). 지우고 다시 실행하세요.`,
+  );
+}
+
+/**
+ * 이 dataDir 이 쓸 포트를 **한 번만** 정해 `lock.port` 에 못 박는다.
+ * 이후 실행은 걷지 않고 이 파일만 읽는다.
  */
 async function resolvePort(dataDir: string): Promise<number> {
   const recorded = readLockPort(dataDir);
@@ -224,13 +280,7 @@ async function resolvePort(dataDir: string): Promise<number> {
     const port = lockPort(dataDir, i);
     walked.push(port);
     if (!(await canBind(port))) continue;
-    try {
-      writeFileSync(portFile(dataDir), String(port), { encoding: 'utf-8', flag: 'wx' });
-      return port;
-    } catch {
-      // 남이 먼저 정했다 — 그 값을 따른다. 각자 다른 포트를 쓰면 잠금이 분열한다.
-      return readLockPort(dataDir) ?? port;
-    }
+    return publishPort(dataDir, port);
   }
   throw new LockPortBusyError(
     walked,
