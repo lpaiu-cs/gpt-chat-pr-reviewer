@@ -647,10 +647,13 @@ program
       if (!progress.enabled) return;
       progress.patch({
         queue: queue.map(toItem),
-        contexts: seen
-          .filter((c) => c.state !== 'CLOSED')
-          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-          .map(toCard),
+        // CLOSED 를 걸러내지 않는다. seen 은 이번 스캔이 손댄 것만 담는데,
+        // CLOSED 컨텍스트는 PR_CLOSED 가 발화된 **그 한 번의 스캔**에서만 들어온다
+        // (이후로는 tracked·lingering 이 둘 다 CLOSED 를 제외한다). 여기서 지우면
+        // 소비자 입장에서는 카드가 조용히 사라질 뿐 종료를 관측할 방법이 없어져
+        // notify 의 closed 이벤트가 영영 발생하지 않는다. 누적 걱정은 없다 —
+        // 다음 스캔의 seen 에는 이미 없다.
+        contexts: seen.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(toCard),
         quotaUntil: quotaAt > Date.now() ? quotaAt : null,
       });
       progress.cycle({ openCount, watchedRepos });

@@ -44,7 +44,8 @@ if (flag('--help') || flag('-h')) {
     --exec <command>  이벤트 발생 시 실행할 셸 명령
     --porcelain       이벤트 1건 = 1줄, 장식 없음 (에이전트·스크립트가 소비할 때)
     --no-bell         터미널 벨 끄기
-    --quiet           진행 단계는 찍지 않고 주요 이벤트만
+    --quiet           진행 단계는 **화면에** 찍지 않고 주요 이벤트만
+                      (--exec 실행 대상은 --on 이 정한다 — quiet 는 관여하지 않는다)
 
   이벤트
     round-start   라운드 시작
@@ -184,20 +185,25 @@ function runExec(event, ctx) {
 }
 
 function emit(event, ctx, detail = '') {
-  // 필터가 가장 먼저다 — 남의 PR 이면 exec 도 돌지 않아야 한다.
+  // 필터가 가장 먼저다 — 남의 PR 이면 출력도 exec 도 없어야 한다.
   if (!matchesFilter(ctx.key)) return;
-  if (QUIET && !LOUD.has(event)) return;
 
-  if (PORCELAIN) {
-    console.log([event, ctx.key, detail, ctx.url ?? ''].filter(Boolean).join('  '));
-  } else {
-    const [color, label] = EVENT_STYLE[event] ?? [C.dim, event];
-    const bell = BELL && LOUD.has(event) ? '\x07' : '';
-    say(
-      `${bell}${color(C.bold(label.padEnd(7)))} ${C.bold(ctx.key)}${detail ? '  ' + C.dim(detail) : ''}`,
-    );
-    if (ctx.url) say(C.dim(`         ${ctx.url}`));
+  // --quiet 는 **화면만** 줄인다. --on 으로 명시한 핸들러까지 막으면
+  // `--quiet --on round-start --exec ...` 가 조용히 아무것도 안 하게 된다 —
+  // 둘은 목적이 다른 옵션이고, 여기서 겹치면 사용자가 요청한 자동화가 사라진다.
+  if (!QUIET || LOUD.has(event)) {
+    if (PORCELAIN) {
+      console.log([event, ctx.key, detail, ctx.url ?? ''].filter(Boolean).join('  '));
+    } else {
+      const [color, label] = EVENT_STYLE[event] ?? [C.dim, event];
+      const bell = BELL && LOUD.has(event) ? '\x07' : '';
+      say(
+        `${bell}${color(C.bold(label.padEnd(7)))} ${C.bold(ctx.key)}${detail ? '  ' + C.dim(detail) : ''}`,
+      );
+      if (ctx.url) say(C.dim(`         ${ctx.url}`));
+    }
   }
+
   runExec(event, ctx);
 }
 
