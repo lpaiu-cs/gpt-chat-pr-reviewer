@@ -28,9 +28,16 @@ src/
   poster.ts         — ReviewResult → GitHub 인라인 코멘트 게시
   instructions.ts   — 맞춤 지침 파일 (instructions.md → {{instructions}} 주입)
   config.ts         — 설정 로드/저장 (pr-review.config.json)
+  progress.ts       — 진행 상황 버스 (리프 — http·config·상태 머신을 모른다)
+  ui/
+    server.ts       — 관측 대시보드: node:http + SSE, 127.0.0.1 전용
+    app.html        — 대시보드 (단일 파일 · 빌드 스텝 없음)
   types.ts          — 공유 타입 (PRState/PREvent/PRContext 포함)
 scripts/
   smoke-machine.ts  — 상태 머신 스모크 테스트 (npm run smoke)
+  copy-ui.mjs       — app.html 을 dist 로 복사 (tsc 는 .html 을 안 옮긴다)
+  notify.mjs        — 대시보드 SSE 구독 → 리뷰 게시 알림 (의존성 없음, node 로 직접 실행)
+                      --pr 로 세션별 대상 한정 · --porcelain 으로 에이전트가 소비
 ```
 
 ## 상태 머신
@@ -70,6 +77,42 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 다툰다. 큐 대기는 GitHub 에서 관측된 PR 상태가 아니므로 `QUEUED` 같은 상태를
 `TRANSITIONS` 에 추가하지 않는다.
 
+## 대시보드 (`watch --ui`)
+
+**watch 프로세스 안에서** 돈다. 별도 프로세스가 아니고 `data/state/*.json` 을 읽지도
+않는다 — `progress.ts` 버스에 모인 루프의 메모리만 본다. 이유는 큐를 파일로 저장하지
+않는 것과 정확히 같다: `store.ts` 에 잠금이 없고 라운드 하나가 2~15분 동안
+read-modify-write 를 붙잡으므로, 다른 읽기·쓰기 경로가 끼어들면 결과를 덮어쓰거나
+찢어진 JSON 을 읽는다.
+
+의존 방향은 `reviewer/chatgpt → progress ← ui/server` 로만 흐른다. `progress.ts` 는
+리프로 유지한다 — 여기가 상태 머신 라벨을 알기 시작하면 UI 를 거쳐 모듈이 얽힌다.
+그래서 `PRContext → ContextCard` 변환은 `cli.ts` 에 둔다.
+
+- 로그는 `console.log/error` 를 한 번 감싸 미러링한다 (호출부 60여 곳을 고치지 않는다).
+  심각도는 chalk 의 첫 SGR 코드로 추론하고, 색이 꺼진 환경에서는 마커(`✓ ⚠ ✗`)가 폴백.
+- 라운드 진행 단계는 `reviewer.ts` 와 `chatgpt.ts` 의 `progress.phase()` 로 보고한다.
+  `waiting` 이 압도적으로 길어(2~15분) 이 구간의 스트리밍 관측값(`progress.stream`)이
+  관측의 핵심이다. **이슈 #1(원인 미상 타임아웃)의 증상 기록 창구이기도 하다.**
+- 세션 id 는 프로세스마다 새로 만든다. 로그 `seq` 가 1부터 다시 시작하므로, 이게 없으면
+  watch 재시작 후 클라이언트가 새 로그를 전부 "이미 본 것" 으로 버린다.
+- `--ui` 없이 돌면 `progress.enabled === false` 라 모든 기록 호출이 no-op 이다.
+
+**읽기 전용이다.** 제어(지금 리뷰·일시정지·지침 편집)는 아직 없다. 넣을 때는 POST 가
+상태를 직접 건드리지 말고 의도 큐에 넣어 루프가 안전한 지점에서 소비해야 한다.
+
+`scripts/notify.mjs` 가 이 SSE 의 첫 소비자다. **상태 파일을 읽지 않고 SSE 만 구독하므로
+별도 프로세스로 띄워도 안전하다** — 대시보드를 만들 때 세운 규칙이 그대로 배당금이 됐다.
+전이 판정은 `active.phase` 가 아니라 **컨텍스트 카드의 state** 로 한다: `endReview` 직후
+스냅샷의 카드는 아직 라운드 이전 값이고 결과는 다음 publish 에 실리는데, 카드만 보면 그
+타이밍을 신경 쓸 필요가 없다.
+
+`--pr` 필터가 필수인 이유: 대시보드는 watch 프로세스당 하나인데 작업 세션은 여러 개다.
+각 세션은 자기가 붙잡은 PR 만 기다리므로, 필터가 없으면 남의 PR 이 게시될 때마다 전부
+깨어난다. 필터에 걸리는 PR 이 하나도 없으면 경고한다 — 오타로 영원히 조용한 상태가
+정상처럼 보이면 안 된다. `--porcelain` 은 에이전트가 소비하는 모드로, 연결 상태까지
+같은 1줄 형식으로 내보내 침묵이 "아직" 인지 "끊김" 인지 구분되게 한다.
+
 ## 핵심 흐름
 
 1. `setup` → Chrome 영속 프로필로 ChatGPT 수동 로그인 (1회)
@@ -86,6 +129,22 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 `pr-review.config.json` 의 `watch` 블록이 대상을 정한다 (`mode`: account/repos/
 review-requested + 글롭 `include`/`exclude` + `filters`). 계정 모드는 GraphQL 검색으로
 "열린 PR 이 있는 레포" 를 발견한 뒤 그 목록을 레포 probe 에 넘긴다.
+
+`filters.skip` / `filters.only` (`'owner/repo#12'`) 는 authors/labels/draft 로 표현할 수
+없는 PR 단위 지정이다. `passesFilters` 에서 **가장 먼저** 판정한다 — 명시적으로 지목한
+조건을 `draft: true` 같은 다른 설정이 뒤집으면 안 된다. 겹치면 skip 이 이긴다.
+둘 다 **감시가 아니라 큐 자격만** 좁힌다 — 제외된 PR 도 계속 동기화되고 대시보드에 남는다.
+형식이 틀리면 아무것도 매치하지 않아 조용히 무효가 되는데 결과가 정반대다 (skip 오타는
+리뷰돼 버리고 only 오타는 전부 멈춘다). `invalidPRRefs` 로 watch 시작 시 검사해 알린다.
+
+`--observe` 는 감시·동기화·큐 계산만 하고 리뷰를 실행하지 않는다. 브라우저를 아예 띄우지
+않아 완전히 무비용이다 (`driver` 가 null 로 남는다). `--dry-run` 은 게시만 건너뛸 뿐
+ChatGPT 를 호출하므로 이 용도로 쓸 수 없다.
+
+**watch 와 review 를 동시에 돌리면 안 된다.** `syncPRFromProbe` 는 스캔마다 무조건
+`saveContext` 하고(reviewer.ts) `runRound` 는 2~15분 동안 ctx 를 메모리에 물고 있다.
+잠금이 없으므로 서로의 결과를 덮어쓴다. "지켜보되 하나만 리뷰" 는 `filters.only` 로
+한 프로세스 안에서 푼다.
 
 검색과 폴링의 역할을 나눈 이유: 검색 인덱스는 반영 지연이 있어 새 커밋 감지에 쓸 수
 없다. 발견은 `discoveryIntervalMs`(기본 5분) 주기로, 감지는 10초 주기 probe 가 맡는다.
@@ -115,10 +174,11 @@ npm install
 npm run smoke        # 상태 머신 테스트
 npm run dev -- init  # 설정 + instructions.md 생성
 npm run dev -- review <pr-url> [--dry-run|--force]
-npm run dev -- watch [--once|--headless]
+npm run dev -- watch [--once|--headless|--observe|--ui|--ui-port <port>]
 npm run dev -- queue [--json]   # 리뷰 대기열
 npm run dev -- status [pr] [--json]
 npm run dev -- graph [pr]   # mermaid 다이어그램
+npm run notify       # 대시보드 이벤트 알림 (watch --ui 가 떠 있어야 한다)
 ```
 
 ## 설정

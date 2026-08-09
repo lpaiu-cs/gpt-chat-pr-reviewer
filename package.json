@@ -19,14 +19,15 @@
     "pr-review": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-ui.mjs",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "setup": "tsx src/cli.ts setup",
     "review": "tsx src/cli.ts review",
     "watch": "tsx src/cli.ts watch",
     "status": "tsx src/cli.ts status",
-    "smoke": "tsx scripts/smoke-machine.ts"
+    "smoke": "tsx scripts/smoke-machine.ts",
+    "notify": "node scripts/notify.mjs"
   },
   "dependencies": {
     "chalk": "^5.4.1",

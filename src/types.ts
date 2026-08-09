@@ -181,6 +181,25 @@ export interface WatchFilters {
   labels?: string[];
   /** true 면 draft PR 도 리뷰한다. 기본값 false = 초안 제외 */
   draft?: boolean;
+  /**
+   * 개별 제외 목록 — `'owner/repo#12'` 형식 (대소문자 무시).
+   *
+   * authors/labels/draft 로는 "이 PR 만 빼기" 를 표현할 수 없다. 오래돼서 지금은
+   * 리뷰받고 싶지 않은 PR 을 감시 범위를 좁히지 않고 골라낼 때 쓴다.
+   * 이미 추적 중이던 PR 도 다음 스캔에서 큐에서 빠진다 (excludedReason 이 붙는다).
+   */
+  skip?: string[];
+  /**
+   * 리뷰 대상을 이 PR 들로만 한정한다 — `'owner/repo#12'` 형식 (대소문자 무시).
+   * 비어 있거나 없으면 제한하지 않는다.
+   *
+   * `skip` 의 반대다. 여러 PR 중 하나만 돌려보고 싶을 때 나머지를 일일이 skip 에
+   * 적는 대신 쓴다. **감시 자체를 좁히지는 않는다** — 이미 추적 중인 PR 은 계속
+   * 동기화되고 대시보드에도 남는다. 큐에만 오르지 않는다.
+   *
+   * 같은 PR 이 skip 에도 있으면 skip 이 이긴다 ("확실히 하지 말 것" 이 우선).
+   */
+  only?: string[];
 }
 
 /**

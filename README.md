@@ -81,7 +81,9 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
     "filters": {
       "authors": ["lpaiu-cs"],      // 이 작성자들의 PR만
       "labels": ["needs-review"],   // 이 라벨을 하나라도 가진 PR만
-      "draft": false                // 초안 제외 (기본값)
+      "draft": false,               // 초안 제외 (기본값)
+      "skip": ["myorg/api#12"],     // 이 PR만 콕 집어 제외
+      "only": ["myorg/api#34"]      // 리뷰 대상을 이 PR로만 한정
     },
     "discoveryIntervalMs": 300000   // 레포 재탐색 주기 (기본 5분)
   }
@@ -95,6 +97,19 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
 | `review-requested` | 현재 `gh` 계정에 **리뷰가 요청된 PR만** (레포 단위가 아니라 PR 단위) |
 
 필터는 AND로 적용되며, 걸린 PR은 추적을 시작하지도 않습니다. `filters`가 없으면 **초안(draft)은 제외**됩니다 — 작성 중인 PR까지 대화 한도를 쓰지 않기 위해서입니다. `"draft": true`로 되돌릴 수 있습니다.
+
+`skip`과 `only`는 `authors`/`labels`/`draft`로 표현할 수 없는 **PR 단위 지정**입니다. 둘 다 `'owner/repo#12'` 형식(대소문자 무시)이고 다른 조건보다 **먼저** 판정되므로 `"draft": true` 같은 설정이 뒤집지 못합니다.
+
+| 키 | 뜻 | 쓰는 때 |
+|---|---|---|
+| `skip` | 이 PR들만 **제외** | 오래돼서 지금은 리뷰받고 싶지 않은 몇 건을 뺄 때 |
+| `only` | 이 PR들만 **리뷰** | 한 건만 돌려보고 나머지는 지켜만 볼 때 |
+
+같은 PR이 양쪽에 있으면 `skip`이 이깁니다 — "확실히 하지 말 것"이 "이것만 할 것"보다 강합니다.
+
+**둘 다 감시 자체는 좁히지 않습니다.** 이미 추적 중인 PR은 계속 동기화되고 대시보드에도 `제외: only 목록 밖` 배지와 함께 남습니다. 큐에만 오르지 않습니다.
+
+형식이 틀린 항목은 아무것도 매치하지 않아 조용히 무효가 되는데, 결과가 정반대로 갈립니다 — `skip` 오타는 빼려던 PR이 리뷰돼 버리고, `only` 오타는 아무것도 리뷰되지 않습니다. 그래서 `watch` 시작 시 어느 목록의 어떤 항목이 틀렸는지 경고합니다.
 
 > `review-requested`는 PR 번호까지 보존해 대상을 한정합니다. 레포 단위로 축약하면 리뷰 요청받은 PR 하나 때문에 그 레포의 열린 PR 전부가 리뷰 대상이 됩니다.
 >
@@ -190,6 +205,14 @@ npm run dev -- watch
 
 계정 전체를 감시하면 새 레포의 PR도 자동으로 큐에 올라옵니다. 자세한 옵션은 [감시 범위](#감시-범위)를 참고하세요.
 
+**5. 대시보드 (선택)**
+
+```bash
+npm run dev -- watch --ui
+```
+
+`http://127.0.0.1:4478`에 관측용 대시보드가 열립니다. 자세한 내용은 [대시보드](#대시보드)를 참고하세요.
+
 ## 명령어
 
 | 명령 | 설명 |
@@ -199,7 +222,7 @@ npm run dev -- watch
 | `init` | 설정 파일 + 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 리뷰 지침 파일 열기 |
 | `review <pr>` | 리뷰 라운드 실행 — `--dry-run` `--force` `--headless` `--timeout <분>` `--from-cache` `--instructions <file>` |
-| `watch` | 감시 범위 폴링 → 동기화 → 큐 순서대로 자동 리뷰 — `--once` `--headless` `--dry-run` |
+| `watch` | 감시 범위 폴링 → 동기화 → 큐 순서대로 자동 리뷰 — `--once` `--headless` `--dry-run` `--observe` `--ui` `--ui-port <port>` |
 | `queue` | 리뷰 대기열 조회 — `--json` |
 | `status [pr]` | PR 상태 조회 — `--json` |
 | `graph [pr]` | 상태 머신 mermaid 다이어그램 출력 |
@@ -226,6 +249,113 @@ npm run dev -- review <pr-url> --from-cache
 - 캐시된 응답에는 어느 대화에서 나왔는지가 함께 저장됩니다. `--from-cache`로 게시할 때 출처가 현재 대화와 다르면(예: dry-run 응답) 대화 참조를 놓습니다 — 그 코멘트는 대화에 없으므로, 다음 라운드가 있다고 오판하면 안 됩니다.
 
 `review`는 상태를 존중합니다. `AWAITING_AUTHOR`인 PR에 실행하면 대기 중임을 알리고 종료하며, `--force`로만 강제 실행됩니다.
+
+## 관측 모드
+
+```bash
+npm run dev -- watch --observe
+```
+
+감시·동기화·큐 계산까지 다 하되 **리뷰는 실행하지 않습니다.** 브라우저를 아예 띄우지 않으므로 ChatGPT 한도도, Chrome 창도, 로그인도 필요 없습니다. GitHub 폴링 비용(레포당 1 point)만 듭니다.
+
+무엇이 리뷰 대상인지 먼저 보고 싶을 때, 대시보드를 시험해 볼 때, 필터·`skip` 설정을 검증할 때 씁니다.
+
+> `--dry-run`은 이 용도로 쓸 수 없습니다. **게시만 건너뛸 뿐 ChatGPT는 그대로 호출**해서 대화 한도를 소비합니다. `--once`도 마찬가지로 "1회 스캔"이지 "1건만 리뷰"가 아니어서 그 스캔의 큐를 끝까지 소진합니다.
+
+### 특정 PR만 리뷰하기
+
+`--observe`는 전부 아니면 전무입니다. "지켜보되 이 PR 하나만 리뷰"는 `--observe`를 빼고 `filters.only`로 대상을 한정합니다.
+
+```jsonc
+"filters": { "only": ["myorg/api#34"] }
+```
+
+```bash
+npm run dev -- watch --ui
+```
+
+나머지 PR도 계속 동기화되고 대시보드에 남습니다 (`제외: only 목록 밖`). 큐에는 `#34`만 오릅니다.
+
+> **`watch`를 켜둔 채 다른 터미널에서 `review <pr>`을 돌리지 마세요.** 스캔은 10초마다 모든 컨텍스트를 저장하고, `review`는 2~15분짜리 라운드를 메모리에 물고 있습니다. `store.ts`에 잠금이 없어서 두 프로세스가 서로의 결과를 덮어씁니다 — 라운드 결과가 사라지거나, 반대로 낡은 메모리가 `watch`가 감지한 `PR_CLOSED`를 되살립니다.
+
+## 대시보드
+
+```bash
+npm run dev -- watch --ui                  # http://127.0.0.1:4478
+npm run dev -- watch --ui --observe        # 리뷰 없이 화면만 (무비용)
+npm run dev -- watch --ui --ui-port 9000
+```
+
+**읽기 전용 관측 화면입니다.** 진행 중인 라운드, 대기열, 추적 중인 PR, GraphQL 잔여 한도, 쿼터 쿨다운, 그리고 터미널 로그를 실시간으로 보여줍니다.
+
+가장 큰 쓸모는 **진행 중 패널**입니다. 리뷰 라운드 하나는 2~15분 걸리는데, 터미널에는 그동안 30초마다 한 줄만 찍혀서 살아 있는지 알기 어려웠습니다. 대시보드는 지금 어느 단계인지(대화 준비 → 프롬프트 전송 → 응답 대기 → 파싱 → 게시 → 동기화), 그 단계에 얼마나 머물렀는지, ChatGPT가 생성 중인지 추론 중인지, 몇 글자를 받았는지를 초 단위로 보여줍니다.
+
+### 왜 watch 프로세스 안에서 도는가
+
+대시보드는 **별도 프로세스가 아니고, 상태 파일을 읽지도 않습니다.** watch 루프의 메모리만 봅니다.
+
+`store.ts`의 `saveContext`는 잠금 없는 `writeFileSync`이고, 리뷰 라운드 하나는 2~15분 동안 read-modify-write를 붙잡고 있습니다. 다른 프로세스가 `data/state/*.json`을 건드리면 라운드 결과를 덮어쓰거나 찢어진 JSON을 읽습니다. [리뷰 큐](#리뷰-큐)를 파일로 저장하지 않는 것과 같은 이유입니다.
+
+- 통신은 SSE(`node:http`) — 새 의존성이 없고, watch를 재시작해도 브라우저가 알아서 재연결합니다 (로그에 `── watch 재시작 ──` 구분선이 들어갑니다)
+- **`127.0.0.1`에만 바인딩합니다.** PR 제목·상태·리뷰 로그가 그대로 보이므로 같은 네트워크에 노출하지 않습니다
+- 포트가 쓰이고 있으면 다음 포트로 최대 10번 물러섭니다
+- 대시보드가 못 떠도 감시는 그대로 계속됩니다
+- `--ui` 없이 돌면 관련 코드는 전부 no-op입니다
+
+SSE를 쓸 수 없는 소비자를 위해 `GET /api/state`가 같은 스냅샷을 JSON으로 돌려줍니다.
+
+### 이벤트 알림
+
+```bash
+npm run notify
+```
+
+대시보드 SSE를 구독해 **리뷰가 게시되는 순간**을 알립니다. 라운드가 2~15분이라 화면을 계속 보고 있을 수 없고, 셀프 리뷰(내 PR을 내 도구가 리뷰)는 GitHub 알림도 외부 CI 훅도 잡아주지 않기 때문입니다.
+
+| 이벤트 | 시점 |
+|---|---|
+| `round-start` | 라운드 시작 |
+| `posting` | 게시 단계 진입 (아직 GitHub에 올라가기 전) |
+| `posted` | **코멘트 게시 완료** → `AWAITING_AUTHOR` — 처리할 게 생긴 시점 |
+| `converged` | 수렴 (approve) |
+| `failed` / `quota` / `closed` | 실패 / 한도 / PR 종료 |
+
+**`--pr`로 대상을 좁히세요.** 대시보드 하나를 여러 작업 세션이 함께 보는 경우, 필터가 없으면 남의 PR이 게시될 때마다 전부 깨어납니다.
+
+```bash
+node scripts/notify.mjs --pr myorg/api#34        # 그 PR만
+node scripts/notify.mjs --pr myorg/api           # 그 레포 전체
+node scripts/notify.mjs --pr myorg/api#34,myorg/web#7
+```
+
+대소문자·여백·선행 0(`#034` → `#34`)은 알아서 맞춥니다. 필터에 걸리는 PR이 하나도 없으면 **경고하고 현재 추적 중인 PR 목록을 보여줍니다** — 오타로 조용히 영원히 기다리는 상황을 막기 위해서입니다.
+
+`--exec`로 명령을 걸면 자동화로 이어집니다. 기본 트리거는 `posted,converged,failed`입니다.
+
+```bash
+node scripts/notify.mjs --pr myorg/api#34 --on posted --exec "your-handler.sh"
+```
+
+### 에이전트가 소비할 때
+
+`--porcelain`은 **이벤트 1건 = 1줄**, 배너도 색도 벨도 없이 냅니다. 코딩 에이전트가 자기 PR의 리뷰를 기다렸다가 지적을 반영하고 다시 대기하는 루프를 만들 때 씁니다.
+
+```bash
+node scripts/notify.mjs --porcelain --pr myorg/api#34
+```
+
+```
+connected  myorg/api#34  watching=myorg/api#34:AWAITING_AUTHOR
+round-start  myorg/api#34  2차 · 작성자 응답  https://github.com/myorg/api/pull/34
+posting  myorg/api#34  2차 · 대기 412초 경과  https://github.com/myorg/api/pull/34
+posted  myorg/api#34  2라운드 · 요청 3개 · 스레드 0/3  https://github.com/myorg/api/pull/34
+```
+
+연결 상태도 같은 형식(`connected` / `disconnected` / `watch-restarted` / `filter-no-match`)으로 나오므로, 침묵이 "아직 안 옴"인지 "끊김"인지 구분할 수 있습니다.
+
+명령에는 `PR_EVENT` `PR_KEY` `PR_URL` `PR_OWNER` `PR_REPO` `PR_NUMBER` `PR_ROUND` `PR_STATE` `PR_TITLE`이 환경변수로 넘어갑니다. 셸은 플랫폼 기본(Windows는 `cmd`)이므로 인라인 명령에서 변수를 쓸 때는 `%PR_NUMBER%` / `$PR_NUMBER`로 각각 맞춰야 합니다 — 스크립트 파일로 넘기면 신경 쓸 필요가 없습니다.
+
+**상태 파일을 건드리지 않고 SSE만 읽으므로 별도 프로세스로 띄워도 안전합니다.** 의존성이 없어 `node scripts/notify.mjs`로 바로 돌고, `watch`를 재시작하면 알아서 다시 붙습니다. 잠깐 끊긴 사이에 일어난 전이도 재연결 후 첫 스냅샷에서 잡아냅니다 (`watch` 자체가 재시작된 경우에만 기준선을 새로 잡습니다).
 
 ## 맞춤 지침
 
@@ -273,8 +403,10 @@ npm run build   # dist/ 생성
 - **CAPTCHA는 자동 우회하지 않습니다.** 발생 시 직접 해결해야 합니다. 헤드리스 모드는 봇 감지에 걸릴 확률이 높습니다.
 - **리뷰 품질은 GPT가 PR을 얼마나 잘 읽느냐에 달려 있습니다.** 비공개 레포는 ChatGPT에 GitHub 커넥터가 연결되어 있어야 읽을 수 있습니다.
 - 라인 번호가 부정확한 경우 인라인 대신 리뷰 본문에 포함됩니다.
-- **응답이 멈춰도 "생성 중"으로 남는 경우가 있습니다** ([#1](https://github.com/lpaiu-cs/gpt-chat-pr-reviewer/issues/1)). 연결 중단 복구가 `!streaming`일 때만 동작하므로 이때는 복구 경로가 막히고 `responseTimeoutMs`(기본 15분)를 모두 소진합니다. 근인이 확정되지 않아 의도적으로 수정을 보류했습니다 — 성급히 정체 타임아웃을 넣으면 실제로 오래 걸리는 정상 응답을 잘라내게 됩니다.
+- **응답이 멈춰도 "생성 중"으로 남는 경우가 있습니다** ([#1](https://github.com/lpaiu-cs/gpt-chat-pr-reviewer/issues/1)). 연결 중단 복구가 `!streaming`일 때만 동작하므로 이때는 복구 경로가 막히고 `responseTimeoutMs`(기본 15분)를 모두 소진합니다. 근인이 확정되지 않아 의도적으로 수정을 보류했습니다 — 성급히 정체 타임아웃을 넣으면 실제로 오래 걸리는 정상 응답을 잘라내게 됩니다. `watch --ui` 대시보드가 이 구간의 관측값(생성 중 / 대기 / 추론 중, 수신 글자 수)을 초 단위로 기록하므로 근인을 짚을 때 쓸 수 있습니다.
 - **리뷰는 직렬로만 돕니다.** 브라우저 페이지가 단일 자원이라, 한 PR을 리뷰하는 2~15분 동안 다른 PR의 변화는 감지되어도 실행이 대기합니다. 폴링 주기를 줄여도 이 구간은 개선되지 않습니다.
+- **대시보드는 관측 전용입니다.** 리뷰를 지금 실행하거나 일시정지하는 등의 제어는 아직 없습니다.
+- **`watch`와 `review`를 동시에 돌릴 수 없습니다.** `store.ts`에 잠금이 없어 두 프로세스가 같은 상태 파일을 다툽니다. 특정 PR만 리뷰하려면 `filters.only`로 한 프로세스 안에서 좁히세요.
 
 ## 주의
 

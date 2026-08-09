@@ -7,6 +7,7 @@
 
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import chalk from 'chalk';
+import { progress } from './progress.js';
 import type { AppConfig } from './types.js';
 
 /** ChatGPT 사용량 한도 도달 — 상태 머신의 QUOTA_EXCEEDED 이벤트로 매핑된다. */
@@ -483,6 +484,7 @@ export class ChatGPTDriver {
     const timeout = this.cfg.responseTimeoutMs;
 
     // 새 어시스턴트 메시지가 나타날 때까지 대기
+    progress.phase('waiting');
     console.log(chalk.dim('  응답 대기 중...'));
     try {
       await page.locator(sel.assistantMessage).nth(messageCountBefore).waitFor({ timeout: 60_000 });
@@ -522,6 +524,12 @@ export class ChatGPTDriver {
       }
 
       const streaming = await this.isStreaming(page);
+      const phase = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
+
+      // 터미널은 30초마다 한 줄이지만 UI 는 폴링마다 갱신한다 — 이 구간이 2~15분
+      // 이라 "멈춘 건지 도는 건지" 를 실시간으로 보여주는 게 관측의 핵심이다.
+      // (이슈 #1 의 원인 미상 타임아웃도 여기 기록이 남아야 나중에 짚을 수 있다.)
+      progress.stream(phase, lastText.length);
 
       // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일
       if (!streaming && lastText.trim().length > 0 && stable >= 3) {
@@ -554,9 +562,8 @@ export class ChatGPTDriver {
       if (Date.now() - lastLogAt > 30_000) {
         lastLogAt = Date.now();
         const sec = Math.round((Date.now() - t0) / 1000);
-        const state = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
         console.log(
-          chalk.dim(`    …${sec}초 경과 · ${state} · ${lastText.length.toLocaleString()}자`),
+          chalk.dim(`    …${sec}초 경과 · ${phase} · ${lastText.length.toLocaleString()}자`),
         );
       }
     }

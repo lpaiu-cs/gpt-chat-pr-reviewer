@@ -4,6 +4,7 @@
  * 대표 시나리오의 전이 경로와 불법 전이 차단을 검증한다.
  */
 
+import chalk from 'chalk';
 import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/machine.js';
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
@@ -21,13 +22,17 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
+import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
   globToRegExp,
+  invalidPRRefs,
+  parsePRRef,
   matchesScope,
   nextRepoCache,
   passesFilters,
   resolveWatchScope,
+  type FilterablePR,
 } from '../src/watch-scope.js';
 import {
   buildQueue,
@@ -604,7 +609,10 @@ const fakePR: PRInfo = {
 // ── 시나리오 17: 대상 필터 ─────────────────────────────────
 
 {
-  const pr = (over: Partial<{ author: string; isDraft: boolean; labels: string[] }> = {}) => ({
+  const pr = (over: Partial<FilterablePR> = {}): FilterablePR => ({
+    owner: 'lpaiu-cs',
+    repo: 'osk-system',
+    number: 12,
     author: 'lpaiu-cs',
     isDraft: false,
     labels: ['needs-review'],
@@ -631,6 +639,117 @@ const fakePR: PRInfo = {
 
   const verdict = passesFilters(pr({ isDraft: true }));
   assert(!!verdict.reason, '제외 사유가 붙는다');
+
+  // ── skip: 개별 PR 제외 ──
+  const skip = ['LPAIU-CS/OSK-System#12'];
+  assert(!passesFilters(pr(), { skip }).ok, 'skip 목록의 PR 은 제외 (대소문자 무시)');
+  assert(passesFilters(pr({ number: 13 }), { skip }).ok, '번호가 다르면 통과');
+  assert(passesFilters(pr({ repo: 'other' }), { skip }).ok, '레포가 다르면 통과');
+  assert(passesFilters(pr({ owner: 'other' }), { skip }).ok, '소유자가 다르면 통과');
+  assert(passesFilters(pr(), { skip: [] }).ok, '빈 skip 은 아무것도 막지 않는다');
+  assert(
+    passesFilters(pr({ number: 121 }), { skip: ['lpaiu-cs/osk-system#12'] }).ok,
+    '번호는 접두 일치가 아니라 완전 일치 (#12 가 #121 을 막지 않는다)',
+  );
+  assert(
+    passesFilters(pr(), { skip: [' lpaiu-cs/osk-system#12 '] }).ok === false,
+    'skip 항목의 앞뒤 여백은 무시',
+  );
+
+  // skip 은 가장 먼저 판정된다 — 다른 조건이 명시적 제외를 뒤집으면 안 된다.
+  assert(
+    !passesFilters(pr({ isDraft: true }), { skip, draft: true }).ok,
+    'draft: true 여도 skip 이 이긴다',
+  );
+  assert(
+    passesFilters(pr(), { skip }).reason === 'skip 목록',
+    'skip 제외 사유가 다른 조건에 가려지지 않는다',
+  );
+
+  // ── only: 리뷰 대상 한정 (skip 의 반대) ──
+  const only = ['LPAIU-CS/OSK-System#12'];
+  assert(passesFilters(pr(), { only }).ok, 'only 목록의 PR 은 통과 (대소문자 무시)');
+  assert(!passesFilters(pr({ number: 13 }), { only }).ok, 'only 목록 밖은 제외');
+  assert(passesFilters(pr({ number: 13 }), { only: [] }).ok, '빈 only 는 제한하지 않는다');
+  assert(passesFilters(pr({ number: 13 }), {}).ok, 'only 가 없으면 제한하지 않는다');
+  assert(
+    passesFilters(pr({ number: 13 }), { only }).reason === 'only 목록 밖',
+    'only 제외 사유가 붙는다',
+  );
+
+  // skip 이 only 를 이긴다 — "확실히 하지 말 것" 이 "이것만 할 것" 보다 강하다.
+  assert(
+    !passesFilters(pr(), { only, skip }).ok &&
+      passesFilters(pr(), { only, skip }).reason === 'skip 목록',
+    '같은 PR 이 양쪽에 있으면 skip 이 이긴다',
+  );
+
+  // only 를 통과한 뒤에는 나머지 조건이 그대로 적용된다 (only 는 면제권이 아니다).
+  assert(
+    !passesFilters(pr({ isDraft: true }), { only }).ok,
+    'only 를 통과해도 draft 제외는 그대로 적용된다',
+  );
+  assert(
+    !passesFilters(pr({ number: 13 }), { only, authors: ['lpaiu-cs'] }).ok,
+    '작성자가 맞아도 only 밖이면 제외',
+  );
+
+  // 형식이 틀리면 아무것도 매치하지 않아 조용히 무효가 된다 — 시작 시 잡아야 한다.
+  // 결과는 정반대로 갈린다: skip 오타는 리뷰돼 버리고, only 오타는 전부 멈춘다.
+  assert(invalidPRRefs({ skip: ['owner/repo#12'] }).length === 0, '정상 형식은 통과');
+  assert(
+    invalidPRRefs({ skip: ['owner/repo', '#12', 'owner/repo#', 'owner#12'] }).length === 4,
+    '번호·소유자가 빠진 항목은 형식 오류',
+  );
+  assert(invalidPRRefs(undefined).length === 0, 'skip 이 없으면 오류도 없다');
+  assert(
+    invalidPRRefs({ skip: [' owner/repo#12 '] }).length === 0,
+    '여백만 있는 차이는 오류가 아니다 (판정과 같은 기준)',
+  );
+  assert(invalidPRRefs({ only: ['owner/repo'] }).length === 1, 'only 도 형식을 검사한다');
+
+  // ── 리뷰 지적 [P2]: 검증과 대조가 갈라지면 검증이 무의미해진다 ──
+  // 예전 정규식은 아래 셋을 정상으로 통과시켰는데, prKey 는 그런 키를 만들지
+  // 않으므로 절대 매치되지 않았다. skip 이면 제외한 줄 알았던 PR 이 리뷰된다.
+  assert(
+    invalidPRRefs({ skip: ['owner/repo/extra#12'] }).length === 1,
+    '레포 이름에 슬래시가 든 참조는 형식 오류 (매치될 수 없다)',
+  );
+  assert(
+    invalidPRRefs({ skip: ['owner/repo#0'] }).length === 1,
+    'PR 번호 0 은 형식 오류 (1부터 시작한다)',
+  );
+  assert(parsePRRef('owner/repo/extra#12') === null, 'parsePRRef: 슬래시 낀 레포 거부');
+  assert(parsePRRef('owner/repo#0') === null, 'parsePRRef: 0번 거부');
+  assert(parsePRRef('owner/repo#-1') === null, 'parsePRRef: 음수 거부');
+  assert(parsePRRef('owner/repo#1e3') === null, 'parsePRRef: 지수 표기 거부');
+
+  // 선행 0 은 사람이 적은 표기 차이일 뿐이므로 같은 키로 접는다.
+  assert(parsePRRef('Owner/Repo#007') === 'owner/repo#7', 'parsePRRef: 선행 0 과 대소문자 정규화');
+  assert(invalidPRRefs({ skip: ['owner/repo#007'] }).length === 0, '선행 0 은 오류가 아니다');
+  assert(
+    !passesFilters(pr({ owner: 'lpaiu-cs', repo: 'osk-system', number: 7 }), {
+      skip: ['lpaiu-cs/osk-system#007'],
+    }).ok,
+    '#007 로 적어도 7번 PR 이 실제로 제외된다 (검증 통과 = 대조 성립)',
+  );
+
+  // 불변식: 형식 검증을 통과한 참조는 반드시 어떤 PR 과 대조될 수 있어야 한다.
+  const probes = ['owner/repo#12', ' Owner/Repo#007 ', 'a-b.c/d_e#1'];
+  assert(
+    probes.every((p) => {
+      const key = parsePRRef(p);
+      if (!key) return false;
+      const [slug, num] = key.split('#');
+      const [owner, repo] = slug.split('/');
+      return !passesFilters(pr({ owner, repo, number: Number(num) }), { skip: [p] }).ok;
+    }),
+    '통과한 참조는 예외 없이 실제 매치로 이어진다',
+  );
+  assert(
+    invalidPRRefs({ skip: ['bad1'], only: ['bad2'] }).join(' ') === 'skip: "bad1" only: "bad2"',
+    '어느 목록의 어떤 항목이 틀렸는지 알려준다',
+  );
 }
 
 // ── 시나리오 18: 감시 범위 해석 (구버전 설정 호환) ─────────
@@ -892,6 +1011,94 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 26: 대시보드 로그 심각도 추론 ─────────────────
+
+{
+  // 로깅 API 를 새로 만드는 대신 이미 있는 두 신호를 읽는다: chalk 의 SGR 코드와
+  // 출력문 마커. 색이 꺼진 환경(파이프)에서는 앞이 사라지므로 둘 다 성립해야 한다.
+  const prevLevel = chalk.level;
+  chalk.level = 3; // SGR 경로
+
+  assert(inferLevel(chalk.red('  ✗ 리뷰 실패:')) === 'error', 'SGR: red → error');
+  assert(inferLevel(chalk.yellow('  ⚠ 쿼터 한도')) === 'warn', 'SGR: yellow → warn');
+  assert(inferLevel(chalk.green('  ✓ 응답 수신 완료')) === 'ok', 'SGR: green → ok');
+  assert(inferLevel(chalk.dim('    …30초 경과')) === 'dim', 'SGR: dim → dim');
+  assert(
+    inferLevel(chalk.bold('  🔍 o/r#8') + chalk.dim(' [1차]')) === 'info',
+    'SGR: 첫 코드만 본다 (bold → info)',
+  );
+
+  chalk.level = 0; // 색 없음 — 마커 폴백 경로
+  assert(inferLevel(chalk.red('  ✗ 리뷰 실패:')) === 'error', '폴백: ✗ → error');
+  assert(inferLevel(chalk.yellow('  ⚠ 쿼터 한도')) === 'warn', '폴백: ⚠ → warn');
+  assert(inferLevel(chalk.green('  ✓ 응답 수신 완료')) === 'ok', '폴백: ✓ → ok');
+  assert(inferLevel('평문 로그') === 'info', '단서가 없으면 info');
+
+  chalk.level = prevLevel;
+  assert(stripAnsi('\x1b[31m✗ 실패\x1b[39m') === '✗ 실패', 'ANSI 제거');
+}
+
+// ── 시나리오 27: 대시보드 버스 — 세션·게이트·라운드 수명 ───
+
+{
+  // enabled 가 꺼져 있으면 아무것도 기록하지 않는다 (--ui 없이 도는 게 기본이다).
+  progress.enabled = false;
+  progress.log('버려질 로그');
+  progress.patch({ scope: '버려질 범위' });
+  assert(progress.state().logs.length === 0, 'UI 가 꺼져 있으면 로그를 쌓지 않는다');
+  assert(progress.state().snapshot.scope === '', 'UI 가 꺼져 있으면 스냅샷도 그대로');
+
+  progress.enabled = true;
+  const session = progress.state().snapshot.session;
+  assert(!!session, '세션 id 가 있다');
+
+  // 세션 id 는 호출자가 덮어쓸 수 없어야 한다. 이게 뚫리면 watch 재시작 판정이
+  // 무너져서 클라이언트가 새 로그를 전부 "이미 본 것" 으로 버린다.
+  progress.patch({ session: 'spoofed' } as never);
+  assert(progress.state().snapshot.session === session, '세션 id 는 patch 로 못 바꾼다');
+
+  progress.log(chalk.green('  ✓ 첫 줄'));
+  progress.log('');
+  progress.log('   \t  ');
+  const logs = progress.state().logs;
+  assert(logs.length === 1, '공백뿐인 줄은 UI 로그에 쌓지 않는다');
+  assert(logs[0].seq === 1 && logs[0].level === 'ok', 'seq 는 1부터, 레벨은 추론값');
+
+  // 라운드 수명: begin → phase → stream → end
+  progress.beginReview({
+    key: 'o/r#8', title: 't', url: 'u', round: 3, reasonLabel: '작성자 응답', dryRun: false,
+  });
+  assert(progress.state().snapshot.active?.phase === 'conversation', '시작 단계는 conversation');
+
+  progress.phase('waiting');
+  const waitingSince = progress.state().snapshot.active!.phaseSince;
+  progress.stream('생성 중', 1200);
+  assert(progress.state().snapshot.active?.stream?.chars === 1200, '스트리밍 관측값 기록');
+
+  progress.phase('waiting'); // 같은 단계 재진입
+  assert(
+    progress.state().snapshot.active!.phaseSince === waitingSince,
+    '같은 단계면 경과 타이머를 되감지 않는다',
+  );
+  assert(progress.state().snapshot.active?.stream?.chars === 1200, '같은 단계면 관측값도 유지');
+
+  progress.phase('parsing');
+  assert(
+    progress.state().snapshot.active?.stream === undefined,
+    '단계가 바뀌면 이전 스트리밍 값은 버린다 (다음 단계의 수치로 오해된다)',
+  );
+
+  progress.endReview();
+  assert(progress.state().snapshot.active === null, 'endReview 가 진행 중 표시를 걷는다');
+
+  // phase/stream 은 active 가 없으면 조용히 무시돼야 한다 — 스캔 중 호출될 수 있다.
+  progress.phase('posting');
+  progress.stream('생성 중', 5);
+  assert(progress.state().snapshot.active === null, '진행 중 라운드가 없으면 단계 기록은 무시');
+
+  progress.enabled = false;
 }
 
 // ── 결과 ────────────────────────────────────────────────────

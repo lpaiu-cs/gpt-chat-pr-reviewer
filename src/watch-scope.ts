@@ -297,11 +297,71 @@ export interface FilterVerdict {
 
 /** 필터 판정 대상 — probe 가 주는 필드 중 필터가 쓰는 것만. */
 export interface FilterablePR {
+  owner: string;
+  repo: string;
+  number: number;
   author: string;
   isDraft: boolean;
   labels: string[];
   /** 라벨 목록이 잘렸는지 — true 면 "라벨이 없다" 를 단정할 수 없다 */
   labelsTruncated?: boolean;
+}
+
+const PR_REF = /^([^/\s]+)\/([^/#\s]+)#(\d+)$/;
+
+/**
+ * `'owner/repo#12'` → 대조용 정규화 키. 형식이 틀리면 null.
+ *
+ * 검증(`invalidPRRefs`)과 대조(`refSet`)가 **같은 함수**를 지나게 해서, "형식
+ * 검사는 통과하는데 절대 매치되지 않는" 항목이 구조적으로 나올 수 없게 한다.
+ * 이 둘이 갈라지면 검증의 존재 이유가 사라진다 — skip 오타가 통과하는 순간
+ * 제외한 줄 알았던 PR 이 그대로 리뷰되고, 그건 되돌릴 수 없다.
+ *
+ * 그래서 실제 PR 이 만들어낼 수 없는 표기는 전부 거른다:
+ *   'owner/repo/extra#12'  레포 이름에 슬래시가 들어갈 수 없다
+ *   'owner/repo#0'         PR 번호는 1부터다
+ * 앞뒤 여백·대소문자·선행 0(`#007` → `#7`)은 같은 키로 접어 넣는다 — 사람이
+ * 적은 표기 차이일 뿐 다른 PR 을 가리키는 게 아니다.
+ */
+export function parsePRRef(entry: string): string | null {
+  const m = PR_REF.exec(entry.trim());
+  if (!m) return null;
+  const number = Number(m[3]);
+  if (!Number.isSafeInteger(number) || number < 1) return null;
+  return `${m[1]}/${m[2]}#${number}`.toLowerCase();
+}
+
+/** PR 하나를 skip/only 목록과 대조할 정규화 키로. parsePRRef 와 같은 표현이어야 한다. */
+function prKey(owner: string, repo: string, number: number): string {
+  return `${owner}/${repo}#${number}`.toLowerCase();
+}
+
+/** 목록을 정규화된 집합으로. 형식이 틀린 항목은 빠진다 (invalidPRRefs 가 따로 알린다). */
+function refSet(entries: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const e of entries) {
+    const key = parsePRRef(e);
+    if (key) out.add(key);
+  }
+  return out;
+}
+
+/**
+ * `filters.skip` · `filters.only` 에서 형식이 틀린 항목을 골라낸다.
+ *
+ * 형식이 틀리면 아무것도 매치하지 않아 **조용히 무효**가 된다 — 'owner/repo' 처럼
+ * 번호를 빠뜨린 오타가 대표적이다. 그 결과가 정반대로 갈린다: skip 이면 제외한 줄
+ * 알았던 PR 이 리뷰되고(되돌릴 수 없다), only 면 아무것도 리뷰되지 않는다.
+ * 어느 쪽이든 조용하면 안 되므로 watch 시작 시 한 번 검사해서 알린다.
+ */
+export function invalidPRRefs(filters?: WatchFilters): string[] {
+  const bad: string[] = [];
+  for (const field of ['skip', 'only'] as const) {
+    for (const entry of filters?.[field] ?? []) {
+      if (parsePRRef(entry) === null) bad.push(`${field}: "${entry}"`);
+    }
+  }
+  return bad;
 }
 
 /**
@@ -311,6 +371,20 @@ export interface FilterablePR {
  * 초안까지 대화 한도를 먹는다. `filters.draft: true` 로 되돌릴 수 있다.
  */
 export function passesFilters(pr: FilterablePR, filters?: WatchFilters): FilterVerdict {
+  // PR 을 콕 집은 조건이 가장 먼저다 — 명시적 지목을 다른 조건이 뒤집으면 안 된다.
+  const key = prKey(pr.owner, pr.repo, pr.number);
+
+  // skip 이 only 를 이긴다: "확실히 하지 말 것" 이 "이것만 할 것" 보다 강하다.
+  const skip = filters?.skip;
+  if (skip && skip.length > 0 && refSet(skip).has(key)) {
+    return { ok: false, reason: 'skip 목록' };
+  }
+
+  const only = filters?.only;
+  if (only && only.length > 0 && !refSet(only).has(key)) {
+    return { ok: false, reason: 'only 목록 밖' };
+  }
+
   if (pr.isDraft && !(filters?.draft ?? false)) {
     return { ok: false, reason: '초안(draft)' };
   }
@@ -346,6 +420,10 @@ export function describeScope(scope: WatchScope): string {
   const f = scope.filters;
   if (f?.authors?.length) parts.push(`authors=${f.authors.join(',')}`);
   if (f?.labels?.length) parts.push(`labels=${f.labels.join(',')}`);
+  // only 는 대상을 통째로 한정하므로 개수가 아니라 실물을 보여준다 — 오타 하나로
+  // 아무것도 리뷰되지 않는데 'only=1건' 만 찍히면 그 사실을 알아챌 수 없다.
+  if (f?.only?.length) parts.push(`only=${f.only.join(',')}`);
+  if (f?.skip?.length) parts.push(`skip=${f.skip.length}건`);
   parts.push(f?.draft ? 'draft=포함' : 'draft=제외');
   return parts.join(' · ');
 }
