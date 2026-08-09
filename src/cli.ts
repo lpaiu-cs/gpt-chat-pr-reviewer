@@ -469,8 +469,20 @@ program
             switch (intent.kind) {
               case 'skip-add':
               case 'skip-remove':
-              case 'review-now':
                 return badRef(intent.ref);
+              case 'review-now': {
+                const bad = badRef(intent.ref);
+                if (bad) return bad;
+                // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 202 로 받아두면
+                // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다 (그리고 상태만
+                // 바뀐다 — applyIntents 주석 참고).
+                const target = findContext(parsePRRef(intent.ref) as string);
+                if (!target) return `${intent.ref} 는 추적 중이 아닙니다.`;
+                if (target.excludedReason) {
+                  return `필터에 걸려 있어 실행할 수 없습니다 (${target.excludedReason}). 먼저 제외를 푸세요.`;
+                }
+                return null;
+              }
               case 'only-set': {
                 // 하나라도 틀리면 전체를 거부한다. 일부만 적용하면 '이것만' 이
                 // 기존 한정 해제로 뒤집힌다 (applyIntents 주석 참고).
@@ -702,6 +714,25 @@ program
             }
             if (target.state === 'REVIEWING') {
               console.log(chalk.dim(`    ${key} 는 이미 리뷰 중입니다.`));
+              break;
+            }
+            // 필터에 걸린 PR 은 **전이시키기 전에** 막는다.
+            //
+            // scan 이 excludedReason 이 붙은 컨텍스트를 eligible 에 넣지 않으므로
+            // 상태만 바꾸고 리뷰는 영영 실행되지 않는다. 그냥 무동작이면 그나마
+            // 나은데, AWAITING_AUTHOR/CONVERGED 였던 **영속 상태가 REVIEW_DUE 로
+            // 바뀌어 남는다.** 나중에 제외를 풀면 작성자 응답도 새 커밋도 없이
+            // 리뷰가 돌아버린다. 상태 전이와 실행 가능성이 갈라지면 안 된다.
+            //
+            // 일회성 우회로 만들지 않은 이유: skip 은 "확실히 하지 말 것" 이고
+            // only 보다도 강하게 잡아둔 조건이다. 버튼 하나로 뒤집히면 그 보증이
+            // 사라진다. 정말 돌리려면 제외를 먼저 풀면 된다.
+            if (target.excludedReason) {
+              console.log(
+                chalk.yellow(
+                  `  ⚠ ${key} 는 필터에 걸려 있습니다 (${target.excludedReason}) — 먼저 제외를 푸세요.`,
+                ),
+              );
               break;
             }
             // REVIEW_DUE 가 아니면 강제로 되돌린다 — review --force 와 같은 경로다.

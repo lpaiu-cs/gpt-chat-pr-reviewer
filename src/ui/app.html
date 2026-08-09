@@ -438,7 +438,13 @@ function renderContexts() {
             (c.lastError ? '<div class="err-line">✗ ' + esc(c.lastError) + '</div>' : '') +
             (closed ? '' :
               '<div class="acts" data-key="' + esc(c.key) + '">' +
-                '<button class="btn" data-act="review-now">지금 리뷰</button>' +
+                // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 누를 수 있게 두면
+                // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다.
+                '<button class="btn" data-act="review-now"' +
+                  (c.excludedReason
+                    ? ' disabled title="' + esc(c.excludedReason) + ' — 먼저 제외를 푸세요"'
+                    : '') +
+                  '>지금 리뷰</button>' +
                 '<button class="btn' + (skipped ? ' on' : '') + '" data-act="skip">' +
                   (skipped ? '제외 해제' : '건너뛰기') + '</button>' +
                 '<button class="btn' + (onlyOn ? ' on' : '') + '" data-act="only">' +

@@ -1016,6 +1016,36 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
 }
 
+// ── 시나리오 30: 필터에 걸린 PR 은 강제 전이시켜도 못 돈다 ──
+
+{
+  // 리뷰 지적 [P2]: '지금 리뷰' 가 필터를 확인하지 않고 먼저 상태를 바꿨다.
+  // 스캔이 excludedReason 붙은 컨텍스트를 eligible 에 넣지 않으므로 리뷰는
+  // 실행되지 않는데, **영속 상태만 REVIEW_DUE 로 바뀌어 남는다.** 나중에
+  // 제외를 풀면 작성자 응답도 새 커밋도 없이 리뷰가 돈다.
+  const ctx = createContext(fakePR);
+  fire(ctx, 'START_REVIEW');
+  fire(ctx, 'POSTED_COMMENTS', { patch: { round: 1 } });
+  ctx.excludedReason = 'skip 목록';
+  assert(ctx.state === 'AWAITING_AUTHOR', '전제: 작성자 응답 대기 상태');
+
+  // '지금 리뷰' 가 하던 강제 전이를 그대로 재현한다.
+  fire(ctx, 'AUTHOR_RESPONDED', { note: 'UI: 지금 리뷰' }); // = FORCE_EVENTS.AWAITING_AUTHOR
+  assert(ctx.state === 'REVIEW_DUE', '강제 전이 자체는 성립한다');
+  assert(!isQueueable(ctx), '그런데 필터에 걸려 있어 큐에는 오르지 않는다 (= 무동작)');
+  assert(
+    buildQueue([ctx]).length === 0,
+    '큐가 비어 있다 — 상태만 바뀌고 리뷰는 영영 실행되지 않는 갈라짐',
+  );
+
+  // 제외를 풀면 그 잔여 상태 때문에 응답 없이도 리뷰가 돈다 — 이게 진짜 피해다.
+  delete ctx.excludedReason;
+  assert(
+    buildQueue([ctx]).length === 1,
+    '제외 해제 시 강제 전이 잔여물이 그대로 큐에 오른다 (그래서 전이 전에 막아야 한다)',
+  );
+}
+
 // ── 시나리오 28: 범위 변경 시 탐색 캐시 폐기 ───────────────
 
 {
