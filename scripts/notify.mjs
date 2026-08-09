@@ -37,9 +37,12 @@ if (flag('--help') || flag('-h')) {
     node scripts/notify.mjs [옵션]
 
   옵션
+    --pr <refs>       감시할 대상, 쉼표 구분. 없으면 전부.
+                      'owner/repo#12' → 그 PR 만 · 'owner/repo' → 그 레포 전체
     --url <origin>    대시보드 주소 (기본 http://127.0.0.1:4478)
     --on <events>     --exec 를 실행할 이벤트, 쉼표 구분 (기본 posted,converged,failed)
     --exec <command>  이벤트 발생 시 실행할 셸 명령
+    --porcelain       이벤트 1건 = 1줄, 장식 없음 (에이전트·스크립트가 소비할 때)
     --no-bell         터미널 벨 끄기
     --quiet           진행 단계는 찍지 않고 주요 이벤트만
 
@@ -61,8 +64,42 @@ if (flag('--help') || flag('-h')) {
 const ORIGIN = value('--url', 'http://127.0.0.1:4478').replace(/\/+$/, '');
 const EXEC = value('--exec', null);
 const ON = new Set(value('--on', 'posted,converged,failed').split(',').map((s) => s.trim()));
-const BELL = !flag('--no-bell');
+const PORCELAIN = flag('--porcelain');
+const BELL = !flag('--no-bell') && !PORCELAIN;
 const QUIET = flag('--quiet');
+
+// ── 감시 대상 필터 ──────────────────────────────────────────
+
+/**
+ * 대시보드 하나를 여러 세션이 함께 본다. 각 세션은 자기가 붙잡고 있는 PR 의
+ * 리뷰만 기다리는데, 필터가 없으면 남의 PR 이 게시될 때마다 전부 깨어난다.
+ *
+ * `owner/repo#12` 는 그 PR 만, `owner/repo` 는 그 레포 전체를 뜻한다.
+ * watch 설정의 `filters.skip`/`only` 와 달리 여기서 레포 단위를 허용하는 이유는
+ * 성격이 다르기 때문이다 — 저쪽은 "무엇을 리뷰할지" 를 정하는 안전 장치라 넓게
+ * 잡히면 위험하지만, 이건 "무엇을 들을지" 라 세션 단위로 묶는 게 자연스럽다.
+ *
+ * 대시보드가 주는 key 는 이미 `owner/repo#<번호>` 정규형이므로 사용자가 적은
+ * 쪽만 맞춰 준다 (대소문자 · 여백 · 선행 0).
+ */
+function parseFilter(entry) {
+  const s = entry.trim().toLowerCase().replace(/\/+$/, '');
+  const m = /^(.+?)#0*(\d+)$/.exec(s);
+  if (m) return { slug: m[1], number: Number(m[2]), label: `${m[1]}#${Number(m[2])}` };
+  return { slug: s, number: null, label: `${s} (레포 전체)` };
+}
+
+const FILTERS = (value('--pr', '') || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(parseFilter);
+
+function matchesFilter(key) {
+  if (FILTERS.length === 0) return true;
+  const [slug, num] = String(key).toLowerCase().split('#');
+  return FILTERS.some((f) => f.slug === slug && (f.number === null || f.number === Number(num)));
+}
 
 // ── 출력 ────────────────────────────────────────────────────
 
@@ -77,7 +114,16 @@ const C = {
 };
 
 const clock = () => new Date().toLocaleTimeString('ko-KR', { hour12: false });
-const say = (line) => console.log(`${C.dim(clock())}  ${line}`);
+const say = (line) => {
+  if (PORCELAIN) return; // porcelain 은 이벤트 줄만 낸다
+  console.log(`${C.dim(clock())}  ${line}`);
+};
+
+/** 연결 상태처럼 이벤트는 아니지만 소비자가 알아야 하는 소식. */
+const note = (kind, text) => {
+  if (PORCELAIN) console.log(`${kind}  ${text}`);
+  else say(C.yellow(text));
+};
 
 /** 주의를 끌어야 하는 이벤트 — 벨을 울린다. */
 const LOUD = new Set(['posted', 'converged', 'failed', 'quota']);
@@ -138,11 +184,20 @@ function runExec(event, ctx) {
 }
 
 function emit(event, ctx, detail = '') {
-  const [color, label] = EVENT_STYLE[event] ?? [C.dim, event];
+  // 필터가 가장 먼저다 — 남의 PR 이면 exec 도 돌지 않아야 한다.
+  if (!matchesFilter(ctx.key)) return;
   if (QUIET && !LOUD.has(event)) return;
-  const bell = BELL && LOUD.has(event) ? '\x07' : '';
-  say(`${bell}${color(C.bold(label.padEnd(7)))} ${C.bold(ctx.key)}${detail ? '  ' + C.dim(detail) : ''}`);
-  if (ctx.url) say(C.dim(`         ${ctx.url}`));
+
+  if (PORCELAIN) {
+    console.log([event, ctx.key, detail, ctx.url ?? ''].filter(Boolean).join('  '));
+  } else {
+    const [color, label] = EVENT_STYLE[event] ?? [C.dim, event];
+    const bell = BELL && LOUD.has(event) ? '\x07' : '';
+    say(
+      `${bell}${color(C.bold(label.padEnd(7)))} ${C.bold(ctx.key)}${detail ? '  ' + C.dim(detail) : ''}`,
+    );
+    if (ctx.url) say(C.dim(`         ${ctx.url}`));
+  }
   runExec(event, ctx);
 }
 
@@ -174,7 +229,7 @@ function onSnapshot(s) {
   // watch 재시작 → 기준선을 다시 잡는다. 안 그러면 재시작 직후 모든 PR 의
   // 현재 상태가 방금 일어난 일처럼 한꺼번에 쏟아진다.
   if (s.session !== session) {
-    if (session !== null) say(C.yellow('── watch 재시작 감지 — 기준선을 다시 잡습니다 ──'));
+    if (session !== null) note('watch-restarted', '── watch 재시작 감지 — 기준선을 다시 잡습니다 ──');
     session = s.session;
     baselined = false;
     prevPhase = null;
@@ -210,12 +265,34 @@ function onSnapshot(s) {
 
   if (!baselined) {
     baselined = true;
-    const watching = s.contexts.filter((c) => !c.excludedReason);
-    say(C.green(`연결됨 — ${s.scope || '범위 미설정'}`));
-    for (const c of watching) {
-      say(C.dim(`  · ${c.key}  ${c.stateLabel}  ${c.round}라운드`));
+    const watching = s.contexts.filter((c) => matchesFilter(c.key));
+
+    // 필터에 걸리는 PR 이 하나도 없으면 오타일 가능성이 높다. 조용히 기다리면
+    // 영원히 아무 일도 안 일어나는데 그게 정상처럼 보인다 — 반드시 짚어준다.
+    // (아직 추적 전인 새 PR 일 수도 있으므로 경고까지만 하고 계속 돈다.)
+    if (FILTERS.length > 0 && watching.length === 0) {
+      note(
+        'filter-no-match',
+        `⚠ --pr 필터(${FILTERS.map((f) => f.label).join(', ')})와 맞는 PR 이 지금은 없습니다 — ` +
+          `오타이거나 아직 추적 전일 수 있습니다. 추적 중: ${s.contexts.map((c) => c.key).join(', ') || '없음'}`,
+      );
     }
-    if (a) say(C.cyan(`  · 진행 중: ${a.key} ${a.round}차 (${a.phase})`));
+
+    if (PORCELAIN) {
+      console.log(
+        `connected  ${FILTERS.length ? FILTERS.map((f) => f.label).join(',') : '전체'}  ` +
+          `watching=${watching.map((c) => `${c.key}:${c.state}`).join(',') || '없음'}` +
+          (a && matchesFilter(a.key) ? `  active=${a.key}:${a.phase}` : ''),
+      );
+      return;
+    }
+
+    say(C.green(`연결됨 — ${s.scope || '범위 미설정'}`));
+    if (FILTERS.length > 0) say(C.cyan(`  대상: ${FILTERS.map((f) => f.label).join(', ')}`));
+    for (const c of watching) {
+      say(C.dim(`  · ${c.key}  ${c.stateLabel}  ${c.round}라운드${c.excludedReason ? `  (제외: ${c.excludedReason})` : ''}`));
+    }
+    if (a && matchesFilter(a.key)) say(C.cyan(`  · 진행 중: ${a.key} ${a.round}차 (${a.phase})`));
   }
 }
 
@@ -251,13 +328,16 @@ async function stream() {
 }
 
 async function main() {
-  console.log(C.bold(`\n  대시보드 이벤트 알림  ${C.dim(ORIGIN)}`));
-  console.log(
-    C.dim(
-      `  exec: ${EXEC ? `${EXEC}  (on ${[...ON].join(',')})` : '없음'}` +
-        `${BELL ? ' · 벨 켜짐' : ''}\n`,
-    ),
-  );
+  if (!PORCELAIN) {
+    console.log(C.bold(`\n  대시보드 이벤트 알림  ${C.dim(ORIGIN)}`));
+    console.log(
+      C.dim(
+        `  대상: ${FILTERS.length ? FILTERS.map((f) => f.label).join(', ') : '전체'}` +
+          ` · exec: ${EXEC ? `${EXEC}  (on ${[...ON].join(',')})` : '없음'}` +
+          `${BELL ? ' · 벨 켜짐' : ''}\n`,
+      ),
+    );
+  }
 
   let backoff = 1000;
   for (;;) {
@@ -271,7 +351,7 @@ async function main() {
       // 잡아내야 한다 — 3초 끊겼다고 그 사이 게시된 리뷰를 놓치면 알림의 의미가
       // 없다. watch 자체가 재시작됐을 때만 onSnapshot 의 session 비교가
       // 기준선을 다시 잡는다.
-      if (session !== null) say(C.yellow(`연결 끊김 (${e.message}) — 재연결합니다`));
+      if (session !== null) note('disconnected', `연결 끊김 (${e.message}) — 재연결합니다`);
     }
     // 한 번이라도 붙었으면 짧게 재시도한다 (watch 재시작은 몇 초면 끝난다).
     // 아직 한 번도 못 붙었으면 backoff — watch 를 켜기 전에 띄워둬도 괜찮게.

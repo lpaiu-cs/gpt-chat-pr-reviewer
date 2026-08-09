@@ -320,11 +320,38 @@ npm run notify
 | `converged` | 수렴 (approve) |
 | `failed` / `quota` / `closed` | 실패 / 한도 / PR 종료 |
 
+**`--pr`로 대상을 좁히세요.** 대시보드 하나를 여러 작업 세션이 함께 보는 경우, 필터가 없으면 남의 PR이 게시될 때마다 전부 깨어납니다.
+
+```bash
+node scripts/notify.mjs --pr myorg/api#34        # 그 PR만
+node scripts/notify.mjs --pr myorg/api           # 그 레포 전체
+node scripts/notify.mjs --pr myorg/api#34,myorg/web#7
+```
+
+대소문자·여백·선행 0(`#034` → `#34`)은 알아서 맞춥니다. 필터에 걸리는 PR이 하나도 없으면 **경고하고 현재 추적 중인 PR 목록을 보여줍니다** — 오타로 조용히 영원히 기다리는 상황을 막기 위해서입니다.
+
 `--exec`로 명령을 걸면 자동화로 이어집니다. 기본 트리거는 `posted,converged,failed`입니다.
 
 ```bash
-node scripts/notify.mjs --on posted --exec "your-handler.sh"
+node scripts/notify.mjs --pr myorg/api#34 --on posted --exec "your-handler.sh"
 ```
+
+### 에이전트가 소비할 때
+
+`--porcelain`은 **이벤트 1건 = 1줄**, 배너도 색도 벨도 없이 냅니다. 코딩 에이전트가 자기 PR의 리뷰를 기다렸다가 지적을 반영하고 다시 대기하는 루프를 만들 때 씁니다.
+
+```bash
+node scripts/notify.mjs --porcelain --pr myorg/api#34
+```
+
+```
+connected  myorg/api#34  watching=myorg/api#34:AWAITING_AUTHOR
+round-start  myorg/api#34  2차 · 작성자 응답  https://github.com/myorg/api/pull/34
+posting  myorg/api#34  2차 · 대기 412초 경과  https://github.com/myorg/api/pull/34
+posted  myorg/api#34  2라운드 · 요청 3개 · 스레드 0/3  https://github.com/myorg/api/pull/34
+```
+
+연결 상태도 같은 형식(`connected` / `disconnected` / `watch-restarted` / `filter-no-match`)으로 나오므로, 침묵이 "아직 안 옴"인지 "끊김"인지 구분할 수 있습니다.
 
 명령에는 `PR_EVENT` `PR_KEY` `PR_URL` `PR_OWNER` `PR_REPO` `PR_NUMBER` `PR_ROUND` `PR_STATE` `PR_TITLE`이 환경변수로 넘어갑니다. 셸은 플랫폼 기본(Windows는 `cmd`)이므로 인라인 명령에서 변수를 쓸 때는 `%PR_NUMBER%` / `$PR_NUMBER`로 각각 맞춰야 합니다 — 스크립트 파일로 넘기면 신경 쓸 필요가 없습니다.
 
