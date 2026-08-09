@@ -77,6 +77,51 @@ const MESSAGE_ID_ATTR = 'data-message-id';
 /** 식별자를 못 잡았을 때, 축소 관측을 이만큼 연속으로 보면 수집 실패로 본다. */
 const SHRINK_TOLERANCE = 3;
 
+/**
+ * 중지 버튼이 남아 있어도 생성 네트워크가 이만큼 조용하면 스트림이 끝난 것으로 본다.
+ *
+ * 넉넉히 잡는다. 추론 모드는 화면도 네트워크도 한동안 조용할 수 있고, 잘못 낮추면
+ * 정상 응답을 절단한다 — 이슈 #1 이 "근인 확정 전 수정 금지" 를 건 이유가 그것이다.
+ */
+const STREAM_QUIET_LIMIT_MS = 180_000;
+
+/** 화면이 멎었을 때 진단 덤프를 남기는 주기 (같은 라운드 안에서). */
+const STALL_DUMP_EVERY_MS = 120_000;
+
+/** 스트리밍 판정에 쓰는 신호들. */
+export interface StreamSignals {
+  /** 중지 버튼이 보이는가 */
+  button: boolean;
+  /** 생성 요청을 한 번이라도 관측했는가 (= 네트워크 추적이 동작하는가) */
+  sawGeneration: boolean;
+  /** 진행 중인 생성 요청 수 */
+  inFlight: number;
+  /** 마지막 생성 네트워크 움직임 이후 경과 (ms) */
+  quietMs: number;
+}
+
+/**
+ * 정말 생성 중인지 판정한다 (순수 함수 — 이슈 #1).
+ *
+ * 중지 버튼 하나로 판정하면 "버튼이 안 사라진 상태" 에서 복구 경로(`!streaming`)에
+ * 영영 진입하지 못하고 예산을 통째로 태운다. 그렇다고 정체 타임아웃만 넣으면
+ * 오래 걸리는 추론을 절단한다. 그래서 **네트워크가 죽었다는 적극적 근거**가 있을
+ * 때만 판정을 내린다.
+ *
+ * 추적이 한 번도 안 걸렸으면(`sawGeneration === false`) 근거가 없는 것이므로
+ * 버튼을 그대로 믿는다 — 종전 동작이다.
+ */
+export function judgeStreaming(
+  s: StreamSignals,
+  quietLimitMs: number = STREAM_QUIET_LIMIT_MS,
+): { streaming: boolean; downgraded: boolean } {
+  if (!s.button) return { streaming: false, downgraded: false };
+  if (!s.sawGeneration) return { streaming: true, downgraded: false };
+  if (s.inFlight > 0) return { streaming: true, downgraded: false };
+  if (s.quietMs < quietLimitMs) return { streaming: true, downgraded: false };
+  return { streaming: false, downgraded: true };
+}
+
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
 const SETTLE_STABLE_READS = 3;
 const SETTLE_POLL_MS = 500;
@@ -127,6 +172,14 @@ export class ChatGPTDriver {
   private page: Page | null = null;
   private readonly cfg: AppConfig;
 
+  // ── 생성 네트워크 관측 (이슈 #1) ──
+  /** 생성 요청을 한 번이라도 봤는가 = 추적이 동작하는가 */
+  private sawGeneration = false;
+  /** 진행 중인 생성 요청 수 */
+  private netInFlight = 0;
+  /** 마지막으로 생성 네트워크가 움직인 시각 */
+  private lastNetAt = 0;
+
   constructor(config: AppConfig) {
     this.cfg = config;
   }
@@ -145,6 +198,43 @@ export class ChatGPTDriver {
       ],
     });
     this.page = this.ctx.pages()[0] ?? (await this.ctx.newPage());
+    this.trackGenerationTraffic(this.page);
+  }
+
+  /**
+   * 생성 요청의 생사를 추적한다 (이슈 #1 판별 근거).
+   *
+   * 중지 버튼만 보고는 "정말 만드는 중" 인지 "버튼이 안 사라진 것" 인지 가릴 수
+   * 없다. 실제로 12분간 같은 글자 수로 "생성 중" 이 유지되어 15분 예산을 통째로
+   * 태운 적이 있다. 네트워크가 조용한지 보면 그 둘이 갈린다.
+   *
+   * 패턴에 안 걸려 한 번도 관측하지 못하면 `sawGeneration` 이 false 로 남고,
+   * 그때는 판정을 바꾸지 않는다 — 근거 없는 조기 절단이 더 나쁘다.
+   */
+  private trackGenerationTraffic(page: Page): void {
+    const isGeneration = (url: string, method: string): boolean =>
+      method === 'POST' && /\/backend-api\/[^?]*conversation/.test(url);
+
+    page.on('request', (r) => {
+      if (!isGeneration(r.url(), r.method())) return;
+      this.sawGeneration = true;
+      this.netInFlight++;
+      this.lastNetAt = Date.now();
+    });
+    const settle = (r: { url: () => string; method: () => string }): void => {
+      if (!isGeneration(r.url(), r.method())) return;
+      this.netInFlight = Math.max(0, this.netInFlight - 1);
+      this.lastNetAt = Date.now();
+    };
+    page.on('requestfinished', settle);
+    page.on('requestfailed', settle);
+
+    // 일부 구간은 웹소켓으로 흐른다 — 프레임이 오면 살아 있는 것이다.
+    page.on('websocket', (ws) => {
+      ws.on('framereceived', () => {
+        this.lastNetAt = Date.now();
+      });
+    });
   }
 
   async close(): Promise<void> {
@@ -682,6 +772,9 @@ export class ChatGPTDriver {
     let recoveries = 0;
     let lastLogAt = Date.now();
     let lastQuotaCheckAt = Date.now();
+    let lastChangeAt = Date.now();
+    let lastDumpAt = Date.now();
+    let downgradeLogged = false;
     const t0 = Date.now();
 
     while (Date.now() - t0 < timeout) {
@@ -724,8 +817,38 @@ export class ChatGPTDriver {
         lastText = cur;
       }
 
-      const streaming = await this.isStreaming(page);
+      const probe = await this.probeStreaming(page);
+      const streaming = probe.streaming;
+      if (probe.downgraded && !downgradeLogged) {
+        downgradeLogged = true;
+        console.log(
+          chalk.yellow(
+            '  ⚠ 중지 버튼은 남아 있지만 생성 네트워크가 조용합니다 — 스트림이 끝난 것으로 봅니다 (이슈 #1).',
+          ),
+        );
+      }
       const phase = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
+
+      // ── 정체 진단 (이슈 #1) ──
+      // 화면이 멎었는데 계속 "생성 중" 이면, 그 순간의 근거를 남긴다. 재현될 때
+      // 사람이 붙어 있지 않아도 (a) 스트림 사망 / (b) 셀렉터 오탐 / (c) 실제 생성
+      // 중을 사후에 가릴 수 있어야 한다.
+      if (cur !== '' && cur === lastText) {
+        if (lastChangeAt === 0) lastChangeAt = Date.now();
+      } else {
+        lastChangeAt = Date.now();
+      }
+      if (streaming && Date.now() - lastDumpAt > STALL_DUMP_EVERY_MS && Date.now() - lastChangeAt > STALL_DUMP_EVERY_MS) {
+        lastDumpAt = Date.now();
+        const quiet = this.lastNetAt ? Math.round((Date.now() - this.lastNetAt) / 1000) : -1;
+        console.log(
+          chalk.yellow(
+            `  ⚠ ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 화면 변화 없음 · ` +
+              `생성요청 ${this.netInFlight}건 진행 · 네트워크 ${quiet}초째 조용 · ` +
+              `중지버튼 ${await this.dumpStopButtons(page)}`,
+          ),
+        );
+      }
 
       // 아직 아무것도 안 나왔고 생성 중도 아니면 한도에 막힌 것일 수 있다.
       // 예전에는 이 검사가 "60초 시작 타임아웃" catch 에만 있어서, 그 시점을
@@ -814,6 +937,45 @@ export class ChatGPTDriver {
       await page.waitForTimeout(IDLE_POLL_MS);
     }
     console.log(chalk.dim('  이전 생성이 끝났습니다 — 전송을 계속합니다.'));
+  }
+
+  /**
+   * 지금 정말 생성 중인가 — 버튼 + 네트워크를 함께 본다 (이슈 #1).
+   * `downgraded` 는 "버튼은 남았는데 네트워크가 죽었다" 는 뜻이다.
+   */
+  private async probeStreaming(page: Page): Promise<{ streaming: boolean; downgraded: boolean }> {
+    return judgeStreaming({
+      button: await this.isStreaming(page),
+      sawGeneration: this.sawGeneration,
+      inFlight: this.netInFlight,
+      quietMs: this.lastNetAt ? Date.now() - this.lastNetAt : Number.POSITIVE_INFINITY,
+    });
+  }
+
+  /**
+   * 중지 버튼 셀렉터에 **무엇이 걸렸는지** 덤프한다 (이슈 #1 다음 단계 1).
+   *
+   * 오탐(받아쓰기 중지 등 다른 버튼)인지 진짜 생성 중지 버튼인지는 이걸 봐야 갈린다.
+   * 재현될 때 자동으로 남게 해 두지 않으면 사람이 그 순간에 붙어 있어야 한다.
+   */
+  private async dumpStopButtons(page: Page): Promise<string> {
+    try {
+      const info = await page.evaluate((selector) => {
+        return [...document.querySelectorAll(selector)].map((el) => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          return {
+            tag: el.tagName.toLowerCase(),
+            testid: el.getAttribute('data-testid'),
+            aria: el.getAttribute('aria-label'),
+            disabled: (el as HTMLButtonElement).disabled ?? null,
+            visible: r.width > 0 && r.height > 0,
+          };
+        });
+      }, this.cfg.selectors.stopButton);
+      return info.length === 0 ? '(매칭 없음)' : JSON.stringify(info);
+    } catch {
+      return '(덤프 실패)';
+    }
   }
 
   /** 생성 중지 버튼이 있으면 아직 스트리밍 중. */

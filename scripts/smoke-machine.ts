@@ -27,7 +27,7 @@ import {
   buildPreviousBlock,
   judgeReclaim,
 } from '../src/reviewer.js';
-import { parseConversationUrl, findRoundBaseline } from '../src/chatgpt.js';
+import { parseConversationUrl, findRoundBaseline, judgeStreaming } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import {
   acquireLock,
@@ -1125,6 +1125,39 @@ const fakePR: PRInfo = {
   assert(legacy.state === 'CONVERGED', 'base 기록이 없으면 base 로 전이시키지 않는다');
   applySyncEvents(cfg, legacy, { status: 'OPEN', headSha: 'A' });
   assert(legacy.state === 'CONVERGED', 'base 를 안 싣는 스냅샷도 그대로 둔다');
+}
+
+// ── 시나리오 38: 정말 생성 중인가 (이슈 #1) ────────────────
+
+{
+  // 중지 버튼 하나로 판정하면, 버튼이 안 사라지는 상태에서 복구 경로(!streaming)에
+  // 영영 못 들어가 예산을 통째로 태운다 (실측 12분 정체 → 15분 타임아웃).
+  // 그렇다고 정체 타임아웃만 넣으면 오래 걸리는 추론을 절단한다. 그래서
+  // **네트워크가 죽었다는 적극적 근거**가 있을 때만 판정을 뒤집는다.
+  const LIMIT = 180_000;
+  const sig = (o: Partial<Parameters<typeof judgeStreaming>[0]>) =>
+    judgeStreaming(
+      { button: true, sawGeneration: true, inFlight: 0, quietMs: 0, ...o },
+      LIMIT,
+    );
+
+  assert(!sig({ button: false }).streaming, '버튼이 없으면 생성 중이 아니다');
+  assert(sig({ inFlight: 1, quietMs: 10 * LIMIT }).streaming, '요청이 진행 중이면 생성 중이다');
+  assert(sig({ quietMs: LIMIT - 1 }).streaming, '조용해도 한계 전이면 기다린다');
+
+  const dead = sig({ quietMs: LIMIT + 1 });
+  assert(!dead.streaming && dead.downgraded, '버튼은 남고 네트워크가 죽었으면 끝난 것으로 본다');
+
+  // 추적이 한 번도 안 걸렸으면 근거가 없다 — 버튼을 믿는다(종전 동작).
+  // 여기서 끊으면 셀렉터가 안 맞는 환경에서 정상 응답을 절단하게 된다.
+  assert(
+    sig({ sawGeneration: false, quietMs: 10 * LIMIT }).streaming,
+    '네트워크를 한 번도 못 봤으면 판정을 바꾸지 않는다',
+  );
+  assert(
+    !sig({ sawGeneration: false, button: false }).streaming,
+    '추적 불가여도 버튼이 없으면 생성 중이 아니다',
+  );
 }
 
 // ── 시나리오 34: 대화에서 라운드 기준점 찾기 ───────────────
