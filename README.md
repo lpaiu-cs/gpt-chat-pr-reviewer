@@ -128,6 +128,10 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
 
 실측 기준 시간당으로는 탐색 30초 = 120 point, 레포 4개 probe 10초 = 1,440 point입니다. 즉 **레포가 늘 때 비용을 밀어올리는 건 probe이지 탐색이 아닙니다.**
 
+그래서 probe는 **스레드 resolve를 기다리는 레포만 매 주기** 돌고, 나머지는 `probeIdleIntervalMs`(기본 60초)로 늦춥니다. 10초가 정말 필요한 건 `AWAITING_AUTHOR` 상태뿐입니다 — 작성자가 방금 응답했고 사람이 결과를 기다리는 상황이니까요. 나머지에서 probe가 잡는 것(새 PR·새 커밋·닫힘)은 몇십 초 늦어도 무해합니다. 라운드 자체가 2~15분이니까요.
+
+건너뛴 주기에도 **이미 추적 중인 PR은 대기열에 그대로 남습니다.** GitHub을 부르지 않을 뿐 판정이 바뀐 게 아닙니다.
+
 검색 인덱스는 반영 지연이 있어 새 커밋 감지에는 쓰지 않고 **대상 목록을 정하는 데에만** 사용합니다. 탐색은 `scan()` 안에서만 돌므로 `watchIntervalMs`(기본 10초)보다 촘촘해지지는 않습니다.
 
 ## 리뷰 큐
@@ -406,6 +410,7 @@ posted  myorg/api#34  2라운드 · 요청 3개 · 스레드 0/3  https://github
 | `watch` | — | 감시 범위 — [위 절](#감시-범위) 참고 |
 | `watchRepos` | `[]` | 감시할 `owner/repo` 목록 (구버전 — `watch.include` 폴백) |
 | `watchIntervalMs` | `10000` | 폴링 간격 (10초, 하한 5초) |
+| `probeIdleIntervalMs` | `60000` | resolve 대기가 없는 레포의 probe 주기 |
 | `quotaCooldownMs` | `10800000` | 쿼터 쿨다운 (3시간) |
 | `maxAutoRetries` | `2` | ERROR 자동 재시도 횟수 |
 | `maxTurnsPerConversation` | `5` | 대화 1개에 전송할 최대 프롬프트 수 (도달 시 새 대화) |
