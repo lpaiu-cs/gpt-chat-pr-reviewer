@@ -62,7 +62,12 @@ import {
   TIER_FIRST_ROUND,
   TIER_OTHER,
 } from '../src/queue.js';
-import { saveResponse, hasResponseForRound, hasResponseSince } from '../src/cache.js';
+import {
+  saveResponse,
+  loadLatestResponse,
+  hasResponseForRound,
+  hasResponseSince,
+} from '../src/cache.js';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, utimesSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -1193,6 +1198,12 @@ const fakePR: PRInfo = {
   // 낡은 응답을 게시하는 쪽보다 낫다.
   assert(hasResponseSince(cfg, ctx, 2, null), '전송 시각을 모르면 라운드 단위로 판정');
   assert(!hasResponseSince(cfg, ctx, 3, null), '응답이 없는 라운드는 그대로 false');
+
+  // 검토 대상은 사이드카에 남는다. --from-cache 는 아무것도 전송하지 않으므로
+  // 여기 없으면 게시 시점의 최신 커밋에 리뷰가 붙고 그게 검토 완료로 기록된다.
+  saveResponse(cfg, ctx, 4, '4차 응답', { headSha: 'sha4', baseRef: 'main' });
+  const hit = loadLatestResponse(cfg, ctx);
+  assert(hit?.meta?.headSha === 'sha4' && hit?.meta?.baseRef === 'main', '캐시가 검토 대상을 남긴다');
 
   rmSync(dir, { recursive: true, force: true });
 }

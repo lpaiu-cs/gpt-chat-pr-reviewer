@@ -34,6 +34,15 @@ export interface ResponseMeta {
   conversationUrl?: string;
   /** dry-run 의 일회성 대화에서 나온 응답인지 */
   dryRun?: boolean;
+  /**
+   * **이 응답이 검토한 대상** (`base...head`).
+   *
+   * --from-cache 는 아무것도 전송하지 않으므로 대상을 다시 알아낼 방법이 없다.
+   * 없으면 리뷰가 게시 시점의 최신 커밋에 붙고 그 커밋이 검토 완료로 기록된다 —
+   * 보지 않은 코드가 수렴하는 경로가 캐시 재사용에도 그대로 있다.
+   */
+  headSha?: string;
+  baseRef?: string;
 }
 
 /** 원본 응답과 출처를 저장하고 .txt 경로를 반환한다. */

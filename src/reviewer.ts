@@ -616,7 +616,10 @@ async function reclaimRound(
   // 기준점을 findRound 가 준 값으로 넘긴다. 완료 판정(스트리밍 종료 + 안정)은
   // collectResponse 가 하므로, 이미 와 있는 답이면 즉시, 생성 중이면 끝까지 기다린다.
   const raw = await driver.collectFrom(baseline);
-  const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl: url });
+  const saved = saveResponse(cfg, ctx, round, raw, {
+    conversationUrl: url,
+    ...targetMeta(sent),
+  });
   console.log(chalk.dim(`  응답 저장: ${saved}`));
   return { raw, target: sent };
 }
@@ -715,7 +718,13 @@ async function obtainRaw(
       );
       saveContext(cfg, ctx);
     }
-    return { raw: hit.raw, target: { headSha: null, baseRef: null } };
+    // 캐시에 검토 대상이 남아 있으면 그대로 쓴다. 없으면(구버전 캐시) 알 수 없으므로
+    // 종전대로 commit_id 없이 게시하고 동기화 값으로 기록한다 — --from-cache 는
+    // 사용자가 "이 응답을 다시 써라" 고 명시한 경로라 여기서 막지는 않는다.
+    return {
+      raw: hit.raw,
+      target: { headSha: hit.meta?.headSha ?? null, baseRef: hit.meta?.baseRef ?? null },
+    };
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
@@ -741,6 +750,14 @@ async function obtainRaw(
     ? { headSha: null, baseRef: null }
     : currentTarget(ctx);
 
+  // 확정하지 못하면 **보내지 않는다.** 회수는 fail-closed 인데 전송만 fail-open 이면
+  // 구멍은 그대로다: 대상 없이 보낸 라운드는 commit_id 없이 게시되고, 대기 중에
+  // 들어온 커밋이 검토 완료로 기록돼 approve 하나로 CONVERGED 가 된다.
+  // 여기서 던지면 countTurn 전이라 대화 한도도 쓰지 않고, ERROR → RETRY 로 돌아온다.
+  if (!opts.dryRun && (!target.headSha || !target.baseRef)) {
+    throw new Error('리뷰 대상(head·base)을 확인하지 못했습니다 — 전송하지 않고 재시도합니다.');
+  }
+
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
   if (!opts.dryRun) {
@@ -762,10 +779,22 @@ async function obtainRaw(
     }
   });
 
-  const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl, dryRun: opts.dryRun });
+  const saved = saveResponse(cfg, ctx, round, raw, {
+    conversationUrl,
+    dryRun: opts.dryRun,
+    ...targetMeta(target),
+  });
   console.log(chalk.dim(`  응답 저장: ${saved}`));
   clearPendingSend(cfg, ctx, opts);
   return { raw, target };
+}
+
+/** 검토 대상을 캐시 사이드카에 남긴다 (--from-cache 가 다시 알아낼 방법이 없다). */
+function targetMeta(t: ReviewTarget): { headSha?: string; baseRef?: string } {
+  return {
+    ...(t.headSha ? { headSha: t.headSha } : {}),
+    ...(t.baseRef ? { baseRef: t.baseRef } : {}),
+  };
 }
 
 /** 응답을 확보했으면 대기 기록을 지운다 — 남겨두면 다음 라운드의 판정을 흐린다. */
