@@ -242,6 +242,22 @@ export function planConversation(
   return { action: 'resume', url, turnsUsed };
 }
 
+/**
+ * 이번 전송을 대화 누적에 반영하고 누적값을 반환한다.
+ *
+ * URL 이 없는 동안 쌓인 누적은 물려받지 않는다. URL 은 전송이 정상 반환된 뒤에야
+ * 기록되므로, 전송·수집 중 예외가 나면 "누적은 있는데 URL 은 없는" 상태가 남는다.
+ * 그 대화는 주소를 모르니 다시 돌아갈 수도 없어서 누적을 셀 이유가 없는데, 그대로
+ * 물려받으면 정작 살아남은 새 대화가 상한에 일찍 걸려 조기 회전한다.
+ *
+ * 전송 **직전**에 부른다 — 쿼터 한도 등으로 예외가 나도 프롬프트는 이미 대화에
+ * 남아 있다. 과다 계상은 회전이 빨라질 뿐이라 안전한 방향이다.
+ */
+export function countTurn(ctx: PRContext): number {
+  ctx.conversationTurns = (ctx.conversationUrl ? (ctx.conversationTurns ?? 0) : 0) + 1;
+  return ctx.conversationTurns;
+}
+
 /** 대화 참조를 놓는다 (수렴·PR 종료·복귀 실패·캐시 출처 불일치 시). */
 export function releaseConversation(ctx: PRContext): void {
   ctx.conversationUrl = undefined;
@@ -505,7 +521,7 @@ async function obtainRaw(
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
   if (!opts.dryRun) {
-    ctx.conversationTurns = (ctx.conversationTurns ?? 0) + 1;
+    countTurn(ctx);
     saveContext(cfg, ctx);
   }
 

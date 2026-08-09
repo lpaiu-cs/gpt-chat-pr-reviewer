@@ -132,6 +132,9 @@ export interface PRContext {
    * 완료된 라운드로 세면 안 된다 — 파싱·게시가 실패하면 ctx.round 는 늘지 않지만
    * 프롬프트와 응답은 이미 대화에 쌓여 있다. 라운드 기준이면 자동 재시도가
    * 컨텍스트 보호 상한을 그대로 우회한다.
+   *
+   * conversationUrl 과 짝을 이룰 때만 의미가 있다. URL 없이 남아 있는 값은 주소를
+   * 확보하지 못한 채 끝난 대화의 잔여물이며, 다음 전송에서 버려진다(countTurn).
    */
   conversationTurns?: number;
   retryCount: number;

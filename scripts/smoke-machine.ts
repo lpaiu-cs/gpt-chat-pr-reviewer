@@ -16,6 +16,7 @@ import {
   planConversation,
   releaseConversation,
   reconcileCachedOrigin,
+  countTurn,
   buildPreviousBlock,
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
@@ -342,6 +343,21 @@ const fakePR: PRInfo = {
     '실패한 재시도도 전송으로 세어 회전시킨다 (라운드 기준이면 우회됨)',
   );
   tracked.conversationTurns = 1;
+
+  // 리뷰 지적 [P2]: URL 은 전송이 정상 반환된 뒤에야 기록된다. 전송·수집 중 예외가
+  // 나면 "누적은 있는데 URL 은 없는" 상태가 남는데, 그 대화는 주소를 몰라 다시
+  // 갈 수도 없다. 물려받으면 살아남은 새 대화가 상한에 일찍 걸려 조기 회전한다.
+  const orphan = createContext(fakePR);
+  orphan.conversationTurns = 4; // 앞선 시도들이 URL 확보 전에 죽어 남긴 값
+  assert(countTurn(orphan) === 1, 'URL 없는 잔여 누적은 물려받지 않는다');
+
+  const alive = createContext(fakePR);
+  alive.conversationUrl = CONV;
+  alive.conversationTurns = 2;
+  assert(countTurn(alive) === 3, 'URL 이 있으면 그 대화의 누적을 이어서 센다');
+
+  const firstEver = createContext(fakePR);
+  assert(countTurn(firstEver) === 1, '첫 전송은 1회');
 
   // 리뷰 지적 [P1]: dry-run 이 저장된 대화에 프롬프트를 끼워 넣으면, 라운드도 상태도
   // 남지 않은 채 다음 실제 라운드가 같은 회차의 dry-run 응답이 섞인 대화를 물려받는다.
