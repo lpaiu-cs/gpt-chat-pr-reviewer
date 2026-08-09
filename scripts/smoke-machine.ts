@@ -22,7 +22,7 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
-import { acquireLock, readLock, LockHeldError } from '../src/lock.js';
+import { acquireLock, readLock, readLockPort, lockPort, LockHeldError } from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
@@ -49,6 +49,7 @@ import {
   TIER_OTHER,
 } from '../src/queue.js';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
@@ -1287,67 +1288,64 @@ const fakePR: PRInfo = {
 // ── 시나리오 33: 단일 인스턴스 잠금 ────────────────────────
 
 {
+  // 잠금은 **루프백 포트**로 잡는다. 파일이 아니라 커널이 "정확히 하나" 를
+  // 보장하고, 프로세스가 어떻게 죽든 커널이 회수하므로 잔여 상태 자체가 없다.
   const dir = mkdtempSync(path.join(tmpdir(), 'pr-review-lock-'));
+  const other = mkdtempSync(path.join(tmpdir(), 'pr-review-lock2-'));
 
-  const release = acquireLock(dir, 'watch');
-  assert(!!readLock(dir), '잠금을 잡으면 파일이 생긴다');
+  const release = await acquireLock(dir, 'watch');
+  assert(readLock(dir)?.pid === process.pid, '잠금을 잡으면 정보 파일에 주인이 적힌다');
 
   let blocked = false;
   try {
-    acquireLock(dir, 'review');
+    await acquireLock(dir, 'review');
   } catch (e) {
     blocked = e instanceof LockHeldError;
   }
-  assert(blocked, '살아 있는 주인이 있으면 LockHeldError');
+  assert(blocked, '같은 dataDir 은 LockHeldError');
 
-  release();
-  assert(readLock(dir) === null, '해제하면 잠금이 사라진다');
-  release(); // 멱등
-  assert(readLock(dir) === null, '해제는 여러 번 불러도 안전하다');
-
-  // 주인이 죽은 잔여 잠금 — 자동 인수해야 한다.
-  // (그러지 않으면 kill -9 한 번에 사용자가 파일을 손으로 지워야 한다)
-  mkdirSync(path.join(dir, 'watch.lock'), { recursive: true });
-  writeFileSync(
-    path.join(dir, 'watch.lock', 'owner.json'),
-    JSON.stringify({ pid: 999_999, startedAt: new Date().toISOString(), command: 'watch' }),
-  );
-  assert(readLock(dir) === null, '죽은 pid 의 잠금은 없는 것으로 본다');
-  const r2 = acquireLock(dir, 'watch');
-  assert(readLock(dir)?.pid === process.pid, '잔여 잠금을 넘겨받는다');
+  // dataDir 이 다르면 상태를 공유하지 않으므로 동시에 돌아도 된다.
+  const r2 = await acquireLock(other, 'watch');
+  assert(readLock(dir)?.port !== readLock(other)?.port, 'dataDir 이 다르면 다른 포트를 잡는다');
   r2();
 
-  // 깨진 owner.json 도 (유예 시간이 지나면) 잔여물로 본다 — 못 읽는 잠금 때문에
-  // 영영 못 뜨면 안 된다. 유예 안이면 '방금 잡은 것' 으로 보고 건드리지 않는다.
-  mkdirSync(path.join(dir, 'watch.lock'), { recursive: true });
-  writeFileSync(path.join(dir, 'watch.lock', 'owner.json'), 'not json');
-  assert(readLock(dir) === null, '깨진 owner.json 은 주인이 없는 것으로 본다');
-  rmSync(path.join(dir, 'watch.lock'), { recursive: true, force: true });
+  release();
+  const again = await acquireLock(dir, 'watch');
+  assert(!!again, '해제 후 다시 잡을 수 있다');
+  again();
+  again(); // 멱등
 
-  // 해제는 **내가 쓴 것일 때만** 지운다. 잔여 잠금을 남이 인수한 뒤라면 그쪽 것을
-  // 지워서는 안 된다 (지우면 세 번째 프로세스가 끼어든다).
-  const mine = acquireLock(dir, 'watch');
+  // 정보 파일은 안내용일 뿐 잠금 판정에 쓰이지 않는다 — 남아 있어도 획득을 막지 않는다.
+  // (파일 기반이었다면 이런 잔여물이 인수 경쟁을 만들었다)
   writeFileSync(
-    path.join(dir, 'watch.lock', 'owner.json'),
-    JSON.stringify({ pid: 999_998, startedAt: new Date().toISOString(), command: 'watch' }),
+    path.join(dir, 'watch.lock.json'),
+    JSON.stringify({ pid: 999_999, startedAt: new Date().toISOString(), command: 'watch' }),
   );
-  mine();
-  assert(existsSync(path.join(dir, 'watch.lock')), '남의 잠금은 지우지 않는다');
-  rmSync(path.join(dir, 'watch.lock'), { recursive: true, force: true });
+  const stale = await acquireLock(dir, 'watch');
+  assert(readLock(dir)?.pid === process.pid, '잔여 정보 파일은 획득을 막지 않는다');
+  stale();
 
-  // 방금 만들어져 owner.json 이 아직 없는 잠금 — 뺏으면 안 된다.
-  // (mkdir 과 owner.json 쓰기 사이의 틈에서 읽힌 경우다)
-  mkdirSync(path.join(dir, 'watch.lock'), { recursive: true });
-  let settling = false;
-  try {
-    acquireLock(dir, 'review');
-  } catch {
-    settling = true;
-  }
-  assert(settling, 'owner.json 이 아직 없는 잠금은 인수하지 않는다 (막 획득한 것일 수 있다)');
-  rmSync(path.join(dir, 'watch.lock'), { recursive: true, force: true });
+  // 포트 선정은 `lock.port` 가 없을 때 한 번만 걷는다. 시작 후보가 막혀 있으면
+  // 다음 후보로 넘어간다 — 고정 포트였다면 45000 대역이 통째로 예약된 머신에서
+  // 도구가 아예 안 뜬다 (실제로 그런 머신이 있었다).
+  const fresh = mkdtempSync(path.join(tmpdir(), 'pr-review-lock3-'));
+  const squatter = createServer((s) => s.end('nope'));
+  await new Promise<void>((r) => squatter.listen(lockPort(fresh, 0), '127.0.0.1', r));
+  const walked = await acquireLock(fresh, 'watch');
+  assert(readLockPort(fresh) === lockPort(fresh, 1), '막힌 시작 후보는 건너뛰고 다음을 정한다');
+  walked();
+  await new Promise<void>((r) => squatter.close(() => r()));
+
+  // 한 번 정해진 포트는 못 박힌다. 획득 경로가 매번 다시 걸으면 경쟁 중에
+  // "해제되는 중" 을 "예약" 으로 오인해 옆 포트로 새고, 잠금이 N 개로 분열한다.
+  const pinned = readLockPort(fresh);
+  const again2 = await acquireLock(fresh, 'watch');
+  assert(readLock(fresh)?.port === pinned, '정해진 포트는 다음 실행에서도 그대로다');
+  again2();
+  rmSync(fresh, { recursive: true, force: true });
 
   rmSync(dir, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
 }
 
 // ── 결과 ────────────────────────────────────────────────────
