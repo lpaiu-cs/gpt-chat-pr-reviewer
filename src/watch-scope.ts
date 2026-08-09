@@ -11,7 +11,7 @@
 
 import chalk from 'chalk';
 import { searchPRRepos } from './github.js';
-import type { AppConfig, WatchFilters, WatchScope } from './types.js';
+import type { AppConfig, WatchFilters, WatchMode, WatchScope } from './types.js';
 
 /**
  * 레포 재탐색 기본 주기.
@@ -90,6 +90,24 @@ export function resolveWatchScope(cfg: AppConfig): WatchScope | null {
 }
 
 /** 글롭에서 검색에 쓸 소유자(org/user)를 뽑는다. 소유자 자리가 글롭이면 못 쓴다. */
+/**
+ * 이 모드의 탐색이 **실제로 펼칠 수 없는** include 패턴을 골라낸다.
+ *
+ * 저장 전 검증(UI)과 `discoverRepos` 가 반드시 이 함수를 함께 써야 한다.
+ * 갈라지면 "UI 는 받아주고 백엔드는 조용히 버리는" 조합이 생기고, lingering
+ * 컨텍스트가 남아 있으면 그 실패가 한동안 가려져 더 늦게 발견된다.
+ *
+ *  repos            글롭을 검색 없이 펼칠 수 없다 → `*` 포함 패턴 전부 불가
+ *  account          검색이 `org:<owner>` 단위라 소유자 자리가 글롭이면 불가
+ *  review-requested 검색 조건이 PR 단위이고 include 는 결과를 거르는 데만
+ *                   쓰이므로 글롭에 제약이 없다
+ */
+export function unsupportedPatterns(mode: WatchMode, include: string[]): string[] {
+  if (mode === 'repos') return include.filter((p) => p.includes('*'));
+  if (mode === 'account') return ownersFromPatterns(include).skipped;
+  return [];
+}
+
 function ownersFromPatterns(include: string[]): { owners: string[]; skipped: string[] } {
   const owners = new Set<string>();
   const skipped: string[] = [];
@@ -127,7 +145,8 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
 
   if (scope.mode === 'repos') {
     // 글롭은 검색 없이 펼칠 수 없다. 조용히 버리면 감시 대상이 통째로 빠진다.
-    const globs = scope.include.filter((p) => p.includes('*'));
+    // 판정은 unsupportedPatterns 하나로만 한다 — UI 검증과 갈라지면 안 된다.
+    const globs = unsupportedPatterns('repos', scope.include);
     if (globs.length > 0) {
       console.log(
         chalk.yellow(
@@ -202,6 +221,17 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
 export interface RepoSource {
   /** 필요하면 재탐색하고 현재 대상 목록을 돌려준다. */
   list(): string[];
+  /**
+   * 감시 범위가 **런타임에 바뀌었을 때** 호출한다. 캐시·targets·freshness 를
+   * 모두 버려 다음 list() 가 새 범위로 처음부터 탐색하게 한다.
+   *
+   * `lastAt = 0` 만으로는 부족하다. 그건 "다시 탐색하라" 일 뿐이고, 그 탐색이
+   * 부분 실패하면 `nextRepoCache` 가 **의도적으로 이전 캐시를 보존**하므로
+   * 옛 범위의 레포가 그대로 살아남는다 (일시적 오류로 감시가 끊기지 않게 하려는
+   * 설계다). 그 상태로 scan 이 돌면 방금 범위에서 뺀 레포의 PR 에 리뷰를 게시할
+   * 수 있고, 게시는 되돌릴 수 없다.
+   */
+  reset(): void;
   /**
    * 레포별 "새로 추적해도 되는 PR 번호". undefined 면 제한 없음.
    * list() 호출 후에 읽어야 최신이다.
@@ -279,6 +309,12 @@ export function createRepoSource(scope: WatchScope): RepoSource {
   const source: RepoSource = {
     truncated: false,
     lastAt: 0,
+    reset() {
+      cached = [];
+      source.targets = undefined;
+      source.truncated = false;
+      source.lastAt = 0;
+    },
     list() {
       const stale = Date.now() - source.lastAt >= interval;
       if (source.lastAt > 0 && !stale) return cached;

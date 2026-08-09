@@ -116,6 +116,8 @@ export interface CycleInfo {
  * 눈에 띄게 표시하고 한 번에 풀 수 있어야 한다.
  */
 export interface ControlState {
+  /** 감시 모드 — 어떤 include 패턴이 허용되는지가 모드마다 다르다 */
+  mode: string;
   paused: boolean;
   /** 아직 적용되지 않은 의도 건수 (라운드 중이면 끝난 뒤 반영된다) */
   pendingIntents: number;
@@ -198,6 +200,7 @@ function emptySnapshot(session: string): Snapshot {
   return {
     session,
     control: {
+      mode: '',
       paused: false,
       pendingIntents: 0,
       include: [],

@@ -25,7 +25,10 @@ import { loadConfig } from '../src/config.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
+  createRepoSource,
+  discoverRepos,
   globToRegExp,
+  unsupportedPatterns,
   invalidPRRefs,
   parsePRRef,
   matchesScope,
@@ -1011,6 +1014,64 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 28: 범위 변경 시 탐색 캐시 폐기 ───────────────
+
+{
+  // 리뷰 지적 [P1]: lastAt = 0 은 "다시 탐색하라" 일 뿐이다. 그 탐색이 부분
+  // 실패하면 nextRepoCache 가 이전 캐시를 **의도적으로 보존**하므로 옛 범위의
+  // 레포가 살아남고, scan 이 그걸 그대로 probe 해 리뷰를 게시할 수 있다.
+  const stale = ['oldorg/a', 'oldorg/b'];
+  const partialFail = { repos: [], partial: true, truncated: false, cost: 0 };
+  assert(
+    nextRepoCache(stale, partialFail).length === 2,
+    '부분 실패는 이전 캐시를 보존한다 (일시 오류로 감시가 끊기면 안 되므로)',
+  );
+
+  // 그래서 범위를 바꿀 때는 freshness 가 아니라 캐시 자체를 버려야 한다.
+  const src = createRepoSource({ mode: 'repos', include: ['oldorg/a'], exclude: [] });
+  assert(src.list().includes('oldorg/a'), '탐색 결과가 캐시에 담긴다');
+  src.targets = new Map([['oldorg/a', new Set([1])]]);
+
+  src.reset();
+  assert(src.lastAt === 0, 'reset 은 freshness 를 되돌린다');
+  assert(src.targets === undefined, 'reset 은 targets 도 버린다 (여기가 lastAt=0 과 다른 지점)');
+  assert(src.truncated === false, 'reset 은 truncated 도 되돌린다');
+}
+
+// ── 시나리오 29: 탐색이 펼칠 수 없는 패턴 ──────────────────
+
+{
+  // 리뷰 지적 [P2]: UI 가 저장을 받아주는데 백엔드가 조용히 버리면,
+  // lingering 컨텍스트가 남아 있는 동안 그 실패가 가려진다.
+  assert(
+    unsupportedPatterns('repos', ['owner/repo', 'owner/*']).join() === 'owner/*',
+    'repos 모드는 글롭을 펼칠 수 없다',
+  );
+  assert(
+    unsupportedPatterns('repos', ['owner/repo']).length === 0,
+    'repos 모드에서 리터럴은 통과',
+  );
+  assert(
+    unsupportedPatterns('account', ['myorg/*', '*/service-*']).join() === '*/service-*',
+    'account 모드는 소유자 자리 글롭만 불가 (검색이 org:<owner> 단위)',
+  );
+  assert(
+    unsupportedPatterns('account', ['myorg/*', 'other/repo']).length === 0,
+    'account 모드에서 소유자가 특정되면 통과',
+  );
+  assert(
+    unsupportedPatterns('review-requested', ['*/*', 'anything']).length === 0,
+    'review-requested 는 include 가 결과 필터일 뿐이라 제약이 없다',
+  );
+
+  // discoverRepos 와 같은 판정을 쓰는지 — 갈라지면 이 검증이 무의미해진다.
+  const r = discoverRepos({ mode: 'repos', include: ['owner/repo', 'owner/*'], exclude: [] });
+  assert(
+    r.repos.join() === 'owner/repo',
+    'discoverRepos 가 버리는 패턴 = unsupportedPatterns 가 지목하는 패턴',
+  );
 }
 
 // ── 시나리오 26: 대시보드 로그 심각도 추론 ─────────────────

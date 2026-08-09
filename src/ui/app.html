@@ -239,11 +239,9 @@
   <form method="dialog" class="dlg-h">감시 범위<button class="btn" value="cancel">닫기</button></form>
   <div class="dlg-b">
     <div>
-      <label>include — 감시할 대상 (한 줄에 하나, 글롭 허용)</label>
+      <label>include — 감시할 대상 (한 줄에 하나)</label>
       <textarea id="in-include" style="min-height:90px" placeholder="myorg/*&#10;owner/repo"></textarea>
-      <div class="hint-s">슬래시가 없으면 <code>owner/*</code> 로 해석합니다.
-        <b>비울 수 없습니다</b> — 빈 목록은 "전부 허용" 으로 읽혀 오히려 범위가 넓어집니다.
-        멈추려면 <b>일시정지</b>를 쓰세요.</div>
+      <div class="hint-s" id="hint-include"></div>
     </div>
     <div>
       <label>exclude — 그중 제외할 글롭</label>
@@ -499,6 +497,15 @@ $('btn-scope').addEventListener('click', () => {
   const ctl = (snap && snap.control) || {};
   $('in-include').value = (ctl.include || []).join('\n');
   $('in-exclude').value = (ctl.exclude || []).join('\n');
+  // 모드마다 탐색이 펼칠 수 있는 패턴이 다르다. "글롭 허용" 이라고만 안내하면
+  // repos 모드 사용자가 owner/* 를 넣고 아무것도 발견되지 않는 상태에 빠진다
+  // (lingering 컨텍스트가 남아 있으면 그 실패가 한동안 가려지기까지 한다).
+  $('hint-include').innerHTML =
+    ctl.mode === 'repos'
+      ? '<b>repos 모드</b>는 글롭을 펼칠 수 없습니다 — <code>owner/repo</code> 를 그대로 적으세요. 글롭이 필요하면 mode 를 account 로 바꾸세요. <b>비울 수 없습니다</b> — 멈추려면 <b>일시정지</b>를 쓰세요.'
+      : ctl.mode === 'review-requested'
+        ? 'include 는 검색 결과를 거르는 용도입니다. 글롭 제약이 없고 비워도 됩니다.'
+        : '글롭을 쓸 수 있지만 <b>소유자 자리</b>는 안 됩니다 (<code>myorg/*</code> ○, <code>*/svc-*</code> ✗) — 검색이 <code>org:&lt;owner&gt;</code> 단위입니다. 슬래시가 없으면 <code>owner/*</code> 로 해석합니다. <b>비울 수 없습니다</b> — 멈추려면 <b>일시정지</b>를 쓰세요.';
   $('scope-msg').textContent = '';
   dlgScope.showModal();
 });

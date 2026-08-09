@@ -33,6 +33,7 @@ import {
   describeScope,
   invalidPRRefs,
   parsePRRef,
+  unsupportedPatterns,
   matchesScope,
   passesFilters,
   resolveWatchScope,
@@ -476,10 +477,20 @@ program
                 const bad = intent.refs.map(badRef).filter(Boolean);
                 return bad.length > 0 ? bad.join(' / ') : null;
               }
-              case 'scope-set':
-                return intent.include.length === 0 && scope.mode !== 'review-requested'
-                  ? `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`
-                  : null;
+              case 'scope-set': {
+                if (intent.include.length === 0 && scope.mode !== 'review-requested') {
+                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
+                }
+                // discoverRepos 와 **같은 판정**을 쓴다 (unsupportedPatterns).
+                // 갈라지면 UI 는 받아주고 백엔드는 조용히 버린다.
+                const bad = unsupportedPatterns(scope.mode, intent.include);
+                if (bad.length > 0) {
+                  return scope.mode === 'repos'
+                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
+                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
+                }
+                return null;
+              }
               default:
                 return null;
             }
@@ -547,6 +558,7 @@ program
 
     const publishControl = (): void => {
       progress.control({
+        mode: scope.mode,
         paused,
         pendingIntents: intents.pending,
         include: [...scope.include],
@@ -657,12 +669,23 @@ program
               );
               break;
             }
+            // 탐색이 펼칠 수 없는 패턴은 저장해봐야 조용히 아무것도 발견하지
+            // 못한다. lingering 컨텍스트가 남아 있으면 그 실패가 한동안 가려진다.
+            const bad = unsupportedPatterns(scope.mode, it.include);
+            if (bad.length > 0) {
+              console.log(
+                chalk.yellow(`  ⚠ ${scope.mode} 모드가 펼칠 수 없는 패턴 — 무시합니다: ${bad.join(', ')}`),
+              );
+              break;
+            }
             scope.include = it.include;
             scope.exclude = it.exclude;
             scopeChanged = true;
-            // 탐색 캐시를 무효화해 다음 스캔이 바로 새 범위로 검색하게 한다
-            // (안 그러면 discoveryIntervalMs, 기본 5분을 기다린다).
-            repoSource.lastAt = 0;
+            // 캐시·targets 를 통째로 버린다. lastAt 만 0 으로 두면 "다시 탐색하라"
+            // 일 뿐이라, 그 탐색이 부분 실패하면 nextRepoCache 가 이전 캐시를
+            // 보존해 **옛 범위의 레포가 그대로 살아남는다**. 그 상태로 스캔이 돌면
+            // 방금 범위에서 뺀 레포에 리뷰를 게시할 수 있고, 게시는 못 되돌린다.
+            repoSource.reset();
             console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
             break;
           }
