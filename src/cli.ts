@@ -459,6 +459,31 @@ program
         ui = await startUIServer(port, {
           readInstructions: () => readInstructionsRaw(cfg),
           writeInstructions: (body) => saveInstructions(cfg, body),
+          // 형식은 서버가 보고, 뜻은 여기서 본다 — 감시 범위와 모드를 아는 쪽이다.
+          // 큐까지 흘려보낸 뒤 로그로만 알리면 "눌렀는데 아무 일도 안 남" 이 된다.
+          validate: (intent): string | null => {
+            const badRef = (r: string): string | null =>
+              parsePRRef(r) ? null : `잘못된 PR 참조: "${r}" — 'owner/repo#12' 형식이어야 합니다.`;
+
+            switch (intent.kind) {
+              case 'skip-add':
+              case 'skip-remove':
+              case 'review-now':
+                return badRef(intent.ref);
+              case 'only-set': {
+                // 하나라도 틀리면 전체를 거부한다. 일부만 적용하면 '이것만' 이
+                // 기존 한정 해제로 뒤집힌다 (applyIntents 주석 참고).
+                const bad = intent.refs.map(badRef).filter(Boolean);
+                return bad.length > 0 ? bad.join(' / ') : null;
+              }
+              case 'scope-set':
+                return intent.include.length === 0 && scope.mode !== 'review-requested'
+                  ? `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`
+                  : null;
+              default:
+                return null;
+            }
+          },
         });
         progress.patch({
           startedAt: Date.now(),
@@ -600,12 +625,18 @@ program
             editList('skip', it.ref, false);
             break;
           case 'only-set': {
-            const keys: string[] = [];
-            for (const ref of it.refs) {
-              const key = parsePRRef(ref);
-              if (key) keys.push(key);
-              else console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${ref}"`));
+            // 하나라도 형식이 틀리면 **아무것도 적용하지 않는다.**
+            // 잘못된 것만 버리고 나머지를 쓰면, 전부 틀렸을 때 f.only = [] 가 되어
+            // "이것만 리뷰" 요청이 정반대로 **기존 한정을 해제**해 버린다.
+            // 막아둔 PR 들이 그대로 리뷰되는 방향의 실패라 되돌릴 수 없다.
+            const bad = it.refs.filter((r) => !parsePRRef(r));
+            if (bad.length > 0) {
+              console.log(
+                chalk.yellow(`  ⚠ 잘못된 PR 참조 — 대상 한정을 바꾸지 않습니다: ${bad.join(', ')}`),
+              );
+              break;
             }
+            const keys = it.refs.map((r) => parsePRRef(r) as string);
             f.only = keys;
             scopeChanged = true;
             console.log(
@@ -616,6 +647,16 @@ program
             break;
           }
           case 'scope-set': {
+            // 빈 include 는 "감시 중지" 가 아니다. matchesScope 는 빈 목록을
+            // **전부 허용**으로 읽으므로(review-requested 가 그렇게 쓴다) 오히려
+            // 추적 중인 컨텍스트가 전부 lingering 으로 되살아나 계속 리뷰된다.
+            // 멈추려면 일시정지를 쓴다. review-requested 는 빈 include 가 정상이다.
+            if (it.include.length === 0 && scope.mode !== 'review-requested') {
+              console.log(
+                chalk.yellow(`  ⚠ ${scope.mode} 모드에서는 include 를 비울 수 없습니다 — 무시합니다.`),
+              );
+              break;
+            }
             scope.include = it.include;
             scope.exclude = it.exclude;
             scopeChanged = true;

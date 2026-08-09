@@ -241,7 +241,9 @@
     <div>
       <label>include — 감시할 대상 (한 줄에 하나, 글롭 허용)</label>
       <textarea id="in-include" style="min-height:90px" placeholder="myorg/*&#10;owner/repo"></textarea>
-      <div class="hint-s">슬래시가 없으면 <code>owner/*</code> 로 해석합니다. 비우면 watch 가 돌지 않습니다.</div>
+      <div class="hint-s">슬래시가 없으면 <code>owner/*</code> 로 해석합니다.
+        <b>비울 수 없습니다</b> — 빈 목록은 "전부 허용" 으로 읽혀 오히려 범위가 넓어집니다.
+        멈추려면 <b>일시정지</b>를 쓰세요.</div>
     </div>
     <div>
       <label>exclude — 그중 제외할 글롭</label>

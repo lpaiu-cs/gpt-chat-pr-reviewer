@@ -55,6 +55,33 @@ export interface UIServerHandle {
 export interface UIHooks {
   readInstructions: () => string;
   writeInstructions: (body: string) => string;
+  /**
+   * 의미 검증 — 형식은 서버가 보고, 뜻은 루프 쪽이 본다 (감시 범위·모드를 아는 곳).
+   * 오류 메시지를 돌려주면 요청을 거부하고, null 이면 통과.
+   *
+   * 여기서 걸러야 사용자가 즉시 400 을 받는다. 큐까지 흘려보낸 뒤 로그로만
+   * 알리면 "눌렀는데 아무 일도 안 일어남" 이 된다.
+   */
+  validate: (intent: Intent) => string | null;
+}
+
+/**
+ * DNS rebinding 방어.
+ *
+ * `127.0.0.1` 바인딩과 Origin 검사만으로는 부족하다. 공격자가 자기 도메인을
+ * 127.0.0.1 로 재바인딩하면 브라우저는 그 페이지를 **same-origin** 으로 취급해
+ * Origin 헤더조차 붙이지 않고 응답 본문을 읽을 수 있다. 그러면 PR 제목·리뷰
+ * 로그·`instructions.md` 원문이 전부 새어 나간다.
+ *
+ * 재바인딩된 요청은 `Host` 가 공격자 도메인이므로 그것으로 걸러진다.
+ * **GET 을 포함한 모든 요청**에 적용한다 — 읽기 엔드포인트가 유출 경로다.
+ */
+function rejectsHost(req: IncomingMessage): string | null {
+  const raw = String(req.headers.host ?? '');
+  // IPv6 리터럴([::1]:4478)과 포트를 떼어낸다.
+  const name = raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.replace(/:\d+$/, '');
+  const ok = name === '127.0.0.1' || name === 'localhost' || name === '[::1]';
+  return ok ? null : `허용되지 않은 Host: ${raw || '(없음)'}`;
 }
 
 /** 요청 본문을 JSON 으로 읽는다. 과도하게 크면 거부한다. */
@@ -195,6 +222,14 @@ async function handle(
 ): Promise<void> {
   const url = (req.url ?? '/').split('?')[0];
 
+  // Host 검사는 읽기·쓰기를 가리지 않는다 — 유출 경로는 GET 쪽이다.
+  const badHost = rejectsHost(req);
+  if (badHost) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(badHost);
+    return;
+  }
+
   // ── 제어 (POST) ──
   if (req.method === 'POST') {
     const denied = rejectsCrossOrigin(req, host);
@@ -209,6 +244,12 @@ async function handle(
         const intent = parseIntent(body);
         if (typeof intent === 'string') {
           json(res, 400, { ok: false, error: intent });
+          return;
+        }
+        // 형식이 맞아도 뜻이 틀릴 수 있다 (없는 PR 참조 · 모드에 안 맞는 빈 범위).
+        const invalid = hooks.validate(intent);
+        if (invalid) {
+          json(res, 400, { ok: false, error: invalid });
           return;
         }
         const pending = intents.push(intent);
