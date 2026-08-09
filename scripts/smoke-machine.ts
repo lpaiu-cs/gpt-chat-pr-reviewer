@@ -27,7 +27,7 @@ import {
   buildPreviousBlock,
   judgeReclaim,
 } from '../src/reviewer.js';
-import { parseConversationUrl, findRoundBaseline } from '../src/chatgpt.js';
+import { parseConversationUrl, findRoundBaseline, classifyStall } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import {
   acquireLock,
@@ -1125,6 +1125,28 @@ const fakePR: PRInfo = {
   assert(legacy.state === 'CONVERGED', 'base 기록이 없으면 base 로 전이시키지 않는다');
   applySyncEvents(cfg, legacy, { status: 'OPEN', headSha: 'A' });
   assert(legacy.state === 'CONVERGED', 'base 를 안 싣는 스냅샷도 그대로 둔다');
+}
+
+// ── 시나리오 38: 정체 구간의 성격 분류 (이슈 #1) ───────────
+
+{
+  // 이슈 #1 은 (a)스트림 사망 / (b)셀렉터 오탐 / (c)실제 생성 중을 가리기 전에는
+  // 고치지 말라고 못박고 있다. 이 분류는 **판정이 아니라 관측**이다 — 이 값으로
+  // 대기를 끊지 않는다. 무트래픽 시간은 종료의 근거가 못 되기 때문이다:
+  // 생성 POST 가 먼저 끝나고 결과가 비동기로 오는 구조면 조용한 게 정상이고,
+  // 그때 끊으면 안정돼 보이는 부분 응답을 완성본으로 게시한다.
+  const LIMIT = 180_000;
+  const at = (o: Partial<Parameters<typeof classifyStall>[0]>) =>
+    classifyStall({ button: true, sawGeneration: true, inFlight: 0, quietMs: 0, ...o }, LIMIT);
+
+  assert(at({ button: false }) === 'idle', '버튼이 없으면 생성 중이 아니다');
+  assert(at({ inFlight: 1, quietMs: 10 * LIMIT }) === 'generating', '요청이 진행 중이면 (c)');
+  assert(at({ quietMs: LIMIT - 1 }) === 'generating', '조용해도 한계 전이면 (c) 로 본다');
+  assert(at({ quietMs: LIMIT + 1 }) === 'network-quiet', '오래 조용하면 (a) 후보로 기록');
+
+  // 추적이 한 번도 안 걸렸으면 근거 자체가 없다 — 그렇게 기록한다.
+  assert(at({ sawGeneration: false, quietMs: 10 * LIMIT }) === 'untracked', '관측 불가는 untracked');
+  assert(at({ sawGeneration: false, button: false }) === 'idle', '추적 불가여도 버튼이 없으면 idle');
 }
 
 // ── 시나리오 34: 대화에서 라운드 기준점 찾기 ───────────────
