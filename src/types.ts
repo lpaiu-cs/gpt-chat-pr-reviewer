@@ -137,6 +137,12 @@ export interface PRContext {
    * 확보하지 못한 채 끝난 대화의 잔여물이며, 다음 전송에서 버려진다(countTurn).
    */
   conversationTurns?: number;
+  /**
+   * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).
+   * 관측된 GitHub 현황을 캐시한 것일 뿐 상태가 아니다 — 필터를 통과하면 지워진다.
+   * 이게 없으면 `queue` 명령이 watch 가 실제로 돌리지 않을 PR 까지 보여준다.
+   */
+  excludedReason?: string;
   retryCount: number;
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
@@ -163,6 +169,43 @@ export interface ChatGPTSelectors {
   newChatButton: string;
   /** 로그인 완료 판별용 요소 */
   loggedInIndicator: string;
+}
+
+// ── 감시 범위 ───────────────────────────────────────────────
+
+/** 수집한 PR 을 리뷰 큐에 올릴지 거르는 조건. 여러 개면 AND 로 적용된다. */
+export interface WatchFilters {
+  /** 지정 시 이 작성자들의 PR 만 (대소문자 무시) */
+  authors?: string[];
+  /** 지정 시 이 라벨을 하나라도 가진 PR 만 */
+  labels?: string[];
+  /** true 면 draft PR 도 리뷰한다. 기본값 false = 초안 제외 */
+  draft?: boolean;
+}
+
+/**
+ * 감시 대상 레포를 정하는 방식.
+ *
+ *  account          — 계정/조직 전체를 검색해 열린 PR 이 있는 레포를 자동 발견
+ *  repos            — include 에 적은 owner/repo 만 (글롭 불가)
+ *  review-requested — 현재 gh 계정에 리뷰가 요청된 PR 이 있는 레포만
+ */
+export type WatchMode = 'account' | 'repos' | 'review-requested';
+
+/** 감시 범위 정의 — pr-review.config.json 의 `watch` 블록. */
+export interface WatchScope {
+  mode: WatchMode;
+  /**
+   * 감시 대상. 'owner/repo' 또는 글롭('owner/*', '*&#47;service-*').
+   * 슬래시가 없으면 'owner' 를 'owner/*' 로 해석한다.
+   * 비어 있으면 (review-requested 모드) 검색 결과 전체를 받는다.
+   */
+  include: string[];
+  /** include 에 걸린 것 중 제외할 글롭 */
+  exclude?: string[];
+  filters?: WatchFilters;
+  /** 레포 재탐색 주기 (ms) — account/review-requested 모드에서만 쓰인다 */
+  discoveryIntervalMs?: number;
 }
 
 export interface AppConfig {
@@ -192,8 +235,13 @@ export interface AppConfig {
   maxTurnsPerConversation: number;
   /** watch 모드 폴링 간격 (ms) */
   watchIntervalMs: number;
-  /** watch 대상 레포 목록 ('owner/repo') */
+  /**
+   * watch 대상 레포 목록 ('owner/repo') — 구버전 설정.
+   * `watch.include` 가 비어 있을 때의 폴백으로만 쓰인다.
+   */
   watchRepos: string[];
+  /** 감시 범위 — 계정 단위 자동 발견 + 글롭 + 필터 */
+  watch?: WatchScope;
   /** 상태·기록 저장 디렉터리 */
   dataDir: string;
 }

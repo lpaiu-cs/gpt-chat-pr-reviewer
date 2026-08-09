@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import type { AppConfig, ChatGPTSelectors } from './types.js';
+import type { AppConfig, ChatGPTSelectors, WatchScope } from './types.js';
 
 const CONFIG_FILE = 'pr-review.config.json';
 
@@ -79,6 +79,14 @@ const DEFAULT_CONFIG: AppConfig = {
   dataDir: './data',
 };
 
+/** init 이 써 넣는 감시 범위 스켈레톤 — include 만 채우면 바로 돈다. */
+const DEFAULT_WATCH_SCOPE: WatchScope = {
+  mode: 'account',
+  include: [], // 예: ['myorg/*', 'owner/repo']
+  exclude: [],
+  filters: { draft: false },
+};
+
 // ── 공개 API ────────────────────────────────────────────────
 
 export function loadConfig(configPath?: string): AppConfig {
@@ -111,6 +119,7 @@ export function initConfig(configPath?: string): string {
     customInstructionsFile: DEFAULT_CONFIG.customInstructionsFile,
     quotaCooldownMs: DEFAULT_CONFIG.quotaCooldownMs,
     maxTurnsPerConversation: DEFAULT_CONFIG.maxTurnsPerConversation,
+    watch: DEFAULT_WATCH_SCOPE,
     watchRepos: [],
     watchIntervalMs: DEFAULT_CONFIG.watchIntervalMs,
   };

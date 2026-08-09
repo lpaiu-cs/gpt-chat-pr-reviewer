@@ -21,10 +21,26 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
+import {
+  admitsNewPR,
+  globToRegExp,
+  matchesScope,
+  nextRepoCache,
+  passesFilters,
+  resolveWatchScope,
+} from '../src/watch-scope.js';
+import {
+  buildQueue,
+  isQueueable,
+  quotaGateUntil,
+  TIER_AUTHOR_RESPONDED,
+  TIER_FIRST_ROUND,
+  TIER_OTHER,
+} from '../src/queue.js';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { PRInfo, PRState, PRContext, AppConfig } from '../src/types.js';
+import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
 
 let passed = 0;
 let failed = 0;
@@ -563,6 +579,319 @@ const fakePR: PRInfo = {
     buildPreviousBlock(recovered, 3, false).text.includes('널 체크 누락'),
     '해제 후 프롬프트는 스니펫을 다시 실어 맥락을 이월한다',
   );
+}
+
+// ── 시나리오 16: 감시 범위 글롭 ────────────────────────────
+
+{
+  assert(globToRegExp('lpaiu-cs/*').test('lpaiu-cs/anything'), '글롭: owner/* 는 그 계정을 매치');
+  assert(!globToRegExp('lpaiu-cs/*').test('other/anything'), '글롭: 다른 계정은 매치하지 않음');
+  assert(globToRegExp('lpaiu-cs').test('lpaiu-cs/repo'), '글롭: 슬래시 없는 패턴은 owner/* 로 해석');
+  assert(globToRegExp('LPAIU-CS/*').test('lpaiu-cs/repo'), '글롭: 대소문자 무시');
+  assert(globToRegExp('*/archived-*').test('any/archived-old'), '글롭: 접두/접미 혼합');
+
+  // `*` 가 슬래시를 넘으면 'a/*' 가 'a/b/c' 같은 값까지 삼킨다. 넘지 않아야 한다.
+  assert(!globToRegExp('a/*').test('a/b/c'), '글롭: * 는 슬래시를 넘지 않음');
+
+  assert(matchesScope('lpaiu-cs/tool', ['lpaiu-cs/*'], []), 'include 매치');
+  assert(
+    !matchesScope('lpaiu-cs/archived-x', ['lpaiu-cs/*'], ['*/archived-*']),
+    'exclude 가 include 를 이긴다',
+  );
+  assert(matchesScope('any/repo', [], []), 'include 가 비면 전부 통과 (review-requested 용)');
+}
+
+// ── 시나리오 17: 대상 필터 ─────────────────────────────────
+
+{
+  const pr = (over: Partial<{ author: string; isDraft: boolean; labels: string[] }> = {}) => ({
+    author: 'lpaiu-cs',
+    isDraft: false,
+    labels: ['needs-review'],
+    ...over,
+  });
+
+  assert(passesFilters(pr()).ok, '필터 없음: 통과');
+
+  // draft 는 기본 제외 — 초안까지 대화 한도를 먹으면 안 된다
+  assert(!passesFilters(pr({ isDraft: true })).ok, 'draft 는 기본 제외');
+  assert(passesFilters(pr({ isDraft: true }), { draft: true }).ok, 'draft: true 면 초안도 통과');
+
+  assert(passesFilters(pr(), { authors: ['LPAIU-CS'] }).ok, '작성자 필터는 대소문자 무시');
+  assert(!passesFilters(pr(), { authors: ['someone'] }).ok, '작성자 불일치 시 제외');
+
+  assert(passesFilters(pr(), { labels: ['needs-review'] }).ok, '라벨 하나라도 맞으면 통과');
+  assert(!passesFilters(pr({ labels: [] }), { labels: ['needs-review'] }).ok, '라벨 없으면 제외');
+
+  // 조건이 여러 개면 AND
+  assert(
+    !passesFilters(pr(), { authors: ['lpaiu-cs'], labels: ['nope'] }).ok,
+    '조건이 여러 개면 AND 로 적용',
+  );
+
+  const verdict = passesFilters(pr({ isDraft: true }));
+  assert(!!verdict.reason, '제외 사유가 붙는다');
+}
+
+// ── 시나리오 18: 감시 범위 해석 (구버전 설정 호환) ─────────
+
+{
+  const base = loadConfig();
+
+  const legacy: AppConfig = { ...base, watch: undefined, watchRepos: ['o/r'] };
+  const s1 = resolveWatchScope(legacy);
+  assert(s1?.mode === 'repos' && s1.include[0] === 'o/r', 'watchRepos 만 있으면 repos 모드로 폴백');
+
+  const both: AppConfig = {
+    ...base,
+    watch: { mode: 'account', include: ['org/*'], filters: { draft: true } },
+    watchRepos: ['o/r'],
+  };
+  const s2 = resolveWatchScope(both);
+  assert(s2?.mode === 'account' && s2.include[0] === 'org/*', 'watch.include 가 watchRepos 를 이긴다');
+
+  // include 가 비어 있으면 watchRepos 로 내려가되 필터는 watch 것을 이어받는다
+  const emptyInclude: AppConfig = {
+    ...base,
+    watch: { mode: 'account', include: [], filters: { draft: true }, exclude: ['*/x-*'] },
+    watchRepos: ['o/r'],
+  };
+  const s3 = resolveWatchScope(emptyInclude);
+  assert(s3?.mode === 'repos' && s3.include[0] === 'o/r', 'include 가 비면 watchRepos 로 폴백');
+  assert(s3?.filters?.draft === true && s3.exclude?.[0] === '*/x-*', '폴백 시에도 필터·exclude 유지');
+
+  // review-requested 는 검색 자체가 범위라 include 없이도 성립한다
+  const rr: AppConfig = { ...base, watch: { mode: 'review-requested', include: [] }, watchRepos: [] };
+  assert(resolveWatchScope(rr)?.mode === 'review-requested', 'review-requested 는 include 없이 성립');
+
+  const nothing: AppConfig = { ...base, watch: undefined, watchRepos: [] };
+  assert(resolveWatchScope(nothing) === null, '대상이 없으면 null');
+}
+
+// ── 시나리오 19: 리뷰 큐 우선순위 ──────────────────────────
+
+{
+  /** REVIEW_DUE 진입 시각을 고정해 정렬을 결정적으로 만든다. */
+  const stamp = (ctx: PRContext, at: string): PRContext => {
+    for (let i = ctx.history.length - 1; i >= 0; i--) {
+      if (ctx.history[i].to === 'REVIEW_DUE') {
+        ctx.history[i].at = at;
+        return ctx;
+      }
+    }
+    ctx.createdAt = at;
+    return ctx;
+  };
+
+  const at = (n: number) => `2026-01-0${n}T00:00:00.000Z`;
+
+  // 라운드 미진행 — 오래된 쪽이 먼저
+  const fresh = (num: number, when: string) =>
+    stamp(createContext({ ...fakePR, number: num }), when);
+
+  const a = fresh(1, at(1));
+  const d = fresh(2, at(3));
+
+  // 작성자 응답 완료
+  const b = createContext({ ...fakePR, number: 3 });
+  fire(b, 'START_REVIEW');
+  fire(b, 'POSTED_COMMENTS', { patch: { round: 1 } });
+  fire(b, 'AUTHOR_RESPONDED');
+  stamp(b, at(2));
+
+  // 그 외 (실패 후 재시도) — round 를 올려 "라운드 미진행" 과 구분한다
+  const c = createContext({ ...fakePR, number: 4 });
+  fire(c, 'START_REVIEW');
+  fire(c, 'POSTED_COMMENTS', { patch: { round: 1 } });
+  fire(c, 'AUTHOR_RESPONDED');
+  fire(c, 'START_REVIEW');
+  fire(c, 'REVIEW_FAILED');
+  fire(c, 'RETRY', { patch: { retryCount: 1 } });
+  stamp(c, at(1));
+
+  // REVIEW_DUE 가 아닌 것은 큐에 오르지 않는다
+  const waiting = createContext({ ...fakePR, number: 5 });
+  fire(waiting, 'START_REVIEW');
+  fire(waiting, 'POSTED_COMMENTS', { patch: { round: 1 } });
+
+  const q = buildQueue([d, c, b, waiting, a]);
+  assert(q.length === 4, `REVIEW_DUE 4건만 큐에 오름 (실제 ${q.length})`);
+  assert(!q.some((e) => e.ctx.prNumber === 5), 'AWAITING_AUTHOR 는 큐에서 제외');
+
+  assert(
+    q.map((e) => e.ctx.prNumber).join(',') === '1,2,3,4',
+    `우선순위: 라운드 미진행 > 작성자 응답 > 그 외, 동순위는 오래 기다린 순 (실제 ${q.map((e) => e.ctx.prNumber).join(',')})`,
+  );
+  assert(q[0].tier === TIER_FIRST_ROUND && q[0].reason === 'first-round', '1순위 티어/사유');
+  assert(q[2].tier === TIER_AUTHOR_RESPONDED && q[2].reason === 'author-responded', '2순위 티어/사유');
+  assert(q[3].tier === TIER_OTHER && q[3].reason === 'retry', '3순위 티어/사유');
+  assert(q[0].waitingMs >= q[1].waitingMs, '오래 기다린 항목의 대기 시간이 더 길다');
+
+  // 같은 입력이면 순서가 항상 같아야 한다 (재스캔마다 큐를 다시 만들기 때문)
+  const again = buildQueue([a, b, c, d]);
+  assert(
+    again.map((e) => e.ctx.prNumber).join(',') === q.map((e) => e.ctx.prNumber).join(','),
+    '입력 순서가 달라도 큐 순서는 동일 (결정적)',
+  );
+}
+
+// ── 시나리오 20: 쿼터 게이트 — 큐 보존 ─────────────────────
+
+{
+  const now = Date.parse('2026-01-01T00:00:00.000Z');
+  const blocked = createContext({ ...fakePR, number: 9 });
+  fire(blocked, 'START_REVIEW');
+  fire(blocked, 'QUOTA_EXCEEDED', { patch: { quotaRetryAt: '2026-01-01T03:00:00.000Z' } });
+
+  const pending = createContext({ ...fakePR, number: 10 });
+
+  const gate = quotaGateUntil([blocked, pending], now);
+  assert(gate === Date.parse('2026-01-01T03:00:00.000Z'), '쿨다운이 남으면 해제 시각을 반환');
+
+  // 핵심: 한도에 걸려도 나머지 대상은 큐에 그대로 남는다 (사이클 중단이 아니라 보류)
+  assert(buildQueue([blocked, pending], now).length === 1, '쿼터 중에도 대기 항목은 큐에 보존');
+
+  const after = Date.parse('2026-01-01T04:00:00.000Z');
+  assert(quotaGateUntil([blocked, pending], after) === null, '쿨다운 경과 후에는 게이트 해제');
+
+  // 여러 건이 막혔으면 가장 늦게 풀리는 시각을 따른다
+  const later = createContext({ ...fakePR, number: 11 });
+  fire(later, 'START_REVIEW');
+  fire(later, 'QUOTA_EXCEEDED', { patch: { quotaRetryAt: '2026-01-01T05:00:00.000Z' } });
+  assert(
+    quotaGateUntil([blocked, later], now) === Date.parse('2026-01-01T05:00:00.000Z'),
+    '가장 늦은 해제 시각을 따른다',
+  );
+
+  assert(quotaGateUntil([pending], now) === null, '막힌 PR 이 없으면 게이트 없음');
+}
+
+// ── 시나리오 21: 큐 자격 — 필터에 걸린 컨텍스트 제외 ───────
+
+{
+  // 리뷰 지적 [P2]: queue 명령이 watch 와 다른 답을 내면 안 된다. 스캔이 남긴
+  // excludedReason 을 buildQueue 가 읽어 둘이 같은 규칙을 쓴다.
+  const plain = createContext({ ...fakePR, number: 20 });
+  const excluded = createContext({ ...fakePR, number: 21 });
+  excluded.excludedReason = '초안(draft)';
+
+  assert(isQueueable(plain), '필터를 통과한 REVIEW_DUE 는 큐 자격 있음');
+  assert(!isQueueable(excluded), 'excludedReason 이 붙으면 큐 자격 없음');
+
+  const q = buildQueue([plain, excluded]);
+  assert(q.length === 1 && q[0].ctx.prNumber === 20, '큐에서 필터 제외 항목이 빠진다');
+
+  // 필터를 다시 통과하면 되살아나야 한다 (draft 해제·라벨 재부착)
+  delete excluded.excludedReason;
+  assert(buildQueue([plain, excluded]).length === 2, '필터를 다시 통과하면 큐에 복귀');
+}
+
+// ── 시나리오 22: review-requested 는 PR 단위로 제한 ────────
+
+{
+  // 리뷰 지적 [P1]: 검색 결과를 레포로 축약하면 "리뷰 요청받은 PR 1건" 때문에
+  // 그 레포의 열린 PR 전부가 대상이 된다.
+  //
+  // 2차 리뷰 지적 [P1]: 판정을 테스트에서 복제하면 실제 경계를 놓친다.
+  // scan() 이 쓰는 admitsNewPR 을 그대로 부른다.
+  const targets = new Map<string, Set<number>>([['o/r', new Set([7])]]);
+
+  assert(admitsNewPR(targets, 'o/r', 7), '요청받은 PR 은 새로 추적한다');
+  assert(!admitsNewPR(targets, 'o/r', 9), '요청받지 않은 같은 레포의 PR 은 추적하지 않는다');
+
+  // 핵심 경계: Map 은 있지만 그 레포 키가 없는 경우.
+  // 리뷰를 게시하면 요청이 해제되어 레포가 targets 에서 통째로 빠지는데,
+  // 기존 컨텍스트 때문에 레포는 계속 스캔된다. 이때 무제한으로 넘기면
+  // 그 레포의 요청받지 않은 다른 PR 이 전부 자동 리뷰된다.
+  assert(
+    !admitsNewPR(targets, 'o/other', 1),
+    '제한 모드에서 목록에 없는 레포는 전부 거부 (빈 목록 ≠ 무제한)',
+  );
+
+  // account/repos 모드 (targets 자체가 없음) 는 제한이 없다
+  assert(admitsNewPR(undefined, 'o/r', 9), '제한이 없으면 모든 PR 이 대상');
+
+  // 이미 추적 중인 PR 은 이 판정과 무관하게 계속 간다 (scan 의 `!existing &&` 조건).
+  // 리뷰 게시로 요청이 해제되면 2차 라운드가 영영 오지 않기 때문이다.
+  const existing = true;
+  assert(!(!existing && !admitsNewPR(targets, 'o/r', 9)), '이미 추적 중이면 계속 추적한다');
+}
+
+// ── 시나리오 23: 탐색 캐시 갱신 규칙 ───────────────────────
+
+{
+  // 부분 실패면 아무것도 빼지 않는다 (실패한 범위의 레포 보존)
+  assert(
+    nextRepoCache(['a/one', 'b/two'], { repos: ['a/one'], partial: true }).includes('b/two'),
+    '부분 실패 시 실패한 범위의 레포가 유지된다',
+  );
+
+  // 2차 리뷰 지적 [P2]: 완전히 성공한 빈 결과는 유효한 답이다.
+  // 과거 목록을 되살리면 이미 정리된 레포를 10초마다 계속 probe 한다.
+  assert(
+    nextRepoCache(['a/one', 'b/two'], { repos: [], partial: false }).length === 0,
+    '완전 성공한 빈 결과는 캐시를 비운다',
+  );
+  assert(
+    nextRepoCache(['a/one', 'b/two'], { repos: [], partial: true }).length === 2,
+    '부분 실패의 빈 결과는 캐시를 유지한다',
+  );
+
+  const shrunk = nextRepoCache(['a/one', 'b/two'], { repos: ['a/one'], partial: false });
+  assert(!shrunk.includes('b/two'), '완전 성공 시 사라진 레포는 정상적으로 빠진다');
+}
+
+// ── 시나리오 24: 라벨 목록이 잘리면 제외하지 않는다 ────────
+
+{
+  // 2차 리뷰 지적 [P2]: first:100 은 페이지 크기이지 완결 보장이 아니다.
+  // 잘린 목록으로 "라벨이 없다" 를 단정해 제외하면 그 PR 은 조용히 영영
+  // 리뷰되지 않는다. 불완전한 근거로는 제외하지 않는다.
+  const base = { author: 'a', isDraft: false };
+  const filters = { labels: ['needs-review'] };
+
+  assert(
+    !passesFilters({ ...base, labels: ['other'], labelsTruncated: false }, filters).ok,
+    '목록이 완전하면 라벨 없는 PR 은 제외한다',
+  );
+  assert(
+    passesFilters({ ...base, labels: ['other'], labelsTruncated: true }, filters).ok,
+    '목록이 잘렸으면 제외하지 않는다 (거짓 음성 방지)',
+  );
+  assert(
+    passesFilters({ ...base, labels: ['needs-review'], labelsTruncated: true }, filters).ok,
+    '잘렸어도 대상 라벨이 이미 보이면 그대로 통과',
+  );
+
+  // 잘림은 라벨 조건에만 영향을 준다 — draft 는 그대로 제외
+  assert(
+    !passesFilters({ ...base, isDraft: true, labels: [], labelsTruncated: true }, filters).ok,
+    '라벨 잘림이 draft 제외까지 무력화하지는 않는다',
+  );
+}
+
+// ── 시나리오 25: 열린 PR 이 없어진 레포도 계속 훑는다 ──────
+
+{
+  // 리뷰 지적 [P2]: 검색은 열린 PR 이 있는 레포만 준다. 마지막 PR 이 닫히면
+  // 레포가 목록에서 빠져 추적 중이던 컨텍스트가 PR_CLOSED 를 못 받는다.
+  const discovered = ['o/alive'];
+  const contexts = [
+    { owner: 'o', repo: 'alive', state: 'REVIEW_DUE' as PRState },
+    { owner: 'o', repo: 'gone', state: 'AWAITING_AUTHOR' as PRState }, // 마지막 PR 이 닫힌 레포
+    { owner: 'o', repo: 'done', state: 'CLOSED' as PRState }, // 이미 정리됨
+    { owner: 'x', repo: 'other', state: 'REVIEW_DUE' as PRState }, // 범위 밖
+  ];
+
+  const include = ['o/*'];
+  const lingering = [
+    ...new Set(contexts.filter((c) => c.state !== 'CLOSED').map((c) => `${c.owner}/${c.repo}`)),
+  ].filter((s) => !discovered.includes(s) && matchesScope(s, include, []));
+
+  assert(lingering.includes('o/gone'), '살아있는 컨텍스트가 있는 레포는 계속 훑는다');
+  assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
+  assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
+  assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

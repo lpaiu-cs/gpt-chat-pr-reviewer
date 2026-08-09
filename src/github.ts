@@ -150,12 +150,20 @@ export function ghErrorMessage(e: unknown): string {
 export interface PRProbe extends PRInfo {
   status: 'OPEN' | 'CLOSED' | 'MERGED';
   updatedAt: string;
+  isDraft: boolean;
+  labels: string[];
+  /** 라벨이 조회 상한을 넘어 일부만 담긴 경우 true — 라벨 필터 판정이 부정확해진다 */
+  labelsTruncated: boolean;
   /** 스레드 상태를 함께 조회한 경우에만 채워진다 (resolve 감지용). */
   threads?: { id: string; isResolved: boolean }[];
 }
 
 export interface RepoProbe {
   prs: PRProbe[];
+  /** 이 레포의 열린 PR 총 개수 (PROBE_PAGE 초과분 감지용) */
+  totalOpen: number;
+  /** 열린 PR 이 PROBE_PAGE 를 넘어 일부만 조회된 경우 true */
+  truncated: boolean;
   /** GitHub 이 계산한 이 쿼리의 실제 비용 */
   cost: number;
   remaining: number;
@@ -168,7 +176,17 @@ export interface RepoProbe {
  */
 export const THREAD_ALIAS_CHUNK = 20;
 
-const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName headRefName author{ login }`;
+/** 한 레포에서 1회에 조회하는 열린 PR 개수. 초과분은 totalCount 로 감지해 알린다. */
+export const PROBE_PAGE = 50;
+
+/**
+ * 라벨 조회 상한. GitHub 의 PR 당 라벨 한도와 같으므로 실질적으로 잘리지 않지만,
+ * 잘렸을 때 라벨 필터가 PR 을 **조용히 제외**하지 않도록 totalCount 로 감지한다.
+ */
+const PROBE_LABEL_PAGE = 100;
+
+const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName headRefName isDraft
+        author{ login } labels(first:${PROBE_LABEL_PAGE}){ totalCount nodes{ name } }`;
 
 // ── GraphQL 사용량 집계 ─────────────────────────────────────
 //
@@ -256,7 +274,8 @@ export function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []
       )
       .join('\n');
     const listPart = withList
-      ? `    prs: pullRequests(states:OPEN, first:50, orderBy:{field:UPDATED_AT,direction:DESC}){
+      ? `    prs: pullRequests(states:OPEN, first:${PROBE_PAGE}, orderBy:{field:UPDATED_AT,direction:DESC}){
+      totalCount
       nodes{ ${PROBE_PR_FIELDS} }
     }\n`
       : '';
@@ -272,6 +291,7 @@ ${listPart}${aliases}
   let cost = 0;
   let remaining = -1;
   let prs: PRProbe[] = [];
+  let totalOpen = 0;
 
   chunks.forEach((ids, i) => {
     const { data, errors } = runQuery(ids, i === 0);
@@ -286,10 +306,14 @@ ${listPart}${aliases}
     remaining = data.rateLimit?.remaining ?? remaining;
 
     if (i === 0) {
+      totalOpen = repoNode.prs?.totalCount ?? 0;
       prs = (repoNode.prs?.nodes ?? []).map((n: any) => ({
         ...toPRInfo(owner, repo, n),
         status: n.state,
         updatedAt: n.updatedAt,
+        isDraft: !!n.isDraft,
+        labels: (n.labels?.nodes ?? []).map((l: any) => l.name),
+        labelsTruncated: (n.labels?.totalCount ?? 0) > (n.labels?.nodes?.length ?? 0),
       }));
     }
 
@@ -306,7 +330,79 @@ ${listPart}${aliases}
     }
   });
 
-  return { prs, cost, remaining };
+  return { prs, totalOpen, truncated: totalOpen > prs.length, cost, remaining };
+}
+
+// ── 레포 탐색 (계정 단위 감시용) ───────────────────────────
+
+export interface RepoSearchResult {
+  /** 열린 PR 이 하나라도 있는 'owner/repo' 목록 */
+  repos: string[];
+  /**
+   * 검색에 걸린 PR 의 신원. 레포로 축약해 버리면 "리뷰 요청된 PR 만" 같은
+   * 조건이 레포 단위로 번져 요청하지 않은 PR 까지 대상이 된다.
+   */
+  prs: { slug: string; number: number }[];
+  /** 검색에 걸린 PR 총 개수 */
+  total: number;
+  /** 페이지 상한에 걸려 일부만 훑은 경우 true */
+  truncated: boolean;
+  cost: number;
+  remaining: number;
+}
+
+/** 검색 페이지네이션 상한 — 100건 × 10페이지 = PR 1,000건. */
+const SEARCH_MAX_PAGES = 10;
+
+const REPO_SEARCH_QUERY = `query($q:String!,$after:String){
+  rateLimit{ cost remaining }
+  search(query:$q, type:ISSUE, first:100, after:$after){
+    issueCount
+    pageInfo{ hasNextPage endCursor }
+    nodes{ ... on PullRequest { number repository{ nameWithOwner } } }
+  }
+}`;
+
+/**
+ * 검색으로 "열린 PR 이 있는 레포" 를 찾는다 (계정/조직 단위 감시의 입구).
+ *
+ * 실측 cost 는 페이지당 1 point 다. 폴링 자체(fetchRepoProbe)는 레포 단위로
+ * 살아있는 데이터를 읽고, 이 함수는 **대상 목록만** 정한다. 검색 인덱스는
+ * 반영 지연이 있어 새 커밋 감지에는 쓸 수 없기 때문에 역할을 나눈 것이다.
+ */
+export function searchPRRepos(searchQuery: string): RepoSearchResult {
+  const repos = new Set<string>();
+  const prs: { slug: string; number: number }[] = [];
+  let cursor: string | null = null;
+  let total = 0;
+  let cost = 0;
+  let remaining = -1;
+  let truncated = false;
+
+  for (let page = 0; page < SEARCH_MAX_PAGES; page++) {
+    const args = [`-f q=${JSON.stringify(searchQuery)}`, cursor ? `-f after=${cursor}` : '']
+      .filter(Boolean)
+      .join(' ');
+    const { data } = graphQLTolerant(args, REPO_SEARCH_QUERY);
+    const search = data?.search;
+    if (!search) break;
+
+    cost += data.rateLimit?.cost ?? 1;
+    remaining = data.rateLimit?.remaining ?? remaining;
+    total = search.issueCount ?? total;
+    for (const n of search.nodes ?? []) {
+      const slug = n?.repository?.nameWithOwner;
+      if (!slug || typeof n.number !== 'number') continue;
+      repos.add(slug);
+      prs.push({ slug, number: n.number });
+    }
+
+    if (!search.pageInfo?.hasNextPage) break;
+    cursor = search.pageInfo.endCursor;
+    truncated = page === SEARCH_MAX_PAGES - 1;
+  }
+
+  return { repos: [...repos].sort(), prs, total, truncated, cost, remaining };
 }
 
 let viewerLoginCache: string | null = null;

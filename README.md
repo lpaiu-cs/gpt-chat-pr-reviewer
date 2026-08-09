@@ -68,6 +68,70 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
 
 2차 라운드부터는 프롬프트에 **이전 라운드 코멘트 현황**(해결됨 / 답변만 있음 / 미해결)이 포함되어, 이전 지적의 반영 여부와 새 변경사항 위주로 검토합니다.
 
+## 감시 범위
+
+레포를 하나씩 등록하는 대신 **계정/조직 단위로 감시**할 수 있습니다. 새 레포에 PR이 열리면 설정을 고치지 않아도 자동으로 대상에 들어옵니다.
+
+```jsonc
+{
+  "watch": {
+    "mode": "account",              // account | repos | review-requested
+    "include": ["myorg/*"],         // 글롭 허용. 슬래시가 없으면 'owner/*' 로 해석
+    "exclude": ["*/archived-*"],
+    "filters": {
+      "authors": ["lpaiu-cs"],      // 이 작성자들의 PR만
+      "labels": ["needs-review"],   // 이 라벨을 하나라도 가진 PR만
+      "draft": false                // 초안 제외 (기본값)
+    },
+    "discoveryIntervalMs": 300000   // 레포 재탐색 주기 (기본 5분)
+  }
+}
+```
+
+| `mode` | 대상 |
+|---|---|
+| `account` | `include`의 계정/조직에서 **열린 PR이 있는 레포**를 검색으로 발견 |
+| `repos` | `include`에 적은 `owner/repo`만 (글롭 불가) |
+| `review-requested` | 현재 `gh` 계정에 **리뷰가 요청된 PR만** (레포 단위가 아니라 PR 단위) |
+
+필터는 AND로 적용되며, 걸린 PR은 추적을 시작하지도 않습니다. `filters`가 없으면 **초안(draft)은 제외**됩니다 — 작성 중인 PR까지 대화 한도를 쓰지 않기 위해서입니다. `"draft": true`로 되돌릴 수 있습니다.
+
+> `review-requested`는 PR 번호까지 보존해 대상을 한정합니다. 레포 단위로 축약하면 리뷰 요청받은 PR 하나 때문에 그 레포의 열린 PR 전부가 리뷰 대상이 됩니다.
+>
+> 다만 **이미 추적을 시작한 PR은 계속 따라갑니다.** 리뷰를 게시하면 GitHub이 리뷰 요청을 해제하므로, 검색 결과만 믿으면 1차 라운드 직후 대상에서 빠져 2차 라운드가 오지 않습니다.
+
+라벨 목록이 한 번에 다 읽히지 않은 경우(`labelsTruncated`)에는 라벨 조건으로 **제외하지 않습니다.** 못 읽은 구간에 대상 라벨이 있을 수 있어서, 불완전한 근거로 빼면 그 PR은 조용히 영영 리뷰되지 않습니다. 이때는 경고를 출력하고 통과시킵니다.
+
+> 구버전 `watchRepos`도 그대로 동작합니다. `watch.include`가 비어 있으면 `watchRepos`를 `repos` 모드로 해석합니다.
+
+**비용.** 레포 발견은 GraphQL 검색 1회(실측 1 point)이고 기본 5분 주기로만 돕니다. 감지 자체는 기존대로 레포당 1 point/스캔입니다. 검색 인덱스는 반영 지연이 있어 새 커밋 감지에는 쓰지 않고, **대상 목록을 정하는 데에만** 사용합니다.
+
+## 리뷰 큐
+
+브라우저 페이지가 단일 자원이라 리뷰는 **직렬로만** 돌 수 있고, 라운드 하나가 2~15분 걸립니다. 대상이 많아지면 "무엇을 먼저 볼 것인가"가 문제가 되므로 스캔과 실행을 분리했습니다. 한 사이클은 감시 범위를 전부 동기화한 뒤, 큐에서 **한 건만** 리뷰하고 즉시 재스캔합니다 — 라운드가 도는 동안 바뀐 상황이 다음 순서에 반영됩니다.
+
+```bash
+npm run dev -- queue          # 대기열 조회
+npm run dev -- queue --json   # UI/스크립트 연동
+```
+
+우선순위는 **라운드 미진행 → 작성자 응답 완료 → 그 외**이고, 같은 순위 안에서는 오래 기다린 PR이 먼저입니다.
+
+`queue`는 watch와 **같은 범위·필터**를 적용합니다. 감시 범위 밖 레포나 필터에 걸린 PR은 대기열에 나오지 않으며, 몇 건을 감췄는지 함께 알려줍니다. 필터 판정은 스캔이 컨텍스트에 남긴 결과를 읽으므로 `queue`는 GitHub을 다시 호출하지 않습니다.
+
+감시 범위가 설정되지 않았으면 watch 자체가 돌지 않으므로, `queue`도 대기열 대신 설정이 비었다고 알립니다 (`--json`은 `"scopeConfigured": false`). 추적 기록을 그대로 보려면 `status`를 쓰세요.
+
+```
+  대기열 3건  (위에서부터 처리)
+   1. myorg/api#42   [1차 리뷰]     대기 2시간 10분
+   2. myorg/web#17   [작성자 응답]  대기 35분
+   3. myorg/api#31   [재시도]       대기 6시간 2분
+```
+
+쿼터 한도에 걸려도 **큐는 그대로 보존**됩니다. ChatGPT 한도는 계정 단위라 남은 대상도 지금은 못 돌지만, 사이클을 중단하는 대신 실행만 미루고 폴링은 계속합니다. 쿨다운이 지나면 우선순위 그대로 재개하며, `watch`를 껐다 켜도 저장된 컨텍스트에서 복원됩니다.
+
+> 큐는 저장되지 않습니다. `REVIEW_DUE`인 컨텍스트에서 매번 다시 계산합니다 — 상태가 이미 단일 소스이므로 큐 파일을 따로 두면 잠금 없는 저장소를 두 곳에서 다투게 됩니다. 같은 이유로 `QUEUED` 같은 상태를 상태 머신에 추가하지 않았습니다. 큐 대기는 실행기 사정이지 GitHub에서 관측된 PR 상태가 아닙니다.
+
 ---
 
 ## 요구사항
@@ -113,11 +177,18 @@ npm run dev -- review https://github.com/owner/repo/pull/123 --dry-run
 
 **4. 자동 감시**
 
-`pr-review.config.json`의 `watchRepos`에 `owner/repo`를 추가한 뒤:
+`pr-review.config.json`의 `watch.include`에 감시 범위를 적은 뒤:
+
+```jsonc
+"watch": { "mode": "account", "include": ["myorg/*"] }   // 조직 전체
+"watch": { "mode": "repos",   "include": ["owner/repo"] } // 레포 지정
+```
 
 ```bash
 npm run dev -- watch
 ```
+
+계정 전체를 감시하면 새 레포의 PR도 자동으로 큐에 올라옵니다. 자세한 옵션은 [감시 범위](#감시-범위)를 참고하세요.
 
 ## 명령어
 
@@ -128,7 +199,8 @@ npm run dev -- watch
 | `init` | 설정 파일 + 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 리뷰 지침 파일 열기 |
 | `review <pr>` | 리뷰 라운드 실행 — `--dry-run` `--force` `--headless` `--timeout <분>` `--from-cache` `--instructions <file>` |
-| `watch` | 레포 폴링 → 동기화 → 자동 리뷰 — `--once` `--headless` `--dry-run` |
+| `watch` | 감시 범위 폴링 → 동기화 → 큐 순서대로 자동 리뷰 — `--once` `--headless` `--dry-run` |
+| `queue` | 리뷰 대기열 조회 — `--json` |
 | `status [pr]` | PR 상태 조회 — `--json` |
 | `graph [pr]` | 상태 머신 mermaid 다이어그램 출력 |
 | `rounds <pr>` | 리뷰 라운드 이력 |
@@ -173,7 +245,8 @@ npm run dev -- review <pr-url> --from-cache
 
 | 키 | 기본값 | 설명 |
 |---|---|---|
-| `watchRepos` | `[]` | 감시할 `owner/repo` 목록 |
+| `watch` | — | 감시 범위 — [위 절](#감시-범위) 참고 |
+| `watchRepos` | `[]` | 감시할 `owner/repo` 목록 (구버전 — `watch.include` 폴백) |
 | `watchIntervalMs` | `10000` | 폴링 간격 (10초, 하한 5초) |
 | `quotaCooldownMs` | `10800000` | 쿼터 쿨다운 (3시간) |
 | `maxAutoRetries` | `2` | ERROR 자동 재시도 횟수 |
