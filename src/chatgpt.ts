@@ -613,15 +613,24 @@ export class ChatGPTDriver {
       throw new Error('ChatGPT 응답이 시작되지 않음 (60초 초과)');
     }
 
+    // **기다린 그 노드를 읽는다.** `.last()` 로 읽으면 안 된다 — 위에서 기다린 건
+    // nth(messageCountBefore) 인데 DOM 에 다른 어시스턴트 노드가 섞이면 둘이
+    // 달라지고, 그러면 **엉뚱한 메시지를 응답으로 저장해 게시한다.** 실제로 9차
+    // 라운드가 7차의 응답을 그대로 게시했다 (관측 길이가 845자로 272초 고정되다가
+    // 341자로 급감 — 스트리밍이면 있을 수 없는 변화다).
+    const target = page.locator(sel.assistantMessage).nth(messageCountBefore);
+
     // 메시지 컨테이너 전체를 읽으면 "Edit"·복사 버튼 같은 UI 텍스트가 섞인다.
-    // 본문(.markdown)이 있으면 그쪽을 읽고, 없을 때만 컨테이너로 폴백한다.
-    const readLatest = async (): Promise<string> => {
-      const msg = page.locator(sel.assistantMessage).last();
-      const body = msg.locator(sel.messageContent).last();
-      if ((await body.count()) > 0) {
-        return body.innerText().catch(() => '');
+    // 본문(.markdown)이 있으면 그쪽을 읽는다. 한 메시지 안에 본문 블록이 여러 개면
+    // (산문 + 코드블록 + 산문) **전부 이어 붙인다** — 마지막 하나만 집으면 JSON 이
+    // 앞에 있을 때 통째로 잃는다.
+    const readTarget = async (): Promise<string> => {
+      const bodies = target.locator(sel.messageContent);
+      if ((await bodies.count().catch(() => 0)) > 0) {
+        const parts = await bodies.allInnerTexts().catch(() => [] as string[]);
+        return parts.join('\n').trim();
       }
-      return msg.innerText().catch(() => '');
+      return target.innerText().catch(() => '');
     };
 
     let lastText = '';
@@ -633,7 +642,20 @@ export class ChatGPTDriver {
     while (Date.now() - t0 < timeout) {
       await page.waitForTimeout(3_000);
 
-      const cur = await readLatest();
+      const cur = await readTarget();
+
+      // 생성 중인 응답은 길어지기만 한다. 짧아졌다면 우리가 **다른 노드를 읽은**
+      // 것이다 (DOM 재렌더·가상화). 그 값을 완성본으로 굳히면 낡은 응답을 게시한다.
+      // 확정을 미루고 기록만 남긴다 — 이슈 #1 의 증상 창구이기도 하다.
+      if (lastText.length > 0 && cur.length < lastText.length) {
+        console.log(
+          chalk.yellow(
+            `  ⚠ 읽은 응답이 짧아졌습니다 (${lastText.length.toLocaleString()} → ` +
+              `${cur.length.toLocaleString()}자) — 노드가 바뀐 것으로 보고 확정을 미룹니다.`,
+          ),
+        );
+      }
+
       if (cur.length > 0 && cur === lastText) {
         stable++;
       } else {
