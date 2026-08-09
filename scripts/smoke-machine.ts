@@ -1018,6 +1018,37 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
 }
 
+// ── 시나리오 32: probe 를 건너뛴 주기의 제외 판정 ──────────
+
+{
+  // 리뷰 지적 [P2]: probe 를 생략하면 excludedReason 이 갱신되지 않는다. 그 사이
+  // 사용자가 건너뛰기를 누르면 낡은 값 때문에 **방금 제외한 PR 이 리뷰된다.**
+  // effectiveExclusion 이 하는 판정을 그대로 재현한다 (cli.ts 는 import 불가).
+  const KEY = 'lpaiu-cs/osk-system#12';
+  const effective = (cached: string | undefined, filters: any): string | undefined => {
+    const live = passesRefFilters(KEY, filters);
+    if (!live.ok) return live.reason;
+    return cached && !isRefFilterReason(cached) ? cached : undefined;
+  };
+
+  // 직전 probe 때는 통과였고(캐시 없음) 그 뒤 skip 이 걸린 상황
+  assert(effective(undefined, { skip: [KEY] }) === 'skip 목록', '캐시가 비어도 지금 skip 이면 제외된다');
+  assert(effective(undefined, { only: ['other/x#1'] }) === 'only 목록 밖', 'only 도 즉시 반영된다');
+
+  // 반대로 직전 probe 때 skip 이었는데 그 뒤 해제된 상황
+  assert(effective('skip 목록', {}) === undefined, '지금 해제됐으면 낡은 캐시를 무시한다');
+
+  // 설정만으로 다시 계산할 수 없는 사유는 캐시가 유효하다
+  assert(effective('초안(draft)', {}) === '초안(draft)', 'draft 캐시는 유지된다');
+  assert(effective('작성자 bot 는 대상 아님', {}) === '작성자 bot 는 대상 아님', 'authors 캐시도 유지');
+
+  // skip 이 only 를 이긴다는 규칙이 여기서도 유지되는지
+  assert(
+    effective(undefined, { skip: [KEY], only: [KEY] }) === 'skip 목록',
+    'probe 생략 경로에서도 skip 이 only 를 이긴다',
+  );
+}
+
 // ── 시나리오 31: 의도 배치 안에서의 필터 판정 ──────────────
 
 {

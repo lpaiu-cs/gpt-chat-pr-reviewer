@@ -449,136 +449,6 @@ program
 
     const repoSource = createRepoSource(scope);
 
-    // ── 관측 대시보드 ──
-    // 브라우저를 띄우기 **전에** 켠다. 로그인 안내나 launch 실패도 대시보드
-    // 로그에 남아야 터미널을 안 보고도 무슨 일인지 알 수 있다.
-    let ui: UIServerHandle | null = null;
-    if (opts.ui) {
-      const port = Number(opts.uiPort ?? DEFAULT_UI_PORT);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        console.log(chalk.red(`  ✗ 잘못된 포트: ${opts.uiPort}`));
-        return;
-      }
-      try {
-        ui = await startUIServer(port, {
-          readInstructions: () => readInstructionsRaw(cfg),
-          writeInstructions: (body) => saveInstructions(cfg, body),
-          // 형식은 서버가 보고, 뜻은 여기서 본다 — 감시 범위와 모드를 아는 쪽이다.
-          // 큐까지 흘려보낸 뒤 로그로만 알리면 "눌렀는데 아무 일도 안 남" 이 된다.
-          validate: (intent): string | null => {
-            const badRef = (r: string): string | null =>
-              parsePRRef(r) ? null : `잘못된 PR 참조: "${r}" — 'owner/repo#12' 형식이어야 합니다.`;
-
-            switch (intent.kind) {
-              case 'skip-add':
-              case 'skip-remove':
-                return badRef(intent.ref);
-              case 'review-now': {
-                const bad = badRef(intent.ref);
-                if (bad) return bad;
-                // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 202 로 받아두면
-                // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다 (그리고 상태만
-                // 바뀐다 — applyIntents 주석 참고).
-                const key = parsePRRef(intent.ref) as string;
-                const target = findContext(key);
-                if (!target) return `${intent.ref} 는 추적 중이 아닙니다.`;
-                // applyIntents 와 같은 두 갈래 판정 (skip/only 는 지금 설정,
-                // 나머지는 스캔이 남긴 값). 큐에 아직 적용 대기 중인 필터 변경까지는
-                // 볼 수 없으므로 최종 권한은 루프에 있고, 여기는 즉시 피드백용이다.
-                const live = passesRefFilters(key, scope.filters);
-                const stale =
-                  target.excludedReason && !isRefFilterReason(target.excludedReason)
-                    ? target.excludedReason
-                    : undefined;
-                const blocked = !live.ok ? live.reason : stale;
-                if (blocked) {
-                  return `필터에 걸려 있어 실행할 수 없습니다 (${blocked}). 먼저 제외를 푸세요.`;
-                }
-                return null;
-              }
-              case 'only-set': {
-                // 하나라도 틀리면 전체를 거부한다. 일부만 적용하면 '이것만' 이
-                // 기존 한정 해제로 뒤집힌다 (applyIntents 주석 참고).
-                const bad = intent.refs.map(badRef).filter(Boolean);
-                return bad.length > 0 ? bad.join(' / ') : null;
-              }
-              case 'scope-set': {
-                if (intent.include.length === 0 && scope.mode !== 'review-requested') {
-                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
-                }
-                // discoverRepos 와 **같은 판정**을 쓴다 (unsupportedPatterns).
-                // 갈라지면 UI 는 받아주고 백엔드는 조용히 버린다.
-                const bad = unsupportedPatterns(scope.mode, intent.include);
-                if (bad.length > 0) {
-                  return scope.mode === 'repos'
-                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
-                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
-                }
-                return null;
-              }
-              default:
-                return null;
-            }
-          },
-        });
-        progress.patch({
-          startedAt: Date.now(),
-          scope: describeScope(scope),
-          dryRun: opts.dryRun,
-        });
-        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
-      } catch (e) {
-        // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
-        console.log(
-          chalk.yellow(`  ⚠ 대시보드를 띄우지 못했습니다: ${e instanceof Error ? e.message : String(e)}`),
-        );
-      }
-    }
-
-    // ── 관측 모드 ──
-    // 리뷰를 실행하지 않으므로 브라우저를 아예 띄우지 않는다. ChatGPT 한도도,
-    // Chrome 창도, 로그인도 필요 없다 — GitHub 폴링만 도는 완전한 무비용 모드다.
-    let driver: ChatGPTDriver | null = null;
-    if (opts.observe) {
-      console.log(
-        chalk.cyan('  ◆ 관측 모드 — 리뷰를 실행하지 않습니다') +
-          chalk.dim(' (브라우저 미실행 · ChatGPT 한도 소비 없음)'),
-      );
-    } else {
-      driver = new ChatGPTDriver(cfg);
-      await driver.launch();
-      await driver.navigateToChatGPT();
-
-      const user = await driver.getSessionUser();
-      if (!user) {
-        console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
-        await driver.close();
-        await ui?.close();
-        return;
-      }
-      console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
-      progress.patch({ account: user.email ?? user.name ?? null });
-    }
-
-    // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
-    // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
-    const reported = new Map<string, string>();
-    let lastHeartbeat = 0;
-    let lastRemaining = -1; // 마지막 probe 가 보고한 GraphQL 잔여 한도
-    let lastCycleCost = 0; // 직전 사이클이 실제로 쓴 GraphQL point 합계
-    let watchedRepos = 0; // 마지막 스캔에서 실제로 폴링한 레포 수
-    /** 레포별 마지막 probe 시각 — resolve 를 기다리지 않는 레포를 늦추는 기준. */
-    const lastProbeAt = new Map<string, number>();
-    /** 레포별 마지막으로 관측한 열린 PR 수 — probe 를 건너뛴 주기의 표시용. */
-    const lastOpenAt = new Map<string, number>();
-
-    // 쿼터 쿨다운. 큐를 버리지 않고 이 시각까지 실행만 멈춘다.
-    // watch 를 재시작해도 컨텍스트에서 복원되도록 시작 시 한 번 읽어둔다.
-    let quotaUntil = quotaGateUntil(listContexts(cfg)) ?? 0;
-    let quotaNotified = 0;
-    let observeNotified = 0;
-    let pauseNotified = 0;
-
     // ── 제어 상태 (UI 의도 큐가 바꾼다) ──
     let paused = false;
     /** '지금 리뷰' 로 큐 앞으로 당긴 PR (정규화 키). 그 라운드가 돌면 빠진다. */
@@ -596,6 +466,25 @@ program
         only: [...(scope.filters?.only ?? [])],
         prioritized: [...prioritized],
       });
+    };
+
+    /**
+     * **지금 기준**의 제외 사유 (없으면 undefined).
+     *
+     * 두 갈래다. `skip`/`only` 는 UI 가 런타임에 바꾸므로 설정만 보고 **다시**
+     * 판정한다. 나머지(draft/authors/labels)는 GitHub 관측값이 있어야 알 수 있어
+     * 스캔이 남긴 `excludedReason` 을 그대로 쓴다.
+     *
+     * 이 판정이 필요한 자리가 셋이다 — 서버 검증 · review-now 적용 · probe 생략
+     * 경로. 앞의 둘에 복제해 두었다가 세 번째(probe 생략)에서 빠뜨려 "방금 제외한
+     * PR 이 그대로 리뷰되는" 회귀를 냈다. 그래서 하나로 묶는다.
+     */
+    const effectiveExclusion = (c: PRContext): string | undefined => {
+      const live = passesRefFilters(ctxKey(c), scope.filters);
+      if (!live.ok) return live.reason;
+      return c.excludedReason && !isRefFilterReason(c.excludedReason)
+        ? c.excludedReason
+        : undefined;
     };
 
     publishControl(); // 첫 스캔 전에도 현재 필터·일시정지 상태가 화면에 보이게
@@ -761,12 +650,7 @@ program
         // 판정은 **두 갈래**다. skip/only 는 방금 1단계에서 바뀌었을 수 있으므로
         // 캐시가 아니라 지금 설정으로 다시 본다. 나머지(draft/authors/labels)는
         // GitHub 관측값이 있어야 알 수 있어 스캔이 남긴 값이 여전히 유효하다.
-        const live = passesRefFilters(key, scope.filters);
-        const stale =
-          target.excludedReason && !isRefFilterReason(target.excludedReason)
-            ? target.excludedReason
-            : undefined;
-        const blocked = !live.ok ? live.reason : stale;
+        const blocked = effectiveExclusion(target);
         if (blocked) {
           console.log(
             chalk.yellow(`  ⚠ ${key} 는 필터에 걸려 있습니다 (${blocked}) — 먼저 제외를 푸세요.`),
@@ -798,6 +682,132 @@ program
       }
       publishControl();
     };
+
+    // ── 관측 대시보드 ──
+    // 브라우저를 띄우기 **전에** 켠다. 로그인 안내나 launch 실패도 대시보드
+    // 로그에 남아야 터미널을 안 보고도 무슨 일인지 알 수 있다.
+    let ui: UIServerHandle | null = null;
+    if (opts.ui) {
+      const port = Number(opts.uiPort ?? DEFAULT_UI_PORT);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        console.log(chalk.red(`  ✗ 잘못된 포트: ${opts.uiPort}`));
+        return;
+      }
+      try {
+        ui = await startUIServer(port, {
+          readInstructions: () => readInstructionsRaw(cfg),
+          writeInstructions: (body) => saveInstructions(cfg, body),
+          // 형식은 서버가 보고, 뜻은 여기서 본다 — 감시 범위와 모드를 아는 쪽이다.
+          // 큐까지 흘려보낸 뒤 로그로만 알리면 "눌렀는데 아무 일도 안 남" 이 된다.
+          validate: (intent): string | null => {
+            const badRef = (r: string): string | null =>
+              parsePRRef(r) ? null : `잘못된 PR 참조: "${r}" — 'owner/repo#12' 형식이어야 합니다.`;
+
+            switch (intent.kind) {
+              case 'skip-add':
+              case 'skip-remove':
+                return badRef(intent.ref);
+              case 'review-now': {
+                const bad = badRef(intent.ref);
+                if (bad) return bad;
+                // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 202 로 받아두면
+                // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다 (그리고 상태만
+                // 바뀐다 — applyIntents 주석 참고).
+                const key = parsePRRef(intent.ref) as string;
+                const target = findContext(key);
+                if (!target) return `${intent.ref} 는 추적 중이 아닙니다.`;
+                // applyIntents 와 같은 두 갈래 판정 (skip/only 는 지금 설정,
+                // 나머지는 스캔이 남긴 값). 큐에 아직 적용 대기 중인 필터 변경까지는
+                // 볼 수 없으므로 최종 권한은 루프에 있고, 여기는 즉시 피드백용이다.
+                const blocked = effectiveExclusion(target);
+                if (blocked) {
+                  return `필터에 걸려 있어 실행할 수 없습니다 (${blocked}). 먼저 제외를 푸세요.`;
+                }
+                return null;
+              }
+              case 'only-set': {
+                // 하나라도 틀리면 전체를 거부한다. 일부만 적용하면 '이것만' 이
+                // 기존 한정 해제로 뒤집힌다 (applyIntents 주석 참고).
+                const bad = intent.refs.map(badRef).filter(Boolean);
+                return bad.length > 0 ? bad.join(' / ') : null;
+              }
+              case 'scope-set': {
+                if (intent.include.length === 0 && scope.mode !== 'review-requested') {
+                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
+                }
+                // discoverRepos 와 **같은 판정**을 쓴다 (unsupportedPatterns).
+                // 갈라지면 UI 는 받아주고 백엔드는 조용히 버린다.
+                const bad = unsupportedPatterns(scope.mode, intent.include);
+                if (bad.length > 0) {
+                  return scope.mode === 'repos'
+                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
+                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
+                }
+                return null;
+              }
+              default:
+                return null;
+            }
+          },
+        });
+        progress.patch({
+          startedAt: Date.now(),
+          scope: describeScope(scope),
+          dryRun: opts.dryRun,
+        });
+        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
+      } catch (e) {
+        // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
+        console.log(
+          chalk.yellow(`  ⚠ 대시보드를 띄우지 못했습니다: ${e instanceof Error ? e.message : String(e)}`),
+        );
+      }
+    }
+
+    // ── 관측 모드 ──
+    // 리뷰를 실행하지 않으므로 브라우저를 아예 띄우지 않는다. ChatGPT 한도도,
+    // Chrome 창도, 로그인도 필요 없다 — GitHub 폴링만 도는 완전한 무비용 모드다.
+    let driver: ChatGPTDriver | null = null;
+    if (opts.observe) {
+      console.log(
+        chalk.cyan('  ◆ 관측 모드 — 리뷰를 실행하지 않습니다') +
+          chalk.dim(' (브라우저 미실행 · ChatGPT 한도 소비 없음)'),
+      );
+    } else {
+      driver = new ChatGPTDriver(cfg);
+      await driver.launch();
+      await driver.navigateToChatGPT();
+
+      const user = await driver.getSessionUser();
+      if (!user) {
+        console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
+        await driver.close();
+        await ui?.close();
+        return;
+      }
+      console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
+      progress.patch({ account: user.email ?? user.name ?? null });
+    }
+
+    // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
+    // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
+    const reported = new Map<string, string>();
+    let lastHeartbeat = 0;
+    let lastRemaining = -1; // 마지막 probe 가 보고한 GraphQL 잔여 한도
+    let lastCycleCost = 0; // 직전 사이클이 실제로 쓴 GraphQL point 합계
+    let watchedRepos = 0; // 마지막 스캔에서 실제로 폴링한 레포 수
+    /** 레포별 마지막 probe 시각 — resolve 를 기다리지 않는 레포를 늦추는 기준. */
+    const lastProbeAt = new Map<string, number>();
+    /** 레포별 마지막으로 관측한 열린 PR 수 — probe 를 건너뛴 주기의 표시용. */
+    const lastOpenAt = new Map<string, number>();
+
+    // 쿼터 쿨다운. 큐를 버리지 않고 이 시각까지 실행만 멈춘다.
+    // watch 를 재시작해도 컨텍스트에서 복원되도록 시작 시 한 번 읽어둔다.
+    let quotaUntil = quotaGateUntil(listContexts(cfg)) ?? 0;
+    let quotaNotified = 0;
+    let observeNotified = 0;
+    let pauseNotified = 0;
+
 
     const reportIfChanged = (ctx: PRContext): void => {
       const key = ctxKey(ctx);
@@ -875,8 +885,14 @@ program
           // 들쭉날쭉해진다. 새 정보가 없을 뿐 판정이 바뀐 게 아니다.
           openCount += lastOpenAt.get(repoSlug) ?? tracked.length;
           for (const c of tracked) {
+            // excludedReason 은 probe 경로에서만 갱신된다. 건너뛰는 동안 사용자가
+            // 건너뛰기/이것만을 눌렀다면 그 값은 낡았고, 그대로 믿으면 **방금 제외한
+            // PR 을 리뷰해 버린다.** skip 은 "확실히 하지 말 것" 이라 즉시 들어야 한다.
+            const reason = effectiveExclusion(c);
+            if (reason) c.excludedReason = reason;
+            else delete c.excludedReason;
             seen.push(c);
-            if (!c.excludedReason) eligible.push(c);
+            if (!reason) eligible.push(c);
           }
           continue;
         }
