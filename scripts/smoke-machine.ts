@@ -25,9 +25,14 @@ import { loadConfig } from '../src/config.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
+  createRepoSource,
+  discoverRepos,
   globToRegExp,
+  unsupportedPatterns,
   invalidPRRefs,
+  isRefFilterReason,
   parsePRRef,
+  passesRefFilters,
   matchesScope,
   nextRepoCache,
   passesFilters,
@@ -1011,6 +1016,133 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 31: 의도 배치 안에서의 필터 판정 ──────────────
+
+{
+  // 리뷰 지적 [P2]: 캐시된 excludedReason 은 **직전 스캔** 값이라, 같은 배치에서
+  // 앞서 적용된 skip/only 변경을 반영하지 못한다. 그래서 판정을 두 갈래로 나눈다.
+  const KEY = 'lpaiu-cs/osk-system#12';
+
+  // (1) 배치에서 방금 skip 에 들어갔다 → 캐시는 비어 있어도 막아야 한다
+  assert(
+    !passesRefFilters(KEY, { skip: [KEY] }).ok,
+    '지금 설정 기준으로 skip 이면 캐시가 비어 있어도 막힌다',
+  );
+  // (2) 배치에서 방금 skip 에서 빠졌다 → 캐시가 'skip 목록' 이어도 통과해야 한다
+  assert(passesRefFilters(KEY, { skip: [] }).ok, '지금 설정에서 빠졌으면 통과한다');
+  assert(
+    isRefFilterReason('skip 목록') && isRefFilterReason('only 목록 밖'),
+    'skip/only 사유는 다시 계산 가능하므로 캐시를 무시해도 된다',
+  );
+  // (3) 반대로 draft/authors/labels 는 설정만으로 못 고치므로 캐시가 유효하다
+  assert(!isRefFilterReason('초안(draft)'), 'draft 는 재계산 불가 — 캐시가 유효하다');
+  assert(!isRefFilterReason('작성자 bot 는 대상 아님'), 'authors 도 재계산 불가');
+  assert(!isRefFilterReason(undefined), '사유가 없으면 ref 사유가 아니다');
+
+  // only 도 같은 규칙
+  assert(!passesRefFilters(KEY, { only: ['other/repo#1'] }).ok, 'only 목록 밖이면 막힌다');
+  assert(passesRefFilters(KEY, { only: [KEY] }).ok, 'only 목록 안이면 통과');
+  assert(passesRefFilters(KEY, {}).ok, '조건이 없으면 통과');
+
+  // passesFilters 가 같은 함수를 지나는지 (판정이 갈라지면 안 된다)
+  const pr = {
+    owner: 'lpaiu-cs', repo: 'osk-system', number: 12,
+    author: 'lpaiu-cs', isDraft: false, labels: [],
+  };
+  assert(
+    passesFilters(pr, { skip: [KEY] }).reason === passesRefFilters(KEY, { skip: [KEY] }).reason,
+    'passesFilters 와 passesRefFilters 가 같은 사유를 낸다',
+  );
+}
+
+// ── 시나리오 30: 필터에 걸린 PR 은 강제 전이시켜도 못 돈다 ──
+
+{
+  // 리뷰 지적 [P2]: '지금 리뷰' 가 필터를 확인하지 않고 먼저 상태를 바꿨다.
+  // 스캔이 excludedReason 붙은 컨텍스트를 eligible 에 넣지 않으므로 리뷰는
+  // 실행되지 않는데, **영속 상태만 REVIEW_DUE 로 바뀌어 남는다.** 나중에
+  // 제외를 풀면 작성자 응답도 새 커밋도 없이 리뷰가 돈다.
+  const ctx = createContext(fakePR);
+  fire(ctx, 'START_REVIEW');
+  fire(ctx, 'POSTED_COMMENTS', { patch: { round: 1 } });
+  ctx.excludedReason = 'skip 목록';
+  assert(ctx.state === 'AWAITING_AUTHOR', '전제: 작성자 응답 대기 상태');
+
+  // '지금 리뷰' 가 하던 강제 전이를 그대로 재현한다.
+  fire(ctx, 'AUTHOR_RESPONDED', { note: 'UI: 지금 리뷰' }); // = FORCE_EVENTS.AWAITING_AUTHOR
+  assert(ctx.state === 'REVIEW_DUE', '강제 전이 자체는 성립한다');
+  assert(!isQueueable(ctx), '그런데 필터에 걸려 있어 큐에는 오르지 않는다 (= 무동작)');
+  assert(
+    buildQueue([ctx]).length === 0,
+    '큐가 비어 있다 — 상태만 바뀌고 리뷰는 영영 실행되지 않는 갈라짐',
+  );
+
+  // 제외를 풀면 그 잔여 상태 때문에 응답 없이도 리뷰가 돈다 — 이게 진짜 피해다.
+  delete ctx.excludedReason;
+  assert(
+    buildQueue([ctx]).length === 1,
+    '제외 해제 시 강제 전이 잔여물이 그대로 큐에 오른다 (그래서 전이 전에 막아야 한다)',
+  );
+}
+
+// ── 시나리오 28: 범위 변경 시 탐색 캐시 폐기 ───────────────
+
+{
+  // 리뷰 지적 [P1]: lastAt = 0 은 "다시 탐색하라" 일 뿐이다. 그 탐색이 부분
+  // 실패하면 nextRepoCache 가 이전 캐시를 **의도적으로 보존**하므로 옛 범위의
+  // 레포가 살아남고, scan 이 그걸 그대로 probe 해 리뷰를 게시할 수 있다.
+  const stale = ['oldorg/a', 'oldorg/b'];
+  const partialFail = { repos: [], partial: true, truncated: false, cost: 0 };
+  assert(
+    nextRepoCache(stale, partialFail).length === 2,
+    '부분 실패는 이전 캐시를 보존한다 (일시 오류로 감시가 끊기면 안 되므로)',
+  );
+
+  // 그래서 범위를 바꿀 때는 freshness 가 아니라 캐시 자체를 버려야 한다.
+  const src = createRepoSource({ mode: 'repos', include: ['oldorg/a'], exclude: [] });
+  assert(src.list().includes('oldorg/a'), '탐색 결과가 캐시에 담긴다');
+  src.targets = new Map([['oldorg/a', new Set([1])]]);
+
+  src.reset();
+  assert(src.lastAt === 0, 'reset 은 freshness 를 되돌린다');
+  assert(src.targets === undefined, 'reset 은 targets 도 버린다 (여기가 lastAt=0 과 다른 지점)');
+  assert(src.truncated === false, 'reset 은 truncated 도 되돌린다');
+}
+
+// ── 시나리오 29: 탐색이 펼칠 수 없는 패턴 ──────────────────
+
+{
+  // 리뷰 지적 [P2]: UI 가 저장을 받아주는데 백엔드가 조용히 버리면,
+  // lingering 컨텍스트가 남아 있는 동안 그 실패가 가려진다.
+  assert(
+    unsupportedPatterns('repos', ['owner/repo', 'owner/*']).join() === 'owner/*',
+    'repos 모드는 글롭을 펼칠 수 없다',
+  );
+  assert(
+    unsupportedPatterns('repos', ['owner/repo']).length === 0,
+    'repos 모드에서 리터럴은 통과',
+  );
+  assert(
+    unsupportedPatterns('account', ['myorg/*', '*/service-*']).join() === '*/service-*',
+    'account 모드는 소유자 자리 글롭만 불가 (검색이 org:<owner> 단위)',
+  );
+  assert(
+    unsupportedPatterns('account', ['myorg/*', 'other/repo']).length === 0,
+    'account 모드에서 소유자가 특정되면 통과',
+  );
+  assert(
+    unsupportedPatterns('review-requested', ['*/*', 'anything']).length === 0,
+    'review-requested 는 include 가 결과 필터일 뿐이라 제약이 없다',
+  );
+
+  // discoverRepos 와 같은 판정을 쓰는지 — 갈라지면 이 검증이 무의미해진다.
+  const r = discoverRepos({ mode: 'repos', include: ['owner/repo', 'owner/*'], exclude: [] });
+  assert(
+    r.repos.join() === 'owner/repo',
+    'discoverRepos 가 버리는 패턴 = unsupportedPatterns 가 지목하는 패턴',
+  );
 }
 
 // ── 시나리오 26: 대시보드 로그 심각도 추론 ─────────────────

@@ -20,18 +20,22 @@ import { spawn } from 'node:child_process';
 import { Command } from 'commander';
 import chalk from 'chalk';
 
-import { loadConfig, initConfig, ensureDataDir } from './config.js';
+import { loadConfig, initConfig, ensureDataDir, patchConfigFile } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
 import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage } from './github.js';
 import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
-import { ensureInstructionsFile } from './instructions.js';
+import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
 import {
   admitsNewPR,
   createRepoSource,
   describeScope,
   invalidPRRefs,
+  isRefFilterReason,
+  parsePRRef,
+  passesRefFilters,
+  unsupportedPatterns,
   matchesScope,
   passesFilters,
   resolveWatchScope,
@@ -44,6 +48,7 @@ import {
   type QueueEntry,
 } from './queue.js';
 import { progress, type ContextCard, type QueueItem } from './progress.js';
+import { intents, type Intent } from './intents.js';
 import { startUIServer, type UIServerHandle } from './ui/server.js';
 import type { AppConfig, PRContext, PREvent, PRState } from './types.js';
 
@@ -454,13 +459,73 @@ program
         return;
       }
       try {
-        ui = await startUIServer(port);
+        ui = await startUIServer(port, {
+          readInstructions: () => readInstructionsRaw(cfg),
+          writeInstructions: (body) => saveInstructions(cfg, body),
+          // 형식은 서버가 보고, 뜻은 여기서 본다 — 감시 범위와 모드를 아는 쪽이다.
+          // 큐까지 흘려보낸 뒤 로그로만 알리면 "눌렀는데 아무 일도 안 남" 이 된다.
+          validate: (intent): string | null => {
+            const badRef = (r: string): string | null =>
+              parsePRRef(r) ? null : `잘못된 PR 참조: "${r}" — 'owner/repo#12' 형식이어야 합니다.`;
+
+            switch (intent.kind) {
+              case 'skip-add':
+              case 'skip-remove':
+                return badRef(intent.ref);
+              case 'review-now': {
+                const bad = badRef(intent.ref);
+                if (bad) return bad;
+                // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 202 로 받아두면
+                // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다 (그리고 상태만
+                // 바뀐다 — applyIntents 주석 참고).
+                const key = parsePRRef(intent.ref) as string;
+                const target = findContext(key);
+                if (!target) return `${intent.ref} 는 추적 중이 아닙니다.`;
+                // applyIntents 와 같은 두 갈래 판정 (skip/only 는 지금 설정,
+                // 나머지는 스캔이 남긴 값). 큐에 아직 적용 대기 중인 필터 변경까지는
+                // 볼 수 없으므로 최종 권한은 루프에 있고, 여기는 즉시 피드백용이다.
+                const live = passesRefFilters(key, scope.filters);
+                const stale =
+                  target.excludedReason && !isRefFilterReason(target.excludedReason)
+                    ? target.excludedReason
+                    : undefined;
+                const blocked = !live.ok ? live.reason : stale;
+                if (blocked) {
+                  return `필터에 걸려 있어 실행할 수 없습니다 (${blocked}). 먼저 제외를 푸세요.`;
+                }
+                return null;
+              }
+              case 'only-set': {
+                // 하나라도 틀리면 전체를 거부한다. 일부만 적용하면 '이것만' 이
+                // 기존 한정 해제로 뒤집힌다 (applyIntents 주석 참고).
+                const bad = intent.refs.map(badRef).filter(Boolean);
+                return bad.length > 0 ? bad.join(' / ') : null;
+              }
+              case 'scope-set': {
+                if (intent.include.length === 0 && scope.mode !== 'review-requested') {
+                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
+                }
+                // discoverRepos 와 **같은 판정**을 쓴다 (unsupportedPatterns).
+                // 갈라지면 UI 는 받아주고 백엔드는 조용히 버린다.
+                const bad = unsupportedPatterns(scope.mode, intent.include);
+                if (bad.length > 0) {
+                  return scope.mode === 'repos'
+                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
+                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
+                }
+                return null;
+              }
+              default:
+                return null;
+            }
+          },
+        });
         progress.patch({
           startedAt: Date.now(),
           scope: describeScope(scope),
           dryRun: opts.dryRun,
         });
-        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (읽기 전용 · localhost 전용)'));
+        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
       } catch (e) {
         // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
         console.log(
@@ -507,6 +572,227 @@ program
     let quotaUntil = quotaGateUntil(listContexts(cfg)) ?? 0;
     let quotaNotified = 0;
     let observeNotified = 0;
+    let pauseNotified = 0;
+
+    // ── 제어 상태 (UI 의도 큐가 바꾼다) ──
+    let paused = false;
+    /** '지금 리뷰' 로 큐 앞으로 당긴 PR (정규화 키). 그 라운드가 돌면 빠진다. */
+    const prioritized = new Set<string>();
+    scope.filters ??= {};
+
+    const publishControl = (): void => {
+      progress.control({
+        mode: scope.mode,
+        paused,
+        pendingIntents: intents.pending,
+        include: [...scope.include],
+        exclude: [...(scope.exclude ?? [])],
+        skip: [...(scope.filters?.skip ?? [])],
+        only: [...(scope.filters?.only ?? [])],
+        prioritized: [...prioritized],
+      });
+    };
+
+    publishControl(); // 첫 스캔 전에도 현재 필터·일시정지 상태가 화면에 보이게
+
+    /** 바뀐 감시 범위를 설정 파일에 남긴다 (바뀐 키만 패치 — config.ts 참고). */
+    const persistScope = (): void => {
+      try {
+        patchConfigFile({ watch: scope });
+      } catch (e) {
+        console.log(
+          chalk.red(`  ✗ 설정 저장 실패: ${e instanceof Error ? e.message : String(e)}`),
+        );
+        console.log(chalk.dim('    메모리에는 적용됐지만 watch 를 재시작하면 되돌아갑니다.'));
+      }
+    };
+
+    /** 정규화 키로 추적 중인 컨텍스트를 찾는다 (파일명 대소문자에 기대지 않는다). */
+    const findContext = (key: string): PRContext | undefined =>
+      listContexts(cfg).find((c) => parsePRRef(ctxKey(c)) === key);
+
+    /**
+     * 쌓인 제어 의도를 적용한다.
+     *
+     * **사이클 시작점에서만** 호출한다. 라운드가 도는 중에 감시 범위가 바뀌면
+     * 그 라운드가 끝나고 저장할 때 반쯤 낡은 기준으로 판정한 결과가 섞인다.
+     * HTTP 핸들러가 여기까지 들어오지 않는 이유가 이것이다 (intents.ts 참고).
+     */
+    const applyIntents = (): void => {
+      const queued = intents.drain();
+      if (queued.length === 0) return;
+
+      // **필터 변경을 먼저 전부 적용한 뒤** review-now 를 판정한다.
+      //
+      // 한 배치에 [건너뛰기 B, 지금 리뷰 B] 나 [지금 리뷰 B, 건너뛰기 B] 가 함께
+      // 들어올 수 있다 (라운드가 2~15분이라 그 사이 클릭이 쌓인다). 순서대로
+      // 처리하면 후자에서 review-now 가 아직 skip 이 반영되기 전 기준으로 통과해
+      // 상태를 전이시키고, 직후 스캔에서 큐에서 빠져 **영속 상태만 오염된다.**
+      // 사용자의 최종 의사는 배치 전체를 본 결과이므로 그 기준으로 판정한다.
+      const filterIntents = queued.filter((i) => i.kind !== 'review-now');
+      const reviewNowIntents = queued.filter((i) => i.kind === 'review-now');
+
+      const f = scope.filters!;
+      let scopeChanged = false;
+
+      /** skip/only 목록에서 참조 하나를 넣거나 뺀다. 저장은 정규화 키로 한다. */
+      const editList = (name: 'skip' | 'only', ref: string, add: boolean): void => {
+        const key = parsePRRef(ref);
+        if (!key) {
+          console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${ref}" — 'owner/repo#12' 형식이어야 합니다.`));
+          return;
+        }
+        const list = f[name] ?? [];
+        const next = list.filter((e) => parsePRRef(e) !== key);
+        if (add) next.push(key);
+        if (next.length === list.length && add) return; // 이미 있음
+        if (next.length === list.length && !add) return; // 원래 없음
+        f[name] = next;
+        scopeChanged = true;
+        console.log(
+          chalk.cyan(`    ${add ? '추가' : '해제'}: ${name} ${key}`),
+        );
+      };
+
+      for (const it of filterIntents) {
+        switch (it.kind) {
+          case 'pause':
+            if (!paused) console.log(chalk.magenta('    ⏸ 일시정지 — 리뷰 실행만 멈춥니다 (감시·동기화는 계속).'));
+            paused = true;
+            break;
+          case 'resume':
+            if (paused) console.log(chalk.green('    ▶ 재개'));
+            paused = false;
+            break;
+          case 'skip-add':
+            editList('skip', it.ref, true);
+            break;
+          case 'skip-remove':
+            editList('skip', it.ref, false);
+            break;
+          case 'only-set': {
+            // 하나라도 형식이 틀리면 **아무것도 적용하지 않는다.**
+            // 잘못된 것만 버리고 나머지를 쓰면, 전부 틀렸을 때 f.only = [] 가 되어
+            // "이것만 리뷰" 요청이 정반대로 **기존 한정을 해제**해 버린다.
+            // 막아둔 PR 들이 그대로 리뷰되는 방향의 실패라 되돌릴 수 없다.
+            const bad = it.refs.filter((r) => !parsePRRef(r));
+            if (bad.length > 0) {
+              console.log(
+                chalk.yellow(`  ⚠ 잘못된 PR 참조 — 대상 한정을 바꾸지 않습니다: ${bad.join(', ')}`),
+              );
+              break;
+            }
+            const keys = it.refs.map((r) => parsePRRef(r) as string);
+            f.only = keys;
+            scopeChanged = true;
+            console.log(
+              keys.length > 0
+                ? chalk.cyan(`    리뷰 대상 한정: ${keys.join(', ')}`)
+                : chalk.cyan('    리뷰 대상 한정 해제 — 범위 전체가 대상입니다.'),
+            );
+            break;
+          }
+          case 'scope-set': {
+            // 빈 include 는 "감시 중지" 가 아니다. matchesScope 는 빈 목록을
+            // **전부 허용**으로 읽으므로(review-requested 가 그렇게 쓴다) 오히려
+            // 추적 중인 컨텍스트가 전부 lingering 으로 되살아나 계속 리뷰된다.
+            // 멈추려면 일시정지를 쓴다. review-requested 는 빈 include 가 정상이다.
+            if (it.include.length === 0 && scope.mode !== 'review-requested') {
+              console.log(
+                chalk.yellow(`  ⚠ ${scope.mode} 모드에서는 include 를 비울 수 없습니다 — 무시합니다.`),
+              );
+              break;
+            }
+            // 탐색이 펼칠 수 없는 패턴은 저장해봐야 조용히 아무것도 발견하지
+            // 못한다. lingering 컨텍스트가 남아 있으면 그 실패가 한동안 가려진다.
+            const bad = unsupportedPatterns(scope.mode, it.include);
+            if (bad.length > 0) {
+              console.log(
+                chalk.yellow(`  ⚠ ${scope.mode} 모드가 펼칠 수 없는 패턴 — 무시합니다: ${bad.join(', ')}`),
+              );
+              break;
+            }
+            scope.include = it.include;
+            scope.exclude = it.exclude;
+            scopeChanged = true;
+            // 캐시·targets 를 통째로 버린다. lastAt 만 0 으로 두면 "다시 탐색하라"
+            // 일 뿐이라, 그 탐색이 부분 실패하면 nextRepoCache 가 이전 캐시를
+            // 보존해 **옛 범위의 레포가 그대로 살아남는다**. 그 상태로 스캔이 돌면
+            // 방금 범위에서 뺀 레포에 리뷰를 게시할 수 있고, 게시는 못 되돌린다.
+            repoSource.reset();
+            console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
+            break;
+          }
+        }
+      }
+
+      // ── 2단계: review-now — 위에서 확정된 필터 기준으로 판정한다 ──
+      for (const it of reviewNowIntents) {
+        const key = parsePRRef(it.ref);
+        if (!key) {
+          console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${it.ref}"`));
+          continue;
+        }
+        const target = findContext(key);
+        if (!target) {
+          console.log(chalk.yellow(`  ⚠ ${key} 는 추적 중이 아닙니다.`));
+          continue;
+        }
+        if (target.state === 'REVIEWING') {
+          console.log(chalk.dim(`    ${key} 는 이미 리뷰 중입니다.`));
+          continue;
+        }
+
+        // 필터에 걸린 PR 은 **전이시키기 전에** 막는다.
+        //
+        // scan 이 excludedReason 붙은 컨텍스트를 eligible 에 넣지 않으므로 상태만
+        // 바뀌고 리뷰는 영영 실행되지 않는다. 그냥 무동작이면 그나마 나은데,
+        // AWAITING_AUTHOR/CONVERGED 였던 **영속 상태가 REVIEW_DUE 로 바뀌어 남는다.**
+        // 나중에 제외를 풀면 작성자 응답도 새 커밋도 없이 리뷰가 돌아버린다.
+        //
+        // 일회성 우회로 만들지 않은 이유: skip 은 "확실히 하지 말 것" 이고 only
+        // 보다도 강하게 잡아둔 조건이다. 버튼 하나로 뒤집히면 그 보증이 사라진다.
+        //
+        // 판정은 **두 갈래**다. skip/only 는 방금 1단계에서 바뀌었을 수 있으므로
+        // 캐시가 아니라 지금 설정으로 다시 본다. 나머지(draft/authors/labels)는
+        // GitHub 관측값이 있어야 알 수 있어 스캔이 남긴 값이 여전히 유효하다.
+        const live = passesRefFilters(key, scope.filters);
+        const stale =
+          target.excludedReason && !isRefFilterReason(target.excludedReason)
+            ? target.excludedReason
+            : undefined;
+        const blocked = !live.ok ? live.reason : stale;
+        if (blocked) {
+          console.log(
+            chalk.yellow(`  ⚠ ${key} 는 필터에 걸려 있습니다 (${blocked}) — 먼저 제외를 푸세요.`),
+          );
+          continue;
+        }
+
+        // REVIEW_DUE 가 아니면 강제로 되돌린다 — review --force 와 같은 경로다.
+        if (target.state !== 'REVIEW_DUE') {
+          const ev = FORCE_EVENTS[target.state];
+          if (!ev || !canFire(target.state, ev)) {
+            console.log(chalk.yellow(`  ⚠ ${key} 는 ${target.state} 에서 강제 실행할 수 없습니다.`));
+            continue;
+          }
+          fire(target, ev, { note: 'UI: 지금 리뷰' });
+          saveContext(cfg, target);
+        }
+        prioritized.add(key);
+        console.log(chalk.cyan(`    지금 리뷰: ${key} — 큐 맨 앞으로 올립니다.`));
+      }
+
+      if (scopeChanged) {
+        persistScope();
+        progress.patch({ scope: describeScope(scope) }); // 헤더의 범위 표시도 갱신
+        const bad = invalidPRRefs(scope.filters);
+        if (bad.length > 0) {
+          console.log(chalk.yellow(`  ⚠ 저장된 필터에 형식 오류가 남아 있습니다: ${bad.join(', ')}`));
+        }
+      }
+      publishControl();
+    };
 
     const reportIfChanged = (ctx: PRContext): void => {
       const key = ctxKey(ctx);
@@ -675,6 +961,7 @@ program
         quotaUntil: quotaAt > Date.now() ? quotaAt : null,
       });
       progress.cycle({ openCount, watchedRepos });
+      publishControl();
     };
 
     const loop = async (drain: boolean): Promise<boolean> => {
@@ -682,8 +969,18 @@ program
       // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
       takeGraphQLUsage();
 
+      // 제어 의도는 스캔 직전에만 적용한다 — 라운드가 돌지 않는 유일한 지점이다.
+      applyIntents();
+
       const { eligible, openCount, seen } = scan();
-      const queue = buildQueue(eligible);
+
+      // '지금 리뷰' 로 지목된 PR 을 맨 앞으로. sort 는 안정적이므로 그 안에서는
+      // buildQueue 가 매긴 원래 우선순위가 그대로 유지된다.
+      const isPrioritized = (e: QueueEntry): boolean =>
+        prioritized.has(parsePRRef(ctxKey(e.ctx)) ?? '');
+      const queue = buildQueue(eligible).sort(
+        (a, b) => Number(isPrioritized(b)) - Number(isPrioritized(a)),
+      );
 
       // ── 쿼터 게이트: 큐는 보존하고 실행만 멈춘다 ──
       // 컨텍스트에서 다시 읽어 review 명령 등 다른 경로가 걸린 한도도 반영한다.
@@ -700,6 +997,16 @@ program
           console.log(
             chalk.cyan(`    관측 모드 — 대기열 ${queue.length}건을 표시만 하고 실행하지 않습니다.`),
           );
+        }
+        return false;
+      }
+
+      // ── 일시정지: 감시·동기화는 계속하고 실행만 멈춘다 ──
+      if (paused) {
+        tally();
+        if (queue.length > 0 && Date.now() - pauseNotified > HEARTBEAT_MS) {
+          pauseNotified = Date.now();
+          console.log(chalk.magenta(`    ⏸ 일시정지 중 — 대기열 ${queue.length}건 보존`));
         }
         return false;
       }
@@ -742,6 +1049,9 @@ program
           progress.endReview();
         }
         reported.set(ctxKey(ctx), ctxSignature(ctx));
+        // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
+        prioritized.delete(parsePRRef(ctxKey(ctx)) ?? '');
+        publishControl();
         reviewRan = true;
         publish(seen, buildQueue(eligible), openCount, quotaUntil);
 

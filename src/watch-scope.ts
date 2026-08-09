@@ -11,10 +11,29 @@
 
 import chalk from 'chalk';
 import { searchPRRepos } from './github.js';
-import type { AppConfig, WatchFilters, WatchScope } from './types.js';
+import type { AppConfig, WatchFilters, WatchMode, WatchScope } from './types.js';
 
-/** 레포 재탐색 기본 주기 — 새 레포가 5분 안에 감시 범위에 들어온다. */
-export const DEFAULT_DISCOVERY_INTERVAL_MS = 5 * 60_000;
+/**
+ * 레포 재탐색 기본 주기.
+ *
+ * 5분이었는데 30초로 낮췄다. 원래 값은 "탐색이 비싸다" 는 잘못된 전제에서 나온
+ * 보수적인 숫자였고, 실측이 그걸 뒤집었다:
+ *
+ *   탐색  = 계정 전체 검색 1회 = **1 point** (레포 50개든 500개든 동일)
+ *   probe = **레포당** 1 point × 스캔마다
+ *
+ * 즉 비용이 레포 수에 비례하는 쪽은 probe 이지 탐색이 아니다. 시간당으로 보면
+ * 탐색 30초 = 120 point 인데 레포 4개 probe 10초 = 1,440 point 다.
+ *
+ * 5분이 만든 실제 피해: 머지 직후 같은 레포에 새 PR 을 열면 최대 5분 동안
+ * 보이지 않는다. 닫힌 컨텍스트는 lingering 에서 빠지므로(scan 참고) 그 레포가
+ * 스캔 대상에서 통째로 사라지고, 검색이 다시 잡아줄 때까지 기다려야 한다.
+ * 도그푸딩의 정상 사이클이 그대로 이 구멍을 밟는다.
+ *
+ * 더 낮춰도 되지만 이 값 아래로는 의미가 적다 — 탐색은 scan() 안에서만 돌므로
+ * `watchIntervalMs`(기본 10초)보다 촘촘해질 수 없다.
+ */
+export const DEFAULT_DISCOVERY_INTERVAL_MS = 30_000;
 
 // ── 글롭 ────────────────────────────────────────────────────
 
@@ -71,6 +90,24 @@ export function resolveWatchScope(cfg: AppConfig): WatchScope | null {
 }
 
 /** 글롭에서 검색에 쓸 소유자(org/user)를 뽑는다. 소유자 자리가 글롭이면 못 쓴다. */
+/**
+ * 이 모드의 탐색이 **실제로 펼칠 수 없는** include 패턴을 골라낸다.
+ *
+ * 저장 전 검증(UI)과 `discoverRepos` 가 반드시 이 함수를 함께 써야 한다.
+ * 갈라지면 "UI 는 받아주고 백엔드는 조용히 버리는" 조합이 생기고, lingering
+ * 컨텍스트가 남아 있으면 그 실패가 한동안 가려져 더 늦게 발견된다.
+ *
+ *  repos            글롭을 검색 없이 펼칠 수 없다 → `*` 포함 패턴 전부 불가
+ *  account          검색이 `org:<owner>` 단위라 소유자 자리가 글롭이면 불가
+ *  review-requested 검색 조건이 PR 단위이고 include 는 결과를 거르는 데만
+ *                   쓰이므로 글롭에 제약이 없다
+ */
+export function unsupportedPatterns(mode: WatchMode, include: string[]): string[] {
+  if (mode === 'repos') return include.filter((p) => p.includes('*'));
+  if (mode === 'account') return ownersFromPatterns(include).skipped;
+  return [];
+}
+
 function ownersFromPatterns(include: string[]): { owners: string[]; skipped: string[] } {
   const owners = new Set<string>();
   const skipped: string[] = [];
@@ -108,7 +145,8 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
 
   if (scope.mode === 'repos') {
     // 글롭은 검색 없이 펼칠 수 없다. 조용히 버리면 감시 대상이 통째로 빠진다.
-    const globs = scope.include.filter((p) => p.includes('*'));
+    // 판정은 unsupportedPatterns 하나로만 한다 — UI 검증과 갈라지면 안 된다.
+    const globs = unsupportedPatterns('repos', scope.include);
     if (globs.length > 0) {
       console.log(
         chalk.yellow(
@@ -184,6 +222,17 @@ export interface RepoSource {
   /** 필요하면 재탐색하고 현재 대상 목록을 돌려준다. */
   list(): string[];
   /**
+   * 감시 범위가 **런타임에 바뀌었을 때** 호출한다. 캐시·targets·freshness 를
+   * 모두 버려 다음 list() 가 새 범위로 처음부터 탐색하게 한다.
+   *
+   * `lastAt = 0` 만으로는 부족하다. 그건 "다시 탐색하라" 일 뿐이고, 그 탐색이
+   * 부분 실패하면 `nextRepoCache` 가 **의도적으로 이전 캐시를 보존**하므로
+   * 옛 범위의 레포가 그대로 살아남는다 (일시적 오류로 감시가 끊기지 않게 하려는
+   * 설계다). 그 상태로 scan 이 돌면 방금 범위에서 뺀 레포의 PR 에 리뷰를 게시할
+   * 수 있고, 게시는 되돌릴 수 없다.
+   */
+  reset(): void;
+  /**
    * 레포별 "새로 추적해도 되는 PR 번호". undefined 면 제한 없음.
    * list() 호출 후에 읽어야 최신이다.
    */
@@ -251,7 +300,7 @@ function mergeTargets(
  * 레포 목록을 주기적으로만 재탐색한다.
  *
  * 폴링은 10초 주기지만 새 레포가 생기는 빈도는 그보다 훨씬 낮다. 매 tick
- * 검색하면 point 만 낭비하므로 discoveryIntervalMs(기본 5분)로 늦춘다.
+ * 매 스캔마다 검색할 필요는 없으므로 discoveryIntervalMs(기본 30초)로 늦춘다.
  * 탐색이 실패하면 직전 목록을 그대로 쓴다 — 일시적 오류로 감시가 멈추면 안 된다.
  */
 export function createRepoSource(scope: WatchScope): RepoSource {
@@ -260,6 +309,12 @@ export function createRepoSource(scope: WatchScope): RepoSource {
   const source: RepoSource = {
     truncated: false,
     lastAt: 0,
+    reset() {
+      cached = [];
+      source.targets = undefined;
+      source.truncated = false;
+      source.lastAt = 0;
+    },
     list() {
       const stale = Date.now() - source.lastAt >= interval;
       if (source.lastAt > 0 && !stale) return cached;
@@ -370,20 +425,45 @@ export function invalidPRRefs(filters?: WatchFilters): string[] {
  * draft 는 기본 제외다. 초안은 작성 중이라 리뷰가 곧 낡고, 계정 전체를 감시하면
  * 초안까지 대화 한도를 먹는다. `filters.draft: true` 로 되돌릴 수 있다.
  */
-export function passesFilters(pr: FilterablePR, filters?: WatchFilters): FilterVerdict {
-  // PR 을 콕 집은 조건이 가장 먼저다 — 명시적 지목을 다른 조건이 뒤집으면 안 된다.
-  const key = prKey(pr.owner, pr.repo, pr.number);
+export const SKIP_REASON = 'skip 목록';
+export const ONLY_REASON = 'only 목록 밖';
 
+/**
+ * **PR 참조만으로** 판정 가능한 조건(skip/only)을 본다.
+ *
+ * authors/labels/draft 와 갈라놓은 이유: 저 셋은 GitHub 에서 관측한 값이 있어야
+ * 알 수 있어서 스캔 결과(`ctx.excludedReason`)에 기대야 하지만, skip/only 는
+ * 설정만 보면 **지금 이 순간** 판정할 수 있다. UI 가 런타임에 바꾸는 것도 이 둘뿐이라,
+ * 의도를 적용하는 시점에는 캐시가 아니라 이쪽으로 물어야 한다.
+ */
+export function passesRefFilters(key: string, filters?: WatchFilters): FilterVerdict {
   // skip 이 only 를 이긴다: "확실히 하지 말 것" 이 "이것만 할 것" 보다 강하다.
   const skip = filters?.skip;
   if (skip && skip.length > 0 && refSet(skip).has(key)) {
-    return { ok: false, reason: 'skip 목록' };
+    return { ok: false, reason: SKIP_REASON };
   }
-
   const only = filters?.only;
   if (only && only.length > 0 && !refSet(only).has(key)) {
-    return { ok: false, reason: 'only 목록 밖' };
+    return { ok: false, reason: ONLY_REASON };
   }
+  return { ok: true };
+}
+
+/**
+ * 이 제외 사유가 skip/only 에서 나온 것인가.
+ *
+ * 스캔이 남긴 `excludedReason` 은 그 시점의 판정이다. skip/only 는 그 사이에
+ * 바뀔 수 있으므로 **지금 기준(passesRefFilters)이 이긴다.** 나머지 사유
+ * (draft/authors/labels)는 설정만으로 다시 계산할 수 없어 캐시가 여전히 유효하다.
+ */
+export function isRefFilterReason(reason?: string): boolean {
+  return reason === SKIP_REASON || reason === ONLY_REASON;
+}
+
+export function passesFilters(pr: FilterablePR, filters?: WatchFilters): FilterVerdict {
+  // PR 을 콕 집은 조건이 가장 먼저다 — 명시적 지목을 다른 조건이 뒤집으면 안 된다.
+  const refs = passesRefFilters(prKey(pr.owner, pr.repo, pr.number), filters);
+  if (!refs.ok) return refs;
 
   if (pr.isDraft && !(filters?.draft ?? false)) {
     return { ok: false, reason: '초안(draft)' };

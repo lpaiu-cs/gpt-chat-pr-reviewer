@@ -227,19 +227,56 @@ const STATE_EVENT = {
 let session = null;
 let prevPhase = null;
 let prevActiveKey = null;
+/**
+ * 이번 끊김을 이미 알렸는가.
+ *
+ * 없으면 watch 가 내려가 있는 동안 재시도마다 "연결 끊김" 을 쏟는다. 알림은
+ * 상태 변화를 알리는 것이지 상태를 반복 보고하는 게 아니다 — 끊긴 순간 한 번,
+ * 붙은 순간 한 번이면 침묵의 의미를 판정하는 데 충분하다.
+ */
+let announcedDisconnect = false;
+/**
+ * 이번 세션에서 "필터에 맞는 PR 이 없다" 를 이미 알렸는가.
+ *
+ * 판정을 연결 직후 한 번만 하면 안 된다 — watch 가 막 뜬 시점에는 첫 스캔 전이라
+ * contexts 가 비어 있어서, 필터가 멀쩡해도 경고가 헛나간다. 경고가 늑대를 외치기
+ * 시작하면 진짜 오타일 때 무시당한다.
+ */
+let warnedNoMatch = false;
+/** 재연결 대기 (ms). 붙는 순간 되돌린다. */
+let backoff = 1000;
 /** key → state. 연결 직후 채워서 "이미 그 상태였던 것" 을 새 이벤트로 오인하지 않는다. */
 let prevStates = new Map();
 let baselined = false;
 
 function onSnapshot(s) {
+  // 스냅샷이 왔다 = 붙어 있다. 다음 끊김은 다시 한 번 알린다.
+  announcedDisconnect = false;
+  backoff = 1000;
+
   // watch 재시작 → 기준선을 다시 잡는다. 안 그러면 재시작 직후 모든 PR 의
   // 현재 상태가 방금 일어난 일처럼 한꺼번에 쏟아진다.
   if (s.session !== session) {
     if (session !== null) note('watch-restarted', '── watch 재시작 감지 — 기준선을 다시 잡습니다 ──');
     session = s.session;
     baselined = false;
+    warnedNoMatch = false;
     prevPhase = null;
     prevActiveKey = null;
+  }
+
+  // 필터 오타 경고는 **추적 중인 PR 이 실제로 있을 때만** 낸다. 아직 하나도
+  // 없으면 그건 "필터가 틀렸다" 가 아니라 "첫 스캔 전" 이다. 매 스냅샷마다
+  // 다시 보되 세션당 한 번만 알린다.
+  if (FILTERS.length > 0 && !warnedNoMatch && s.contexts.length > 0) {
+    if (!s.contexts.some((c) => matchesFilter(c.key))) {
+      warnedNoMatch = true;
+      note(
+        'filter-no-match',
+        `⚠ --pr 필터(${FILTERS.map((f) => f.label).join(', ')})와 맞는 PR 이 없습니다 — ` +
+          `오타일 수 있습니다. 추적 중: ${s.contexts.map((c) => c.key).join(', ')}`,
+      );
+    }
   }
 
   const a = s.active;
@@ -272,17 +309,6 @@ function onSnapshot(s) {
   if (!baselined) {
     baselined = true;
     const watching = s.contexts.filter((c) => matchesFilter(c.key));
-
-    // 필터에 걸리는 PR 이 하나도 없으면 오타일 가능성이 높다. 조용히 기다리면
-    // 영원히 아무 일도 안 일어나는데 그게 정상처럼 보인다 — 반드시 짚어준다.
-    // (아직 추적 전인 새 PR 일 수도 있으므로 경고까지만 하고 계속 돈다.)
-    if (FILTERS.length > 0 && watching.length === 0) {
-      note(
-        'filter-no-match',
-        `⚠ --pr 필터(${FILTERS.map((f) => f.label).join(', ')})와 맞는 PR 이 지금은 없습니다 — ` +
-          `오타이거나 아직 추적 전일 수 있습니다. 추적 중: ${s.contexts.map((c) => c.key).join(', ') || '없음'}`,
-      );
-    }
 
     if (PORCELAIN) {
       console.log(
@@ -345,7 +371,6 @@ async function main() {
     );
   }
 
-  let backoff = 1000;
   for (;;) {
     try {
       await stream();
@@ -357,12 +382,17 @@ async function main() {
       // 잡아내야 한다 — 3초 끊겼다고 그 사이 게시된 리뷰를 놓치면 알림의 의미가
       // 없다. watch 자체가 재시작됐을 때만 onSnapshot 의 session 비교가
       // 기준선을 다시 잡는다.
-      if (session !== null) note('disconnected', `연결 끊김 (${e.message}) — 재연결합니다`);
+      //
+      // 알림은 **끊긴 순간 한 번만** 낸다. 재시도마다 내면 watch 가 내려가 있는
+      // 동안 같은 사실을 초당 한 번씩 반복하게 된다.
+      if (session !== null && !announcedDisconnect) {
+        note('disconnected', `연결 끊김 (${e.message}) — 재연결합니다`);
+        announcedDisconnect = true;
+      }
     }
-    // 한 번이라도 붙었으면 짧게 재시도한다 (watch 재시작은 몇 초면 끝난다).
-    // 아직 한 번도 못 붙었으면 backoff — watch 를 켜기 전에 띄워둬도 괜찮게.
     await new Promise((r) => setTimeout(r, backoff));
-    backoff = session !== null ? 1000 : Math.min(backoff * 2, 15_000);
+    // 오래 끊겨 있을수록 뜸하게 — 붙는 순간 onSnapshot 이 1초로 되돌린다.
+    backoff = Math.min(backoff * 2, 15_000);
   }
 }
 

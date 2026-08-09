@@ -121,6 +121,54 @@
   .lv-dim span{color:var(--dim)} .lv-info span{color:var(--fg)}
   .log.restart span { color:var(--warn); }
 
+  /* ── 제어 ── */
+  button { font: inherit; color: inherit; cursor: pointer; }
+  .btn {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+    padding: .2rem .5rem; font-size: .72rem; line-height: 1.4; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn:disabled:hover { border-color: var(--line); color: inherit; }
+  .btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.warn:hover { border-color: var(--warn); color: var(--warn); }
+  .btn.lg { padding: .32rem .7rem; font-size: .78rem; }
+  .acts { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .4rem; }
+
+  /* only 가 걸려 있으면 나머지가 전부 멈추므로 눈에 띄어야 한다 */
+  #onlyBar {
+    display: none; align-items: center; gap: .6rem; flex-wrap: wrap;
+    background: rgba(210,153,34,.12); border: 1px solid var(--warn);
+    border-radius: 8px; padding: .5rem .8rem; font-size: .8rem;
+  }
+  #onlyBar.show { display: flex; }
+  #onlyBar b { font-family: var(--mono); }
+  #pauseBar {
+    display: none; align-items: center; gap: .6rem;
+    background: rgba(188,140,255,.12); border: 1px solid var(--mag);
+    border-radius: 8px; padding: .5rem .8rem; font-size: .8rem; color: var(--mag);
+  }
+  #pauseBar.show { display: flex; }
+
+  dialog {
+    border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+    color: var(--fg); padding: 0; max-width: 720px; width: calc(100vw - 2rem);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  .dlg-h { padding: .7rem .9rem; border-bottom: 1px solid var(--line);
+           display: flex; align-items: center; gap: .6rem; font-weight: 600; font-size: .9rem; }
+  .dlg-h .btn { margin-left: auto; }
+  .dlg-b { padding: .9rem; display: flex; flex-direction: column; gap: .8rem; }
+  .dlg-b label { font-size: .78rem; color: var(--dim); display: block; margin-bottom: .25rem; }
+  .dlg-b input, .dlg-b textarea {
+    width: 100%; background: var(--bg); color: var(--fg); font-family: var(--mono);
+    border: 1px solid var(--line); border-radius: 6px; padding: .45rem .6rem; font-size: .8rem;
+  }
+  .dlg-b textarea { min-height: 300px; resize: vertical; line-height: 1.55; }
+  .dlg-f { display: flex; gap: .5rem; align-items: center; }
+  .dlg-f .msg { font-size: .76rem; color: var(--dim); margin-left: auto; }
+  .hint-s { font-size: .72rem; color: var(--faint); margin-top: .25rem; }
+
   /* ── 푸터 ── */
   footer {
     position:sticky; bottom:0; background:var(--panel); border-top:1px solid var(--line);
@@ -143,9 +191,21 @@
     <span id="m-account"></span>
     <span id="m-uptime"></span>
   </div>
+  <button class="btn" id="btn-pause">⏸ 일시정지</button>
+  <button class="btn" id="btn-scope">감시 범위</button>
+  <button class="btn" id="btn-instr">리뷰 지침</button>
 </header>
 
 <main>
+  <div id="pauseBar">
+    <span>⏸ 일시정지 중 — 감시·동기화는 계속하고 리뷰 실행만 멈춰 있습니다. 대기열은 보존됩니다.</span>
+  </div>
+
+  <div id="onlyBar">
+    <span>⚠ <b id="only-list"></b> <b>만</b> 리뷰합니다 — 나머지는 감시만 하고 큐에 오르지 않습니다.</span>
+    <button class="btn warn" id="btn-only-clear">한정 해제</button>
+  </div>
+
   <div id="active" class="idle"></div>
 
   <div class="cols">
@@ -172,7 +232,42 @@
   <span>사이클 <b id="f-cost">0</b> point</span>
   <span id="f-remain"></span>
   <span id="f-quota" class="quota"></span>
+  <span id="f-pending"></span>
 </footer>
+
+<dialog id="dlg-scope">
+  <form method="dialog" class="dlg-h">감시 범위<button class="btn" value="cancel">닫기</button></form>
+  <div class="dlg-b">
+    <div>
+      <label>include — 감시할 대상 (한 줄에 하나)</label>
+      <textarea id="in-include" style="min-height:90px" placeholder="myorg/*&#10;owner/repo"></textarea>
+      <div class="hint-s" id="hint-include"></div>
+    </div>
+    <div>
+      <label>exclude — 그중 제외할 글롭</label>
+      <textarea id="in-exclude" style="min-height:60px" placeholder="*/archived-*"></textarea>
+    </div>
+    <div class="dlg-f">
+      <button class="btn lg on" id="btn-scope-save">저장</button>
+      <span class="msg" id="scope-msg"></span>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlg-instr">
+  <form method="dialog" class="dlg-h">리뷰 지침 (instructions.md)<button class="btn" value="cancel">닫기</button></form>
+  <div class="dlg-b">
+    <div>
+      <label>매 리뷰 프롬프트의 <code>{{instructions}}</code> 자리에 주입됩니다</label>
+      <textarea id="in-instr" spellcheck="false"></textarea>
+      <div class="hint-s">HTML 주석(<code>&lt;!-- --&gt;</code>)은 프롬프트에서 제거됩니다. 다음 라운드부터 적용됩니다.</div>
+    </div>
+    <div class="dlg-f">
+      <button class="btn lg on" id="btn-instr-save">저장</button>
+      <span class="msg" id="instr-msg"></span>
+    </div>
+  </div>
+</dialog>
 
 <script>
 'use strict';
@@ -301,19 +396,32 @@ function renderQueue() {
         '</div>').join('');
 }
 
+/** PR 참조 정규화 — 서버(parsePRRef)와 같은 기준으로 목록 포함 여부를 본다. */
+function normRef(s) {
+  const m = /^(.+?)#0*(\d+)$/.exec(String(s).trim().toLowerCase());
+  return m ? m[1] + '#' + Number(m[2]) : String(s).trim().toLowerCase();
+}
+const inList = (list, key) => (list || []).some((e) => normRef(e) === normRef(key));
+
 function renderContexts() {
   if (!snap) return;
   const cs = snap.contexts;
+  const ctl = snap.control || {};
   $('c-n').textContent = cs.length;
   $('contexts').innerHTML = cs.length === 0
     ? '<div class="empty">추적 중인 PR 이 없습니다. 첫 스캔을 기다리는 중입니다.</div>'
     : cs.map((c) => {
         const pct = c.threadsTotal ? Math.round((c.threadsResolved / c.threadsTotal) * 100) : 0;
+        const skipped = inList(ctl.skip, c.key);
+        const onlyOn = inList(ctl.only, c.key);
+        const pri = inList(ctl.prioritized, c.key);
+        const closed = c.state === 'CLOSED';
         return '<div class="row">' +
           '<div class="body">' +
             '<div class="l1">' +
               '<a class="key" href="' + esc(c.url) + '" target="_blank" rel="noopener">' + esc(c.key) + '</a>' +
               '<span class="badge b-' + esc(c.state) + '">' + esc(c.stateLabel) + '</span>' +
+              (pri ? '<span class="tag">다음 차례</span>' : '') +
               (c.excludedReason ? '<span class="tag mute">제외: ' + esc(c.excludedReason) + '</span>' : '') +
             '</div>' +
             '<div class="l2">' + esc(c.title) + '</div>' +
@@ -328,9 +436,137 @@ function renderContexts() {
               '<span style="color:var(--faint)">' + esc(c.nextAction) + '</span>' +
             '</div>' +
             (c.lastError ? '<div class="err-line">✗ ' + esc(c.lastError) + '</div>' : '') +
+            (closed ? '' :
+              '<div class="acts" data-key="' + esc(c.key) + '">' +
+                // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 누를 수 있게 두면
+                // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다.
+                '<button class="btn" data-act="review-now"' +
+                  (c.excludedReason
+                    ? ' disabled title="' + esc(c.excludedReason) + ' — 먼저 제외를 푸세요"'
+                    : '') +
+                  '>지금 리뷰</button>' +
+                '<button class="btn' + (skipped ? ' on' : '') + '" data-act="skip">' +
+                  (skipped ? '제외 해제' : '건너뛰기') + '</button>' +
+                '<button class="btn' + (onlyOn ? ' on' : '') + '" data-act="only">' +
+                  (onlyOn ? '한정 해제' : '이것만') + '</button>' +
+              '</div>') +
           '</div>' +
         '</div>';
       }).join('');
+}
+
+// ── 제어 ────────────────────────────────────────────────────
+
+async function sendIntent(body) {
+  try {
+    const res = await fetch('/api/intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) { alert('요청 실패: ' + (j.error || res.status)); return false; }
+    return true;
+  } catch (e) {
+    alert('요청 실패: ' + e.message);
+    return false;
+  }
+}
+
+// 카드 버튼은 매 렌더마다 새로 만들어지므로 위임으로 받는다.
+$('contexts').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const key = btn.closest('.acts').dataset.key;
+  const ctl = (snap && snap.control) || {};
+  const act = btn.dataset.act;
+
+  if (act === 'review-now') sendIntent({ kind: 'review-now', ref: key });
+  else if (act === 'skip') {
+    sendIntent({ kind: inList(ctl.skip, key) ? 'skip-remove' : 'skip-add', ref: key });
+  } else if (act === 'only') {
+    // '이것만' 은 목록을 통째로 이 PR 하나로 바꾼다 — 누적이면 무엇이 걸렸는지
+    // 추적하기 어렵고, 애초에 하나만 돌려보려고 누르는 버튼이다.
+    sendIntent({ kind: 'only-set', refs: inList(ctl.only, key) ? [] : [key] });
+  }
+});
+
+$('btn-pause').addEventListener('click', () => {
+  sendIntent({ kind: (snap && snap.control && snap.control.paused) ? 'resume' : 'pause' });
+});
+$('btn-only-clear').addEventListener('click', () => sendIntent({ kind: 'only-set', refs: [] }));
+
+// ── 감시 범위 편집 ──
+
+const dlgScope = $('dlg-scope');
+$('btn-scope').addEventListener('click', () => {
+  const ctl = (snap && snap.control) || {};
+  $('in-include').value = (ctl.include || []).join('\n');
+  $('in-exclude').value = (ctl.exclude || []).join('\n');
+  // 모드마다 탐색이 펼칠 수 있는 패턴이 다르다. "글롭 허용" 이라고만 안내하면
+  // repos 모드 사용자가 owner/* 를 넣고 아무것도 발견되지 않는 상태에 빠진다
+  // (lingering 컨텍스트가 남아 있으면 그 실패가 한동안 가려지기까지 한다).
+  $('hint-include').innerHTML =
+    ctl.mode === 'repos'
+      ? '<b>repos 모드</b>는 글롭을 펼칠 수 없습니다 — <code>owner/repo</code> 를 그대로 적으세요. 글롭이 필요하면 mode 를 account 로 바꾸세요. <b>비울 수 없습니다</b> — 멈추려면 <b>일시정지</b>를 쓰세요.'
+      : ctl.mode === 'review-requested'
+        ? 'include 는 검색 결과를 거르는 용도입니다. 글롭 제약이 없고 비워도 됩니다.'
+        : '글롭을 쓸 수 있지만 <b>소유자 자리</b>는 안 됩니다 (<code>myorg/*</code> ○, <code>*/svc-*</code> ✗) — 검색이 <code>org:&lt;owner&gt;</code> 단위입니다. 슬래시가 없으면 <code>owner/*</code> 로 해석합니다. <b>비울 수 없습니다</b> — 멈추려면 <b>일시정지</b>를 쓰세요.';
+  $('scope-msg').textContent = '';
+  dlgScope.showModal();
+});
+const lines = (el) => el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+$('btn-scope-save').addEventListener('click', async () => {
+  const ok = await sendIntent({
+    kind: 'scope-set', include: lines($('in-include')), exclude: lines($('in-exclude')),
+  });
+  $('scope-msg').textContent = ok ? '저장했습니다 — 다음 스캔부터 적용됩니다.' : '';
+});
+
+// ── 지침 편집 ──
+
+const dlgInstr = $('dlg-instr');
+$('btn-instr').addEventListener('click', async () => {
+  $('instr-msg').textContent = '불러오는 중…';
+  dlgInstr.showModal();
+  try {
+    const j = await (await fetch('/api/instructions')).json();
+    $('in-instr').value = j.body || '';
+    $('instr-msg').textContent = '';
+  } catch (e) {
+    $('instr-msg').textContent = '불러오기 실패: ' + e.message;
+  }
+});
+$('btn-instr-save').addEventListener('click', async () => {
+  $('instr-msg').textContent = '저장 중…';
+  try {
+    const res = await fetch('/api/instructions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: $('in-instr').value }),
+    });
+    const j = await res.json().catch(() => ({}));
+    $('instr-msg').textContent = res.ok
+      ? '저장했습니다 — 다음 라운드부터 적용됩니다.'
+      : '저장 실패: ' + (j.error || res.status);
+  } catch (e) {
+    $('instr-msg').textContent = '저장 실패: ' + e.message;
+  }
+});
+
+function renderControl() {
+  const ctl = (snap && snap.control) || {};
+  $('btn-pause').textContent = ctl.paused ? '▶ 재개' : '⏸ 일시정지';
+  $('btn-pause').classList.toggle('on', !!ctl.paused);
+  $('pauseBar').classList.toggle('show', !!ctl.paused);
+
+  const only = ctl.only || [];
+  $('onlyBar').classList.toggle('show', only.length > 0);
+  $('only-list').textContent = only.join(', ');
+
+  $('f-pending').textContent = ctl.pendingIntents
+    ? '적용 대기 ' + ctl.pendingIntents + '건' + (snap && snap.active ? ' (라운드 종료 후)' : '')
+    : '';
 }
 
 function renderMeta() {
@@ -346,7 +582,7 @@ function renderMeta() {
 }
 
 function renderAll() {
-  renderMeta(); renderActive(); renderQueue(); renderContexts(); tick();
+  renderMeta(); renderControl(); renderActive(); renderQueue(); renderContexts(); tick();
 }
 
 // ── 로그 ────────────────────────────────────────────────────

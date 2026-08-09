@@ -110,6 +110,25 @@ export interface CycleInfo {
   nextScanAt: number | null;
 }
 
+/**
+ * UI 가 편집할 수 있는 현재 설정. 스냅샷에 실어야 화면이 "지금 무엇이 걸려 있는지"
+ * 를 보여줄 수 있다 — 특히 `only` 는 하나 걸어두면 나머지가 전부 멈추므로
+ * 눈에 띄게 표시하고 한 번에 풀 수 있어야 한다.
+ */
+export interface ControlState {
+  /** 감시 모드 — 어떤 include 패턴이 허용되는지가 모드마다 다르다 */
+  mode: string;
+  paused: boolean;
+  /** 아직 적용되지 않은 의도 건수 (라운드 중이면 끝난 뒤 반영된다) */
+  pendingIntents: number;
+  include: string[];
+  exclude: string[];
+  skip: string[];
+  only: string[];
+  /** '지금 리뷰' 로 큐 앞으로 당겨둔 PR 참조 */
+  prioritized: string[];
+}
+
 export interface Snapshot {
   /**
    * 이 프로세스의 고유 id. 로그 seq 는 프로세스마다 1부터 다시 시작하므로,
@@ -117,6 +136,7 @@ export interface Snapshot {
    * 전부 "이미 본 것" 으로 버린다 (재연결 자체는 EventSource 가 알아서 한다).
    */
   session: string;
+  control: ControlState;
   startedAt: number;
   scope: string;
   account: string | null;
@@ -179,6 +199,16 @@ const LOG_CAP = 600;
 function emptySnapshot(session: string): Snapshot {
   return {
     session,
+    control: {
+      mode: '',
+      paused: false,
+      pendingIntents: 0,
+      include: [],
+      exclude: [],
+      skip: [],
+      only: [],
+      prioritized: [],
+    },
     startedAt: Date.now(),
     scope: '',
     account: null,
@@ -250,6 +280,12 @@ class ProgressBus {
   cycle(p: Partial<CycleInfo>): void {
     if (!this.enabled) return;
     this.snap = { ...this.snap, cycle: { ...this.snap.cycle, ...p } };
+    this.push();
+  }
+
+  control(p: Partial<ControlState>): void {
+    if (!this.enabled) return;
+    this.snap = { ...this.snap, control: { ...this.snap.control, ...p } };
     this.push();
   }
 

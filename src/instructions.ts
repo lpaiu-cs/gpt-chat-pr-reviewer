@@ -28,6 +28,29 @@ export function ensureInstructionsFile(cfg: AppConfig): string {
   return f;
 }
 
+/**
+ * 편집용 원문 — `loadInstructions` 와 달리 HTML 주석을 남긴다.
+ * 저장 화면에 주석이 안 보이면 사용자가 그 설명을 영영 못 보고 지우게 된다.
+ */
+export function readInstructionsRaw(cfg: AppConfig): string {
+  const f = cfg.customInstructionsFile;
+  return existsSync(f) ? readFileSync(f, 'utf-8') : '';
+}
+
+/**
+ * 지침을 저장한다 (UI 편집용).
+ *
+ * 의도 큐를 거치지 않고 즉시 쓴다. 이 파일은 **상태가 아니라 입력**이고, 루프가
+ * 라운드를 시작할 때마다 새로 읽으므로(runRound → loadInstructions) 메모리에
+ * 붙잡고 있는 주체가 없다. 진행 중인 라운드는 이미 읽어간 내용으로 끝나고,
+ * 다음 라운드부터 새 지침이 적용된다.
+ */
+export function saveInstructions(cfg: AppConfig, body: string): string {
+  const f = cfg.customInstructionsFile;
+  writeFileSync(f, body, 'utf-8');
+  return f;
+}
+
 /** 지침 내용을 읽는다 — HTML 주석은 제거된다 (없으면 빈 문자열). */
 export function loadInstructions(cfg: AppConfig, overridePath?: string): string {
   const f = overridePath ?? cfg.customInstructionsFile;

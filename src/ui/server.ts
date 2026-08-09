@@ -16,6 +16,7 @@ import { inspect } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { progress, type BusEvent } from '../progress.js';
+import { intents, INTENT_KINDS, type Intent } from '../intents.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -45,6 +46,120 @@ function loadHtml(): string {
 export interface UIServerHandle {
   url: string;
   close: () => Promise<void>;
+}
+
+/**
+ * 지침 파일을 읽고 쓰는 훅. cli.ts 가 config 를 들고 주입한다 —
+ * 서버가 config 를 직접 알면 UI 계층이 설정 로딩까지 떠안게 된다.
+ */
+export interface UIHooks {
+  readInstructions: () => string;
+  writeInstructions: (body: string) => string;
+  /**
+   * 의미 검증 — 형식은 서버가 보고, 뜻은 루프 쪽이 본다 (감시 범위·모드를 아는 곳).
+   * 오류 메시지를 돌려주면 요청을 거부하고, null 이면 통과.
+   *
+   * 여기서 걸러야 사용자가 즉시 400 을 받는다. 큐까지 흘려보낸 뒤 로그로만
+   * 알리면 "눌렀는데 아무 일도 안 일어남" 이 된다.
+   */
+  validate: (intent: Intent) => string | null;
+}
+
+/**
+ * DNS rebinding 방어.
+ *
+ * `127.0.0.1` 바인딩과 Origin 검사만으로는 부족하다. 공격자가 자기 도메인을
+ * 127.0.0.1 로 재바인딩하면 브라우저는 그 페이지를 **same-origin** 으로 취급해
+ * Origin 헤더조차 붙이지 않고 응답 본문을 읽을 수 있다. 그러면 PR 제목·리뷰
+ * 로그·`instructions.md` 원문이 전부 새어 나간다.
+ *
+ * 재바인딩된 요청은 `Host` 가 공격자 도메인이므로 그것으로 걸러진다.
+ * **GET 을 포함한 모든 요청**에 적용한다 — 읽기 엔드포인트가 유출 경로다.
+ */
+function rejectsHost(req: IncomingMessage): string | null {
+  const raw = String(req.headers.host ?? '');
+  // IPv6 리터럴([::1]:4478)과 포트를 떼어낸다.
+  const name = raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.replace(/:\d+$/, '');
+  const ok = name === '127.0.0.1' || name === 'localhost' || name === '[::1]';
+  return ok ? null : `허용되지 않은 Host: ${raw || '(없음)'}`;
+}
+
+/** 요청 본문을 JSON 으로 읽는다. 과도하게 크면 거부한다. */
+const MAX_BODY = 256 * 1024;
+
+async function readJson(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY) throw new Error('본문이 너무 큽니다');
+    chunks.push(chunk as Buffer);
+  }
+  if (size === 0) return {};
+  return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+}
+
+/**
+ * 다른 사이트가 이 대시보드를 조작하지 못하게 막는다.
+ *
+ * 127.0.0.1 바인딩만으로는 부족하다 — 사용자가 아무 웹페이지나 열어둔 상태에서
+ * 그 페이지가 localhost 로 요청을 보낼 수 있기 때문이다. 읽기 전용일 때는 큰
+ * 문제가 아니었지만 이제 POST 가 설정 파일을 바꾸므로 반드시 걸러야 한다.
+ *
+ * 두 겹이다: (1) Origin 이 있으면 우리 것이어야 하고 (2) JSON content-type 을
+ * 요구해 단순 요청(form/텍스트)으로는 아예 닿지 못하게 한다.
+ */
+function rejectsCrossOrigin(req: IncomingMessage, host: string): string | null {
+  const origin = req.headers.origin;
+  if (origin && origin !== `http://${host}` && origin !== `http://localhost:${host.split(':')[1]}`) {
+    return `허용되지 않은 origin: ${origin}`;
+  }
+  const ct = String(req.headers['content-type'] ?? '');
+  if (!ct.includes('application/json')) {
+    return 'Content-Type: application/json 이 필요합니다';
+  }
+  return null;
+}
+
+/** 신뢰할 수 없는 입력을 Intent 로 좁힌다. 모르는 종류는 거부한다. */
+function parseIntent(body: unknown): Intent | string {
+  if (!body || typeof body !== 'object') return '본문이 객체가 아닙니다';
+  const b = body as Record<string, unknown>;
+  const kind = b.kind;
+  if (typeof kind !== 'string' || !(INTENT_KINDS as string[]).includes(kind)) {
+    return `알 수 없는 intent: ${String(kind)}`;
+  }
+  const strArray = (v: unknown): string[] | null =>
+    Array.isArray(v) && v.every((s) => typeof s === 'string') ? (v as string[]) : null;
+
+  switch (kind) {
+    case 'pause':
+    case 'resume':
+      return { kind };
+    case 'skip-add':
+    case 'skip-remove':
+    case 'review-now': {
+      if (typeof b.ref !== 'string' || !b.ref.trim()) return 'ref 가 필요합니다';
+      return { kind, ref: b.ref.trim() };
+    }
+    case 'only-set': {
+      const refs = strArray(b.refs);
+      if (!refs) return 'refs 배열이 필요합니다';
+      return { kind, refs: refs.map((s) => s.trim()).filter(Boolean) };
+    }
+    case 'scope-set': {
+      const include = strArray(b.include);
+      const exclude = strArray(b.exclude);
+      if (!include || !exclude) return 'include/exclude 배열이 필요합니다';
+      return {
+        kind,
+        include: include.map((s) => s.trim()).filter(Boolean),
+        exclude: exclude.map((s) => s.trim()).filter(Boolean),
+      };
+    }
+    default:
+      return `처리되지 않은 intent: ${kind}`;
+  }
 }
 
 /**
@@ -93,12 +208,83 @@ function sse(res: ServerResponse): (e: BusEvent | null) => void {
   };
 }
 
-function handle(req: IncomingMessage, res: ServerResponse, html: string): void {
+function json(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
+}
+
+async function handle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  html: string,
+  hooks: UIHooks,
+  host: string,
+): Promise<void> {
   const url = (req.url ?? '/').split('?')[0];
+
+  // Host 검사는 읽기·쓰기를 가리지 않는다 — 유출 경로는 GET 쪽이다.
+  const badHost = rejectsHost(req);
+  if (badHost) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(badHost);
+    return;
+  }
+
+  // ── 제어 (POST) ──
+  if (req.method === 'POST') {
+    const denied = rejectsCrossOrigin(req, host);
+    if (denied) {
+      json(res, 403, { ok: false, error: denied });
+      return;
+    }
+    try {
+      const body = await readJson(req);
+
+      if (url === '/api/intent') {
+        const intent = parseIntent(body);
+        if (typeof intent === 'string') {
+          json(res, 400, { ok: false, error: intent });
+          return;
+        }
+        // 형식이 맞아도 뜻이 틀릴 수 있다 (없는 PR 참조 · 모드에 안 맞는 빈 범위).
+        const invalid = hooks.validate(intent);
+        if (invalid) {
+          json(res, 400, { ok: false, error: invalid });
+          return;
+        }
+        const pending = intents.push(intent);
+        progress.control({ pendingIntents: pending });
+        json(res, 202, { ok: true, pending });
+        return;
+      }
+
+      if (url === '/api/instructions') {
+        const b = body as Record<string, unknown>;
+        if (typeof b.body !== 'string') {
+          json(res, 400, { ok: false, error: 'body 문자열이 필요합니다' });
+          return;
+        }
+        const path = hooks.writeInstructions(b.body);
+        json(res, 200, { ok: true, path });
+        return;
+      }
+    } catch (e) {
+      json(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+
+    json(res, 404, { ok: false, error: 'not found' });
+    return;
+  }
 
   if (url === '/' || url === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
+    return;
+  }
+
+  if (url === '/api/instructions') {
+    json(res, 200, { ok: true, body: hooks.readInstructions() });
     return;
   }
 
@@ -138,12 +324,18 @@ function handle(req: IncomingMessage, res: ServerResponse, html: string): void {
  * 띄우거나 이전 인스턴스가 아직 안 죽은 경우가 흔한데, 그때 대시보드 하나 때문에
  * watch 가 못 뜨는 건 과한 실패다.
  */
-export async function startUIServer(port: number): Promise<UIServerHandle> {
+export async function startUIServer(port: number, hooks: UIHooks): Promise<UIServerHandle> {
   const html = loadHtml();
   const restoreConsole = mirrorConsole();
   progress.enabled = true;
 
-  const server: Server = createServer((req, res) => handle(req, res, html));
+  let host = `127.0.0.1:${port}`;
+  const server: Server = createServer((req, res) => {
+    handle(req, res, html, hooks, host).catch((e) => {
+      if (!res.headersSent) json(res, 500, { ok: false, error: String(e) });
+      else res.end();
+    });
+  });
   // 열려 있는 SSE 연결이 종료를 막지 않도록.
   server.on('connection', (s) => s.unref());
 
@@ -175,6 +367,8 @@ export async function startUIServer(port: number): Promise<UIServerHandle> {
     progress.enabled = false;
     throw new Error(`포트 ${port}–${port + 9} 가 모두 사용 중입니다. --ui-port 로 지정하세요.`);
   }
+
+  host = `127.0.0.1:${bound}`; // 포트가 밀렸을 수 있으니 origin 검사 기준을 맞춘다
 
   return {
     url: `http://127.0.0.1:${bound}`,
