@@ -235,6 +235,14 @@ let prevActiveKey = null;
  * 붙은 순간 한 번이면 침묵의 의미를 판정하는 데 충분하다.
  */
 let announcedDisconnect = false;
+/**
+ * 이번 세션에서 "필터에 맞는 PR 이 없다" 를 이미 알렸는가.
+ *
+ * 판정을 연결 직후 한 번만 하면 안 된다 — watch 가 막 뜬 시점에는 첫 스캔 전이라
+ * contexts 가 비어 있어서, 필터가 멀쩡해도 경고가 헛나간다. 경고가 늑대를 외치기
+ * 시작하면 진짜 오타일 때 무시당한다.
+ */
+let warnedNoMatch = false;
 /** 재연결 대기 (ms). 붙는 순간 되돌린다. */
 let backoff = 1000;
 /** key → state. 연결 직후 채워서 "이미 그 상태였던 것" 을 새 이벤트로 오인하지 않는다. */
@@ -252,8 +260,23 @@ function onSnapshot(s) {
     if (session !== null) note('watch-restarted', '── watch 재시작 감지 — 기준선을 다시 잡습니다 ──');
     session = s.session;
     baselined = false;
+    warnedNoMatch = false;
     prevPhase = null;
     prevActiveKey = null;
+  }
+
+  // 필터 오타 경고는 **추적 중인 PR 이 실제로 있을 때만** 낸다. 아직 하나도
+  // 없으면 그건 "필터가 틀렸다" 가 아니라 "첫 스캔 전" 이다. 매 스냅샷마다
+  // 다시 보되 세션당 한 번만 알린다.
+  if (FILTERS.length > 0 && !warnedNoMatch && s.contexts.length > 0) {
+    if (!s.contexts.some((c) => matchesFilter(c.key))) {
+      warnedNoMatch = true;
+      note(
+        'filter-no-match',
+        `⚠ --pr 필터(${FILTERS.map((f) => f.label).join(', ')})와 맞는 PR 이 없습니다 — ` +
+          `오타일 수 있습니다. 추적 중: ${s.contexts.map((c) => c.key).join(', ')}`,
+      );
+    }
   }
 
   const a = s.active;
@@ -286,17 +309,6 @@ function onSnapshot(s) {
   if (!baselined) {
     baselined = true;
     const watching = s.contexts.filter((c) => matchesFilter(c.key));
-
-    // 필터에 걸리는 PR 이 하나도 없으면 오타일 가능성이 높다. 조용히 기다리면
-    // 영원히 아무 일도 안 일어나는데 그게 정상처럼 보인다 — 반드시 짚어준다.
-    // (아직 추적 전인 새 PR 일 수도 있으므로 경고까지만 하고 계속 돈다.)
-    if (FILTERS.length > 0 && watching.length === 0) {
-      note(
-        'filter-no-match',
-        `⚠ --pr 필터(${FILTERS.map((f) => f.label).join(', ')})와 맞는 PR 이 지금은 없습니다 — ` +
-          `오타이거나 아직 추적 전일 수 있습니다. 추적 중: ${s.contexts.map((c) => c.key).join(', ') || '없음'}`,
-      );
-    }
 
     if (PORCELAIN) {
       console.log(

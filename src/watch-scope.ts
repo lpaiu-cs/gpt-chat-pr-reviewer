@@ -425,20 +425,45 @@ export function invalidPRRefs(filters?: WatchFilters): string[] {
  * draft 는 기본 제외다. 초안은 작성 중이라 리뷰가 곧 낡고, 계정 전체를 감시하면
  * 초안까지 대화 한도를 먹는다. `filters.draft: true` 로 되돌릴 수 있다.
  */
-export function passesFilters(pr: FilterablePR, filters?: WatchFilters): FilterVerdict {
-  // PR 을 콕 집은 조건이 가장 먼저다 — 명시적 지목을 다른 조건이 뒤집으면 안 된다.
-  const key = prKey(pr.owner, pr.repo, pr.number);
+export const SKIP_REASON = 'skip 목록';
+export const ONLY_REASON = 'only 목록 밖';
 
+/**
+ * **PR 참조만으로** 판정 가능한 조건(skip/only)을 본다.
+ *
+ * authors/labels/draft 와 갈라놓은 이유: 저 셋은 GitHub 에서 관측한 값이 있어야
+ * 알 수 있어서 스캔 결과(`ctx.excludedReason`)에 기대야 하지만, skip/only 는
+ * 설정만 보면 **지금 이 순간** 판정할 수 있다. UI 가 런타임에 바꾸는 것도 이 둘뿐이라,
+ * 의도를 적용하는 시점에는 캐시가 아니라 이쪽으로 물어야 한다.
+ */
+export function passesRefFilters(key: string, filters?: WatchFilters): FilterVerdict {
   // skip 이 only 를 이긴다: "확실히 하지 말 것" 이 "이것만 할 것" 보다 강하다.
   const skip = filters?.skip;
   if (skip && skip.length > 0 && refSet(skip).has(key)) {
-    return { ok: false, reason: 'skip 목록' };
+    return { ok: false, reason: SKIP_REASON };
   }
-
   const only = filters?.only;
   if (only && only.length > 0 && !refSet(only).has(key)) {
-    return { ok: false, reason: 'only 목록 밖' };
+    return { ok: false, reason: ONLY_REASON };
   }
+  return { ok: true };
+}
+
+/**
+ * 이 제외 사유가 skip/only 에서 나온 것인가.
+ *
+ * 스캔이 남긴 `excludedReason` 은 그 시점의 판정이다. skip/only 는 그 사이에
+ * 바뀔 수 있으므로 **지금 기준(passesRefFilters)이 이긴다.** 나머지 사유
+ * (draft/authors/labels)는 설정만으로 다시 계산할 수 없어 캐시가 여전히 유효하다.
+ */
+export function isRefFilterReason(reason?: string): boolean {
+  return reason === SKIP_REASON || reason === ONLY_REASON;
+}
+
+export function passesFilters(pr: FilterablePR, filters?: WatchFilters): FilterVerdict {
+  // PR 을 콕 집은 조건이 가장 먼저다 — 명시적 지목을 다른 조건이 뒤집으면 안 된다.
+  const refs = passesRefFilters(prKey(pr.owner, pr.repo, pr.number), filters);
+  if (!refs.ok) return refs;
 
   if (pr.isDraft && !(filters?.draft ?? false)) {
     return { ok: false, reason: '초안(draft)' };

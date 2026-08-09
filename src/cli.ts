@@ -32,7 +32,9 @@ import {
   createRepoSource,
   describeScope,
   invalidPRRefs,
+  isRefFilterReason,
   parsePRRef,
+  passesRefFilters,
   unsupportedPatterns,
   matchesScope,
   passesFilters,
@@ -476,10 +478,20 @@ program
                 // 필터에 걸린 PR 은 스캔이 큐에 올리지 않는다. 202 로 받아두면
                 // "큐 맨 앞으로" 라고 해놓고 아무 일도 안 일어난다 (그리고 상태만
                 // 바뀐다 — applyIntents 주석 참고).
-                const target = findContext(parsePRRef(intent.ref) as string);
+                const key = parsePRRef(intent.ref) as string;
+                const target = findContext(key);
                 if (!target) return `${intent.ref} 는 추적 중이 아닙니다.`;
-                if (target.excludedReason) {
-                  return `필터에 걸려 있어 실행할 수 없습니다 (${target.excludedReason}). 먼저 제외를 푸세요.`;
+                // applyIntents 와 같은 두 갈래 판정 (skip/only 는 지금 설정,
+                // 나머지는 스캔이 남긴 값). 큐에 아직 적용 대기 중인 필터 변경까지는
+                // 볼 수 없으므로 최종 권한은 루프에 있고, 여기는 즉시 피드백용이다.
+                const live = passesRefFilters(key, scope.filters);
+                const stale =
+                  target.excludedReason && !isRefFilterReason(target.excludedReason)
+                    ? target.excludedReason
+                    : undefined;
+                const blocked = !live.ok ? live.reason : stale;
+                if (blocked) {
+                  return `필터에 걸려 있어 실행할 수 없습니다 (${blocked}). 먼저 제외를 푸세요.`;
                 }
                 return null;
               }
@@ -610,6 +622,16 @@ program
       const queued = intents.drain();
       if (queued.length === 0) return;
 
+      // **필터 변경을 먼저 전부 적용한 뒤** review-now 를 판정한다.
+      //
+      // 한 배치에 [건너뛰기 B, 지금 리뷰 B] 나 [지금 리뷰 B, 건너뛰기 B] 가 함께
+      // 들어올 수 있다 (라운드가 2~15분이라 그 사이 클릭이 쌓인다). 순서대로
+      // 처리하면 후자에서 review-now 가 아직 skip 이 반영되기 전 기준으로 통과해
+      // 상태를 전이시키고, 직후 스캔에서 큐에서 빠져 **영속 상태만 오염된다.**
+      // 사용자의 최종 의사는 배치 전체를 본 결과이므로 그 기준으로 판정한다.
+      const filterIntents = queued.filter((i) => i.kind !== 'review-now');
+      const reviewNowIntents = queued.filter((i) => i.kind === 'review-now');
+
       const f = scope.filters!;
       let scopeChanged = false;
 
@@ -632,7 +654,7 @@ program
         );
       };
 
-      for (const it of queued) {
+      for (const it of filterIntents) {
         switch (it.kind) {
           case 'pause':
             if (!paused) console.log(chalk.magenta('    ⏸ 일시정지 — 리뷰 실행만 멈춥니다 (감시·동기화는 계속).'));
@@ -701,55 +723,64 @@ program
             console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
             break;
           }
-          case 'review-now': {
-            const key = parsePRRef(it.ref);
-            if (!key) {
-              console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${it.ref}"`));
-              break;
-            }
-            const target = findContext(key);
-            if (!target) {
-              console.log(chalk.yellow(`  ⚠ ${key} 는 추적 중이 아닙니다.`));
-              break;
-            }
-            if (target.state === 'REVIEWING') {
-              console.log(chalk.dim(`    ${key} 는 이미 리뷰 중입니다.`));
-              break;
-            }
-            // 필터에 걸린 PR 은 **전이시키기 전에** 막는다.
-            //
-            // scan 이 excludedReason 이 붙은 컨텍스트를 eligible 에 넣지 않으므로
-            // 상태만 바꾸고 리뷰는 영영 실행되지 않는다. 그냥 무동작이면 그나마
-            // 나은데, AWAITING_AUTHOR/CONVERGED 였던 **영속 상태가 REVIEW_DUE 로
-            // 바뀌어 남는다.** 나중에 제외를 풀면 작성자 응답도 새 커밋도 없이
-            // 리뷰가 돌아버린다. 상태 전이와 실행 가능성이 갈라지면 안 된다.
-            //
-            // 일회성 우회로 만들지 않은 이유: skip 은 "확실히 하지 말 것" 이고
-            // only 보다도 강하게 잡아둔 조건이다. 버튼 하나로 뒤집히면 그 보증이
-            // 사라진다. 정말 돌리려면 제외를 먼저 풀면 된다.
-            if (target.excludedReason) {
-              console.log(
-                chalk.yellow(
-                  `  ⚠ ${key} 는 필터에 걸려 있습니다 (${target.excludedReason}) — 먼저 제외를 푸세요.`,
-                ),
-              );
-              break;
-            }
-            // REVIEW_DUE 가 아니면 강제로 되돌린다 — review --force 와 같은 경로다.
-            if (target.state !== 'REVIEW_DUE') {
-              const ev = FORCE_EVENTS[target.state];
-              if (!ev || !canFire(target.state, ev)) {
-                console.log(chalk.yellow(`  ⚠ ${key} 는 ${target.state} 에서 강제 실행할 수 없습니다.`));
-                break;
-              }
-              fire(target, ev, { note: 'UI: 지금 리뷰' });
-              saveContext(cfg, target);
-            }
-            prioritized.add(key);
-            console.log(chalk.cyan(`    지금 리뷰: ${key} — 큐 맨 앞으로 올립니다.`));
-            break;
-          }
         }
+      }
+
+      // ── 2단계: review-now — 위에서 확정된 필터 기준으로 판정한다 ──
+      for (const it of reviewNowIntents) {
+        const key = parsePRRef(it.ref);
+        if (!key) {
+          console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${it.ref}"`));
+          continue;
+        }
+        const target = findContext(key);
+        if (!target) {
+          console.log(chalk.yellow(`  ⚠ ${key} 는 추적 중이 아닙니다.`));
+          continue;
+        }
+        if (target.state === 'REVIEWING') {
+          console.log(chalk.dim(`    ${key} 는 이미 리뷰 중입니다.`));
+          continue;
+        }
+
+        // 필터에 걸린 PR 은 **전이시키기 전에** 막는다.
+        //
+        // scan 이 excludedReason 붙은 컨텍스트를 eligible 에 넣지 않으므로 상태만
+        // 바뀌고 리뷰는 영영 실행되지 않는다. 그냥 무동작이면 그나마 나은데,
+        // AWAITING_AUTHOR/CONVERGED 였던 **영속 상태가 REVIEW_DUE 로 바뀌어 남는다.**
+        // 나중에 제외를 풀면 작성자 응답도 새 커밋도 없이 리뷰가 돌아버린다.
+        //
+        // 일회성 우회로 만들지 않은 이유: skip 은 "확실히 하지 말 것" 이고 only
+        // 보다도 강하게 잡아둔 조건이다. 버튼 하나로 뒤집히면 그 보증이 사라진다.
+        //
+        // 판정은 **두 갈래**다. skip/only 는 방금 1단계에서 바뀌었을 수 있으므로
+        // 캐시가 아니라 지금 설정으로 다시 본다. 나머지(draft/authors/labels)는
+        // GitHub 관측값이 있어야 알 수 있어 스캔이 남긴 값이 여전히 유효하다.
+        const live = passesRefFilters(key, scope.filters);
+        const stale =
+          target.excludedReason && !isRefFilterReason(target.excludedReason)
+            ? target.excludedReason
+            : undefined;
+        const blocked = !live.ok ? live.reason : stale;
+        if (blocked) {
+          console.log(
+            chalk.yellow(`  ⚠ ${key} 는 필터에 걸려 있습니다 (${blocked}) — 먼저 제외를 푸세요.`),
+          );
+          continue;
+        }
+
+        // REVIEW_DUE 가 아니면 강제로 되돌린다 — review --force 와 같은 경로다.
+        if (target.state !== 'REVIEW_DUE') {
+          const ev = FORCE_EVENTS[target.state];
+          if (!ev || !canFire(target.state, ev)) {
+            console.log(chalk.yellow(`  ⚠ ${key} 는 ${target.state} 에서 강제 실행할 수 없습니다.`));
+            continue;
+          }
+          fire(target, ev, { note: 'UI: 지금 리뷰' });
+          saveContext(cfg, target);
+        }
+        prioritized.add(key);
+        console.log(chalk.cyan(`    지금 리뷰: ${key} — 큐 맨 앞으로 올립니다.`));
       }
 
       if (scopeChanged) {

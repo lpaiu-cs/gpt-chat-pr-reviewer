@@ -30,7 +30,9 @@ import {
   globToRegExp,
   unsupportedPatterns,
   invalidPRRefs,
+  isRefFilterReason,
   parsePRRef,
+  passesRefFilters,
   matchesScope,
   nextRepoCache,
   passesFilters,
@@ -1014,6 +1016,45 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 31: 의도 배치 안에서의 필터 판정 ──────────────
+
+{
+  // 리뷰 지적 [P2]: 캐시된 excludedReason 은 **직전 스캔** 값이라, 같은 배치에서
+  // 앞서 적용된 skip/only 변경을 반영하지 못한다. 그래서 판정을 두 갈래로 나눈다.
+  const KEY = 'lpaiu-cs/osk-system#12';
+
+  // (1) 배치에서 방금 skip 에 들어갔다 → 캐시는 비어 있어도 막아야 한다
+  assert(
+    !passesRefFilters(KEY, { skip: [KEY] }).ok,
+    '지금 설정 기준으로 skip 이면 캐시가 비어 있어도 막힌다',
+  );
+  // (2) 배치에서 방금 skip 에서 빠졌다 → 캐시가 'skip 목록' 이어도 통과해야 한다
+  assert(passesRefFilters(KEY, { skip: [] }).ok, '지금 설정에서 빠졌으면 통과한다');
+  assert(
+    isRefFilterReason('skip 목록') && isRefFilterReason('only 목록 밖'),
+    'skip/only 사유는 다시 계산 가능하므로 캐시를 무시해도 된다',
+  );
+  // (3) 반대로 draft/authors/labels 는 설정만으로 못 고치므로 캐시가 유효하다
+  assert(!isRefFilterReason('초안(draft)'), 'draft 는 재계산 불가 — 캐시가 유효하다');
+  assert(!isRefFilterReason('작성자 bot 는 대상 아님'), 'authors 도 재계산 불가');
+  assert(!isRefFilterReason(undefined), '사유가 없으면 ref 사유가 아니다');
+
+  // only 도 같은 규칙
+  assert(!passesRefFilters(KEY, { only: ['other/repo#1'] }).ok, 'only 목록 밖이면 막힌다');
+  assert(passesRefFilters(KEY, { only: [KEY] }).ok, 'only 목록 안이면 통과');
+  assert(passesRefFilters(KEY, {}).ok, '조건이 없으면 통과');
+
+  // passesFilters 가 같은 함수를 지나는지 (판정이 갈라지면 안 된다)
+  const pr = {
+    owner: 'lpaiu-cs', repo: 'osk-system', number: 12,
+    author: 'lpaiu-cs', isDraft: false, labels: [],
+  };
+  assert(
+    passesFilters(pr, { skip: [KEY] }).reason === passesRefFilters(KEY, { skip: [KEY] }).reason,
+    'passesFilters 와 passesRefFilters 가 같은 사유를 낸다',
+  );
 }
 
 // ── 시나리오 30: 필터에 걸린 PR 은 강제 전이시켜도 못 돈다 ──
