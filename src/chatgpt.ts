@@ -18,6 +18,21 @@ export class QuotaLimitError extends Error {
   }
 }
 
+/**
+ * 정해진 시간 안에 응답을 받지 못했다 — **내용 실패와 성격이 다르다.**
+ *
+ * 파싱 실패·리뷰 거부는 같은 답을 다시 써도 결과가 같지만, 타임아웃은 환경 사정이라
+ * 다시 시도하면 대개 풀린다. 둘을 같은 "리뷰 실패" 로 표기하면 로그만 보고는
+ * 무엇이 잘못됐는지 구분할 수 없고, 실제로 그래서 "오류가 왜 이렇게 잦은가" 를
+ * 되묻게 됐다.
+ */
+export class ResponseTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResponseTimeoutError';
+  }
+}
+
 /** 대화에서 읽어온 메시지 하나 (역할 + 본문). */
 export interface ConversationMessage {
   role: string;
@@ -915,8 +930,8 @@ export class ChatGPTDriver {
 
     const quota = await this.detectQuotaLimit(page);
     if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
-    throw new Error(
-      `응답을 수신하지 못했습니다 (${Math.round(timeout / 60_000)}분 대기). ` +
+    throw new ResponseTimeoutError(
+      `${Math.round(timeout / 60_000)}분 동안 응답을 받지 못했습니다. ` +
         '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
     );
   }
@@ -936,7 +951,7 @@ export class ChatGPTDriver {
     const deadline = Date.now() + this.cfg.responseTimeoutMs;
     while (await this.isStreaming(page)) {
       if (Date.now() > deadline) {
-        throw new Error(
+        throw new ResponseTimeoutError(
           '이전 응답이 계속 생성 중이라 전송을 보류했습니다 — 끊지 않기 위해 라운드를 넘깁니다.',
         );
       }

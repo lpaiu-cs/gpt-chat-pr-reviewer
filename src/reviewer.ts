@@ -18,7 +18,7 @@ import {
   type SyncThread,
   type PRProbe,
 } from './github.js';
-import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
+import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub } from './poster.js';
 import { loadInstructions } from './instructions.js';
@@ -842,7 +842,8 @@ export async function runRound(
         return 'quota';
       }
       const msg = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 300);
-      console.error(chalk.red('  ✗ 리뷰 실패:'), msg);
+      if (e instanceof ResponseTimeoutError) console.log(chalk.yellow('  ⏱ 응답 타임아웃:'), msg);
+      else console.error(chalk.red('  ✗ 리뷰 실패:'), msg);
       return 'failed';
     }
   }
@@ -923,10 +924,19 @@ export async function runRound(
       return 'quota';
     }
 
-    const msg = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 300);
+    // 타임아웃은 **환경 사정**이라 다시 시도하면 대개 풀린다. 파싱 실패·리뷰 거부
+    // (같은 답을 다시 써도 결과가 같다)와 같은 붉은 "리뷰 실패" 로 뭉치면, 로그만
+    // 보고는 무엇이 잘못됐는지 구분할 수 없다. 상태 전이는 같지만 표기를 나눈다.
+    const timedOut = e instanceof ResponseTimeoutError;
+    const raw = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 280);
+    const msg = timedOut ? `타임아웃 — ${raw}` : raw;
     fire(ctx, 'REVIEW_FAILED', { note: msg, patch: { lastError: msg } });
     saveContext(cfg, ctx);
-    console.error(chalk.red('  ✗ 리뷰 실패:'), msg);
+    if (timedOut) {
+      console.log(chalk.yellow('  ⏱ 응답 타임아웃:'), raw);
+    } else {
+      console.error(chalk.red('  ✗ 리뷰 실패:'), raw);
+    }
     return 'failed';
   }
 }
