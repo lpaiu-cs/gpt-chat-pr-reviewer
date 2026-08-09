@@ -84,6 +84,13 @@ function ownersFromPatterns(include: string[]): { owners: string[]; skipped: str
 
 export interface DiscoveryResult {
   repos: string[];
+  /**
+   * 레포별로 "새로 추적을 시작해도 되는 PR 번호". 검색 조건이 PR 단위인
+   * review-requested 모드에서만 채워지며, undefined 면 제한 없음이다.
+   */
+  targets?: Map<string, Set<number>>;
+  /** 일부 검색이 실패해 결과가 불완전한지 — true 면 캐시를 교체하면 안 된다 */
+  partial: boolean;
   /** 검색 페이지 상한에 걸려 일부만 훑었는지 */
   truncated: boolean;
   /** 이번 탐색이 쓴 GraphQL point */
@@ -111,7 +118,12 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
       console.log(chalk.dim('    글롭을 쓰려면 watch.mode 를 "account" 로 바꾸세요.'));
     }
     const literal = scope.include.filter((p) => !p.includes('*'));
-    return { repos: literal.filter((s) => matchesScope(s, [], exclude)), truncated: false, cost: 0 };
+    return {
+      repos: literal.filter((s) => matchesScope(s, [], exclude)),
+      partial: false,
+      truncated: false,
+      cost: 0,
+    };
   }
 
   const queries: string[] = [];
@@ -127,22 +139,40 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
     for (const o of owners) queries.push(`is:pr is:open archived:false org:${o}`);
   }
 
+  // review-requested 는 검색 조건이 PR 단위다. 레포로 축약하면 "요청받은 PR 1건"
+  // 때문에 그 레포의 열린 PR 전부가 대상이 되어 요청 범위 밖의 리뷰를 게시한다.
+  const byPR = scope.mode === 'review-requested';
   const found = new Set<string>();
+  const targets = new Map<string, Set<number>>();
   let truncated = false;
+  let partial = false;
   let cost = 0;
+
   for (const q of queries) {
     try {
       const r = searchPRRepos(q);
       r.repos.forEach((s) => found.add(s));
+      if (byPR) {
+        for (const { slug, number } of r.prs) {
+          if (!targets.has(slug)) targets.set(slug, new Set());
+          targets.get(slug)!.add(number);
+        }
+      }
       truncated ||= r.truncated;
       cost += r.cost;
     } catch {
-      console.log(chalk.yellow(`  ⚠ 레포 탐색 실패 (${q}) — 이전 목록을 유지합니다.`));
+      // 이 쿼리 범위만 실패했다. 성공한 쿼리 결과로 캐시를 통째로 갈아치우면
+      // 실패한 범위의 레포가 감시에서 빠진다 — 호출부가 병합하도록 알린다.
+      partial = true;
+      console.log(chalk.yellow(`  ⚠ 레포 탐색 실패 (${q}) — 이 범위는 이전 목록을 유지합니다.`));
     }
   }
 
+  const repos = [...found].filter((s) => matchesScope(s, scope.include, exclude)).sort();
   return {
-    repos: [...found].filter((s) => matchesScope(s, scope.include, exclude)).sort(),
+    repos,
+    targets: byPR ? targets : undefined,
+    partial,
     truncated,
     cost,
   };
@@ -153,10 +183,31 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
 export interface RepoSource {
   /** 필요하면 재탐색하고 현재 대상 목록을 돌려준다. */
   list(): string[];
+  /**
+   * 레포별 "새로 추적해도 되는 PR 번호". undefined 면 제한 없음.
+   * list() 호출 후에 읽어야 최신이다.
+   */
+  targets?: Map<string, Set<number>>;
   /** 마지막 탐색에서 결과가 잘렸는지 */
   truncated: boolean;
   /** 마지막 탐색 시각 (0 = 아직 없음) */
   lastAt: number;
+}
+
+/** 두 허용 목록을 합친다 (둘 다 없으면 undefined = 제한 없음). */
+function mergeTargets(
+  a: Map<string, Set<number>> | undefined,
+  b: Map<string, Set<number>> | undefined,
+): Map<string, Set<number>> | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const out = new Map<string, Set<number>>();
+  for (const [slug, nums] of [...a, ...b]) {
+    const set = out.get(slug) ?? new Set<number>();
+    nums.forEach((n) => set.add(n));
+    out.set(slug, set);
+  }
+  return out;
 }
 
 /**
@@ -179,14 +230,20 @@ export function createRepoSource(scope: WatchScope): RepoSource {
       const r = discoverRepos(scope);
       source.lastAt = Date.now();
       source.truncated = r.truncated;
-      // 탐색이 실패해 0건이 나왔는데 직전 목록이 있으면 그것을 유지한다
-      if (r.repos.length === 0 && cached.length > 0) {
+      // 실패한 범위의 허용 목록까지 지워지면 그 PR 들이 추적 대상에서 빠진다.
+      source.targets = r.partial ? mergeTargets(source.targets, r.targets) : r.targets;
+
+      // 결과가 불완전하면 아무것도 빼지 않는다. 성공한 범위의 결과로 캐시를
+      // 교체하면 실패한 범위의 레포가 조용히 감시에서 빠진다.
+      // (전부 실패해 0건이 된 경우도 여기에 포함된다)
+      const next = r.partial ? [...new Set([...cached, ...r.repos])].sort() : r.repos;
+      if (next.length === 0 && cached.length > 0) {
         console.log(chalk.yellow('  ⚠ 레포 탐색 결과가 비었습니다 — 직전 목록을 유지합니다.'));
         return cached;
       }
-      const added = r.repos.filter((s) => !cached.includes(s));
-      const removed = cached.filter((s) => !r.repos.includes(s));
-      cached = r.repos;
+      const added = next.filter((s) => !cached.includes(s));
+      const removed = cached.filter((s) => !next.includes(s));
+      cached = next;
       if (added.length > 0) console.log(chalk.dim(`    감시 추가: ${added.join(', ')}`));
       if (removed.length > 0) console.log(chalk.dim(`    감시 해제: ${removed.join(', ')}`));
       if (r.truncated) {

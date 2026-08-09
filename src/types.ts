@@ -137,6 +137,12 @@ export interface PRContext {
    * 확보하지 못한 채 끝난 대화의 잔여물이며, 다음 전송에서 버려진다(countTurn).
    */
   conversationTurns?: number;
+  /**
+   * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).
+   * 관측된 GitHub 현황을 캐시한 것일 뿐 상태가 아니다 — 필터를 통과하면 지워진다.
+   * 이게 없으면 `queue` 명령이 watch 가 실제로 돌리지 않을 PR 까지 보여준다.
+   */
+  excludedReason?: string;
   retryCount: number;
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */

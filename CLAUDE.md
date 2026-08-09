@@ -91,6 +91,14 @@ review-requested + 글롭 `include`/`exclude` + `filters`). 계정 모드는 Gra
 없다. 발견은 `discoveryIntervalMs`(기본 5분) 주기로, 감지는 10초 주기 probe 가 맡는다.
 구버전 `watchRepos` 는 `watch.include` 가 비었을 때의 폴백으로 계속 동작한다.
 
+스캔 대상 = 검색으로 발견한 레포 ∪ **아직 살아있는 컨텍스트가 있는 (범위 내) 레포**.
+검색은 열린 PR 이 있는 레포만 주므로, 후자를 빼면 마지막 PR 이 닫힌 레포의 컨텍스트가
+`PR_CLOSED` 를 못 받고 영영 남는다.
+
+`review-requested` 는 검색 조건이 PR 단위다. 레포로 축약하면 요청받지 않은 PR 까지
+리뷰하게 되므로 PR 번호를 보존해 **새 추적 시작만** 제한한다. 이미 추적 중인 PR 은
+계속 간다 — 리뷰를 게시하면 GitHub 이 요청을 해제해 2차 라운드가 끊기기 때문이다.
+
 실측 비용: 검색 1 point/페이지 · probe 1 point/레포 (PR 개수·라벨 조회와 무관).
 
 ## 빌드 & 실행

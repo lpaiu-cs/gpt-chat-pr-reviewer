@@ -152,6 +152,8 @@ export interface PRProbe extends PRInfo {
   updatedAt: string;
   isDraft: boolean;
   labels: string[];
+  /** 라벨이 조회 상한을 넘어 일부만 담긴 경우 true — 라벨 필터 판정이 부정확해진다 */
+  labelsTruncated: boolean;
   /** 스레드 상태를 함께 조회한 경우에만 채워진다 (resolve 감지용). */
   threads?: { id: string; isResolved: boolean }[];
 }
@@ -177,8 +179,14 @@ export const THREAD_ALIAS_CHUNK = 20;
 /** 한 레포에서 1회에 조회하는 열린 PR 개수. 초과분은 totalCount 로 감지해 알린다. */
 export const PROBE_PAGE = 50;
 
+/**
+ * 라벨 조회 상한. GitHub 의 PR 당 라벨 한도와 같으므로 실질적으로 잘리지 않지만,
+ * 잘렸을 때 라벨 필터가 PR 을 **조용히 제외**하지 않도록 totalCount 로 감지한다.
+ */
+const PROBE_LABEL_PAGE = 100;
+
 const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName headRefName isDraft
-        author{ login } labels(first:20){ nodes{ name } }`;
+        author{ login } labels(first:${PROBE_LABEL_PAGE}){ totalCount nodes{ name } }`;
 
 // ── GraphQL 사용량 집계 ─────────────────────────────────────
 //
@@ -305,6 +313,7 @@ ${listPart}${aliases}
         updatedAt: n.updatedAt,
         isDraft: !!n.isDraft,
         labels: (n.labels?.nodes ?? []).map((l: any) => l.name),
+        labelsTruncated: (n.labels?.totalCount ?? 0) > (n.labels?.nodes?.length ?? 0),
       }));
     }
 
@@ -329,6 +338,11 @@ ${listPart}${aliases}
 export interface RepoSearchResult {
   /** 열린 PR 이 하나라도 있는 'owner/repo' 목록 */
   repos: string[];
+  /**
+   * 검색에 걸린 PR 의 신원. 레포로 축약해 버리면 "리뷰 요청된 PR 만" 같은
+   * 조건이 레포 단위로 번져 요청하지 않은 PR 까지 대상이 된다.
+   */
+  prs: { slug: string; number: number }[];
   /** 검색에 걸린 PR 총 개수 */
   total: number;
   /** 페이지 상한에 걸려 일부만 훑은 경우 true */
@@ -345,7 +359,7 @@ const REPO_SEARCH_QUERY = `query($q:String!,$after:String){
   search(query:$q, type:ISSUE, first:100, after:$after){
     issueCount
     pageInfo{ hasNextPage endCursor }
-    nodes{ ... on PullRequest { repository{ nameWithOwner } } }
+    nodes{ ... on PullRequest { number repository{ nameWithOwner } } }
   }
 }`;
 
@@ -358,6 +372,7 @@ const REPO_SEARCH_QUERY = `query($q:String!,$after:String){
  */
 export function searchPRRepos(searchQuery: string): RepoSearchResult {
   const repos = new Set<string>();
+  const prs: { slug: string; number: number }[] = [];
   let cursor: string | null = null;
   let total = 0;
   let cost = 0;
@@ -377,7 +392,9 @@ export function searchPRRepos(searchQuery: string): RepoSearchResult {
     total = search.issueCount ?? total;
     for (const n of search.nodes ?? []) {
       const slug = n?.repository?.nameWithOwner;
-      if (slug) repos.add(slug);
+      if (!slug || typeof n.number !== 'number') continue;
+      repos.add(slug);
+      prs.push({ slug, number: n.number });
     }
 
     if (!search.pageInfo?.hasNextPage) break;
@@ -385,7 +402,7 @@ export function searchPRRepos(searchQuery: string): RepoSearchResult {
     truncated = page === SEARCH_MAX_PAGES - 1;
   }
 
-  return { repos: [...repos].sort(), total, truncated, cost, remaining };
+  return { repos: [...repos].sort(), prs, total, truncated, cost, remaining };
 }
 
 let viewerLoginCache: string | null = null;

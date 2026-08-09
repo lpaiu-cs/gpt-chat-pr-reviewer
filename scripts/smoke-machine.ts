@@ -24,6 +24,7 @@ import { loadConfig } from '../src/config.js';
 import { globToRegExp, matchesScope, passesFilters, resolveWatchScope } from '../src/watch-scope.js';
 import {
   buildQueue,
+  isQueueable,
   quotaGateUntil,
   TIER_AUTHOR_RESPONDED,
   TIER_FIRST_ROUND,
@@ -756,6 +757,89 @@ const fakePR: PRInfo = {
   );
 
   assert(quotaGateUntil([pending], now) === null, '막힌 PR 이 없으면 게이트 없음');
+}
+
+// ── 시나리오 21: 큐 자격 — 필터에 걸린 컨텍스트 제외 ───────
+
+{
+  // 리뷰 지적 [P2]: queue 명령이 watch 와 다른 답을 내면 안 된다. 스캔이 남긴
+  // excludedReason 을 buildQueue 가 읽어 둘이 같은 규칙을 쓴다.
+  const plain = createContext({ ...fakePR, number: 20 });
+  const excluded = createContext({ ...fakePR, number: 21 });
+  excluded.excludedReason = '초안(draft)';
+
+  assert(isQueueable(plain), '필터를 통과한 REVIEW_DUE 는 큐 자격 있음');
+  assert(!isQueueable(excluded), 'excludedReason 이 붙으면 큐 자격 없음');
+
+  const q = buildQueue([plain, excluded]);
+  assert(q.length === 1 && q[0].ctx.prNumber === 20, '큐에서 필터 제외 항목이 빠진다');
+
+  // 필터를 다시 통과하면 되살아나야 한다 (draft 해제·라벨 재부착)
+  delete excluded.excludedReason;
+  assert(buildQueue([plain, excluded]).length === 2, '필터를 다시 통과하면 큐에 복귀');
+}
+
+// ── 시나리오 22: 감시 범위 부분 실패 시 캐시 보존 ──────────
+
+{
+  // 리뷰 지적 [P2]: owner 두 개 중 하나만 실패했을 때 성공한 쪽 결과로 캐시를
+  // 통째로 갈면 실패한 owner 의 레포가 조용히 감시에서 빠진다.
+  // discoverRepos 는 partial 로 알리고, createRepoSource 는 그때 병합한다.
+  const cached = ['a/one', 'b/two'];
+  const fresh = ['a/one']; // b 쿼리 실패로 b 의 레포가 빠진 결과
+
+  const merged = [...new Set([...cached, ...fresh])].sort();
+  assert(merged.includes('b/two'), '부분 실패 시 실패한 범위의 레포가 유지된다');
+
+  const replaced = fresh; // partial=false 였다면
+  assert(!replaced.includes('b/two'), '완전 성공 시에는 사라진 레포가 정상적으로 빠진다');
+}
+
+// ── 시나리오 23: review-requested 는 PR 단위로 제한 ────────
+
+{
+  // 리뷰 지적 [P1]: 검색 결과를 레포로 축약하면 "리뷰 요청받은 PR 1건" 때문에
+  // 그 레포의 열린 PR 전부가 대상이 된다.
+  const targets = new Map<string, Set<number>>([['o/r', new Set([7])]]);
+  const allowed = targets.get('o/r');
+
+  const admits = (num: number, existing: boolean): boolean =>
+    !(!existing && allowed && !allowed.has(num));
+
+  assert(admits(7, false), '요청받은 PR 은 새로 추적한다');
+  assert(!admits(9, false), '요청받지 않은 같은 레포의 PR 은 추적하지 않는다');
+
+  // 리뷰를 게시하면 GitHub 이 요청을 해제한다. 검색 결과만 믿으면 2차 라운드가
+  // 영영 오지 않으므로, 이미 추적 중인 PR 은 목록에 없어도 계속 간다.
+  assert(admits(9, true), '이미 추적 중이면 요청 목록에 없어도 계속 추적한다');
+
+  // account/repos 모드는 제한이 없다
+  const unrestricted = undefined as Set<number> | undefined;
+  assert(!(!false && unrestricted && !unrestricted.has(9)), '제한이 없으면 모든 PR 이 대상');
+}
+
+// ── 시나리오 24: 열린 PR 이 없어진 레포도 계속 훑는다 ──────
+
+{
+  // 리뷰 지적 [P2]: 검색은 열린 PR 이 있는 레포만 준다. 마지막 PR 이 닫히면
+  // 레포가 목록에서 빠져 추적 중이던 컨텍스트가 PR_CLOSED 를 못 받는다.
+  const discovered = ['o/alive'];
+  const contexts = [
+    { owner: 'o', repo: 'alive', state: 'REVIEW_DUE' as PRState },
+    { owner: 'o', repo: 'gone', state: 'AWAITING_AUTHOR' as PRState }, // 마지막 PR 이 닫힌 레포
+    { owner: 'o', repo: 'done', state: 'CLOSED' as PRState }, // 이미 정리됨
+    { owner: 'x', repo: 'other', state: 'REVIEW_DUE' as PRState }, // 범위 밖
+  ];
+
+  const include = ['o/*'];
+  const lingering = [
+    ...new Set(contexts.filter((c) => c.state !== 'CLOSED').map((c) => `${c.owner}/${c.repo}`)),
+  ].filter((s) => !discovered.includes(s) && matchesScope(s, include, []));
+
+  assert(lingering.includes('o/gone'), '살아있는 컨텍스트가 있는 레포는 계속 훑는다');
+  assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
+  assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
+  assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ import { ensureInstructionsFile } from './instructions.js';
 import {
   createRepoSource,
   describeScope,
+  matchesScope,
   passesFilters,
   resolveWatchScope,
 } from './watch-scope.js';
@@ -397,12 +398,25 @@ program
      * 여기서는 리뷰를 실행하지 않는다. 실행 순서는 큐가 정한다.
      */
     const scan = (): { eligible: PRContext[]; openCount: number } => {
-      const repos = repoSource.list();
+      const discovered = repoSource.list();
+      const all = listContexts(cfg);
+
+      // 검색은 "열린 PR 이 있는 레포" 만 돌려준다. 어떤 레포의 마지막 PR 이 닫히면
+      // 그 레포가 목록에서 사라지고, 추적 중이던 컨텍스트는 PR_CLOSED 를 못 받아
+      // AWAITING_AUTHOR 같은 상태로 영원히 남는다. 아직 살아있는 컨텍스트가 있는
+      // 레포는 범위 안이라면 계속 훑어서 종료까지 정리한다.
+      const lingering = [
+        ...new Set(
+          all.filter((c) => c.state !== 'CLOSED').map((c) => `${c.owner}/${c.repo}`),
+        ),
+      ].filter(
+        (s) => !discovered.includes(s) && matchesScope(s, scope.include, scope.exclude ?? []),
+      );
+
+      const repos = [...discovered, ...lingering];
       watchedRepos = repos.length;
       const eligible: PRContext[] = [];
       let openCount = 0;
-
-      const all = listContexts(cfg);
 
       for (const repoSlug of repos) {
         const tracked = all.filter(
@@ -442,16 +456,36 @@ program
           }
         }
 
+        // review-requested 모드에서 "이 레포의 어떤 PR 을 새로 추적해도 되는가".
+        // undefined 면 제한 없음 (account/repos 모드).
+        const allowed = repoSource.targets?.get(repoSlug);
+
         for (const pr of probe.prs) {
           const existing = loadContext(cfg, pr.owner, pr.repo, pr.number);
           const verdict = passesFilters(pr, scope.filters);
 
-          // 필터에 걸린 PR 은 추적 자체를 시작하지 않는다. 이미 추적 중이라면
-          // (초안으로 되돌렸거나 라벨을 뗀 경우) 상태는 계속 갱신하되 큐에서 뺀다.
-          if (!existing && !verdict.ok) continue;
+          if (pr.labelsTruncated && scope.filters?.labels?.length) {
+            console.log(
+              chalk.yellow(
+                `  ⚠ ${repoSlug}#${pr.number} 라벨이 조회 상한을 넘었습니다 — 라벨 필터 판정이 부정확할 수 있습니다.`,
+              ),
+            );
+          }
+
+          // 새로 추적을 시작할지의 판정.
+          //
+          // 필터에 걸린 PR 과 리뷰 요청받지 않은 PR 은 추적 자체를 시작하지 않는다.
+          // 반대로 **이미 추적 중이면 계속 간다** — 리뷰를 게시하면 GitHub 이 리뷰
+          // 요청을 해제하므로, 검색 결과만 믿으면 1차 라운드 직후 대상에서 빠져
+          // 2차 라운드가 영영 오지 않는다.
+          if (!existing && (!verdict.ok || (allowed && !allowed.has(pr.number)))) continue;
 
           const ctx = existing ?? createContext(pr);
           ctx.title = pr.title;
+          // 필터 판정을 컨텍스트에 남긴다 — queue 명령이 GitHub 을 다시 부르지 않고도
+          // watch 와 같은 답을 낼 수 있어야 한다.
+          if (verdict.ok) delete ctx.excludedReason;
+          else ctx.excludedReason = verdict.reason;
 
           // 1단계: probe 만으로 전이 판정 (API 추가 호출 없음)
           const needsFull = syncPRFromProbe(cfg, ctx, pr);
@@ -646,15 +680,31 @@ program
     ensureDataDir(cfg);
 
     // 큐는 저장되지 않는다 — 컨텍스트에서 매번 다시 계산한다 (queue.ts 참고).
+    //
+    // watch 와 같은 범위·필터를 적용해야 "watch 가 처리할 대기열" 이라는 말이
+    // 사실이 된다. 범위는 여기서 글롭으로 판정하고, draft/라벨 필터는 스캔이
+    // 남겨둔 excludedReason 을 buildQueue 가 읽는다 (GitHub 재조회 없음).
+    const scope = resolveWatchScope(cfg);
     const all = listContexts(cfg);
-    const entries = buildQueue(all);
-    const blockedUntil = quotaGateUntil(all);
+    const inScope = (c: PRContext): boolean =>
+      !scope || matchesScope(`${c.owner}/${c.repo}`, scope.include, scope.exclude ?? []);
+
+    const scoped = all.filter(inScope);
+    const entries = buildQueue(scoped);
+    const blockedUntil = quotaGateUntil(scoped);
+
+    // 숨긴 것은 반드시 세어서 알린다 — 조용히 빠지면 "대기열 0건" 이 거짓이 된다.
+    const hiddenOutOfScope = all.filter((c) => c.state === 'REVIEW_DUE' && !inScope(c)).length;
+    const hiddenFiltered = scoped.filter(
+      (c) => c.state === 'REVIEW_DUE' && !!c.excludedReason,
+    ).length;
 
     if (opts.json) {
       console.log(
         JSON.stringify(
           {
             blockedUntil: blockedUntil ? new Date(blockedUntil).toISOString() : null,
+            hidden: { outOfScope: hiddenOutOfScope, filtered: hiddenFiltered },
             entries: entries.map((e: QueueEntry) => ({
               owner: e.ctx.owner,
               repo: e.ctx.repo,
@@ -684,8 +734,20 @@ program
       );
       console.log(chalk.dim('    대기열은 그대로 보존됩니다.\n'));
     }
+    /** 범위·필터로 감춘 항목을 알린다 (조용히 빠지면 대기열이 거짓말을 한다). */
+    const reportHidden = (): void => {
+      if (hiddenOutOfScope > 0) {
+        console.log(chalk.dim(`  · 감시 범위 밖 ${hiddenOutOfScope}건은 표시하지 않았습니다.`));
+      }
+      if (hiddenFiltered > 0) {
+        console.log(chalk.dim(`  · 필터에 걸린 ${hiddenFiltered}건은 표시하지 않았습니다.`));
+      }
+    };
+
     if (entries.length === 0) {
-      console.log(chalk.dim('  대기열이 비어 있습니다.\n'));
+      console.log(chalk.dim('  대기열이 비어 있습니다.'));
+      reportHidden();
+      console.log();
       return;
     }
 
@@ -698,6 +760,7 @@ program
       );
       console.log(chalk.dim(`      ${e.ctx.title.slice(0, 60)}`));
     });
+    reportHidden();
     console.log();
   });
 

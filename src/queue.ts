@@ -97,15 +97,23 @@ export function toQueueEntry(ctx: PRContext, now = Date.now()): QueueEntry {
   };
 }
 
+/** 큐에 오를 자격 — REVIEW_DUE 이면서 감시 필터에 걸리지 않은 것. */
+export function isQueueable(ctx: PRContext): boolean {
+  return ctx.state === 'REVIEW_DUE' && !ctx.excludedReason;
+}
+
 /**
  * 리뷰 대기열을 만든다 — REVIEW_DUE 인 것만, 우선순위 순으로.
  *
  * 브라우저 페이지가 단일 자원이라 리뷰는 직렬로만 돌 수 있다. 큐가 하는 일은
  * "동시에 여러 개" 가 아니라 "무엇을 먼저" 를 정하는 것이다.
+ *
+ * 필터에 걸린 컨텍스트(excludedReason)는 제외한다. watch 는 애초에 넘기지 않지만,
+ * `queue` 명령은 저장소를 통째로 읽으므로 여기서 한 번 더 걸러야 둘이 같은 답을 준다.
  */
 export function buildQueue(contexts: PRContext[], now = Date.now()): QueueEntry[] {
   return contexts
-    .filter((c) => c.state === 'REVIEW_DUE')
+    .filter(isQueueable)
     .map((c) => toQueueEntry(c, now))
     .sort(
       (a, b) =>
