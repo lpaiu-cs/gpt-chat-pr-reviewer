@@ -304,6 +304,32 @@ npm run dev -- watch --ui --ui-port 9000
 
 SSE를 쓸 수 없는 소비자를 위해 `GET /api/state`가 같은 스냅샷을 JSON으로 돌려줍니다.
 
+### 이벤트 알림
+
+```bash
+npm run notify
+```
+
+대시보드 SSE를 구독해 **리뷰가 게시되는 순간**을 알립니다. 라운드가 2~15분이라 화면을 계속 보고 있을 수 없고, 셀프 리뷰(내 PR을 내 도구가 리뷰)는 GitHub 알림도 외부 CI 훅도 잡아주지 않기 때문입니다.
+
+| 이벤트 | 시점 |
+|---|---|
+| `round-start` | 라운드 시작 |
+| `posting` | 게시 단계 진입 (아직 GitHub에 올라가기 전) |
+| `posted` | **코멘트 게시 완료** → `AWAITING_AUTHOR` — 처리할 게 생긴 시점 |
+| `converged` | 수렴 (approve) |
+| `failed` / `quota` / `closed` | 실패 / 한도 / PR 종료 |
+
+`--exec`로 명령을 걸면 자동화로 이어집니다. 기본 트리거는 `posted,converged,failed`입니다.
+
+```bash
+node scripts/notify.mjs --on posted --exec "your-handler.sh"
+```
+
+명령에는 `PR_EVENT` `PR_KEY` `PR_URL` `PR_OWNER` `PR_REPO` `PR_NUMBER` `PR_ROUND` `PR_STATE` `PR_TITLE`이 환경변수로 넘어갑니다. 셸은 플랫폼 기본(Windows는 `cmd`)이므로 인라인 명령에서 변수를 쓸 때는 `%PR_NUMBER%` / `$PR_NUMBER`로 각각 맞춰야 합니다 — 스크립트 파일로 넘기면 신경 쓸 필요가 없습니다.
+
+**상태 파일을 건드리지 않고 SSE만 읽으므로 별도 프로세스로 띄워도 안전합니다.** 의존성이 없어 `node scripts/notify.mjs`로 바로 돌고, `watch`를 재시작하면 알아서 다시 붙습니다. 잠깐 끊긴 사이에 일어난 전이도 재연결 후 첫 스냅샷에서 잡아냅니다 (`watch` 자체가 재시작된 경우에만 기준선을 새로 잡습니다).
+
 ## 맞춤 지침
 
 `instructions.md`의 내용이 매 리뷰 프롬프트에 주입됩니다.

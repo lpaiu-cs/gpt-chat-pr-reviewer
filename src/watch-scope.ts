@@ -307,17 +307,43 @@ export interface FilterablePR {
   labelsTruncated?: boolean;
 }
 
-/** `filters.skip` · `filters.only` 항목의 형식. 소유자·레포·번호가 모두 있어야 한다. */
-const PR_REF = /^[^/\s]+\/[^#\s]+#\d+$/;
+const PR_REF = /^([^/\s]+)\/([^/#\s]+)#(\d+)$/;
 
-/** PR 하나를 skip/only 목록과 대조할 정규화 키로. */
+/**
+ * `'owner/repo#12'` → 대조용 정규화 키. 형식이 틀리면 null.
+ *
+ * 검증(`invalidPRRefs`)과 대조(`refSet`)가 **같은 함수**를 지나게 해서, "형식
+ * 검사는 통과하는데 절대 매치되지 않는" 항목이 구조적으로 나올 수 없게 한다.
+ * 이 둘이 갈라지면 검증의 존재 이유가 사라진다 — skip 오타가 통과하는 순간
+ * 제외한 줄 알았던 PR 이 그대로 리뷰되고, 그건 되돌릴 수 없다.
+ *
+ * 그래서 실제 PR 이 만들어낼 수 없는 표기는 전부 거른다:
+ *   'owner/repo/extra#12'  레포 이름에 슬래시가 들어갈 수 없다
+ *   'owner/repo#0'         PR 번호는 1부터다
+ * 앞뒤 여백·대소문자·선행 0(`#007` → `#7`)은 같은 키로 접어 넣는다 — 사람이
+ * 적은 표기 차이일 뿐 다른 PR 을 가리키는 게 아니다.
+ */
+export function parsePRRef(entry: string): string | null {
+  const m = PR_REF.exec(entry.trim());
+  if (!m) return null;
+  const number = Number(m[3]);
+  if (!Number.isSafeInteger(number) || number < 1) return null;
+  return `${m[1]}/${m[2]}#${number}`.toLowerCase();
+}
+
+/** PR 하나를 skip/only 목록과 대조할 정규화 키로. parsePRRef 와 같은 표현이어야 한다. */
 function prKey(owner: string, repo: string, number: number): string {
   return `${owner}/${repo}#${number}`.toLowerCase();
 }
 
-/** 목록을 정규화된 집합으로. 앞뒤 여백과 대소문자를 무시한다. */
+/** 목록을 정규화된 집합으로. 형식이 틀린 항목은 빠진다 (invalidPRRefs 가 따로 알린다). */
 function refSet(entries: string[]): Set<string> {
-  return new Set(entries.map((s) => s.trim().toLowerCase()));
+  const out = new Set<string>();
+  for (const e of entries) {
+    const key = parsePRRef(e);
+    if (key) out.add(key);
+  }
+  return out;
 }
 
 /**
@@ -332,7 +358,7 @@ export function invalidPRRefs(filters?: WatchFilters): string[] {
   const bad: string[] = [];
   for (const field of ['skip', 'only'] as const) {
     for (const entry of filters?.[field] ?? []) {
-      if (!PR_REF.test(entry.trim())) bad.push(`${field}: "${entry}"`);
+      if (parsePRRef(entry) === null) bad.push(`${field}: "${entry}"`);
     }
   }
   return bad;

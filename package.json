@@ -26,7 +26,8 @@
     "review": "tsx src/cli.ts review",
     "watch": "tsx src/cli.ts watch",
     "status": "tsx src/cli.ts status",
-    "smoke": "tsx scripts/smoke-machine.ts"
+    "smoke": "tsx scripts/smoke-machine.ts",
+    "notify": "node scripts/notify.mjs"
   },
   "dependencies": {
     "chalk": "^5.4.1",

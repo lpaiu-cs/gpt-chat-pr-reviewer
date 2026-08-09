@@ -27,6 +27,7 @@ import {
   admitsNewPR,
   globToRegExp,
   invalidPRRefs,
+  parsePRRef,
   matchesScope,
   nextRepoCache,
   passesFilters,
@@ -706,6 +707,45 @@ const fakePR: PRInfo = {
     '여백만 있는 차이는 오류가 아니다 (판정과 같은 기준)',
   );
   assert(invalidPRRefs({ only: ['owner/repo'] }).length === 1, 'only 도 형식을 검사한다');
+
+  // ── 리뷰 지적 [P2]: 검증과 대조가 갈라지면 검증이 무의미해진다 ──
+  // 예전 정규식은 아래 셋을 정상으로 통과시켰는데, prKey 는 그런 키를 만들지
+  // 않으므로 절대 매치되지 않았다. skip 이면 제외한 줄 알았던 PR 이 리뷰된다.
+  assert(
+    invalidPRRefs({ skip: ['owner/repo/extra#12'] }).length === 1,
+    '레포 이름에 슬래시가 든 참조는 형식 오류 (매치될 수 없다)',
+  );
+  assert(
+    invalidPRRefs({ skip: ['owner/repo#0'] }).length === 1,
+    'PR 번호 0 은 형식 오류 (1부터 시작한다)',
+  );
+  assert(parsePRRef('owner/repo/extra#12') === null, 'parsePRRef: 슬래시 낀 레포 거부');
+  assert(parsePRRef('owner/repo#0') === null, 'parsePRRef: 0번 거부');
+  assert(parsePRRef('owner/repo#-1') === null, 'parsePRRef: 음수 거부');
+  assert(parsePRRef('owner/repo#1e3') === null, 'parsePRRef: 지수 표기 거부');
+
+  // 선행 0 은 사람이 적은 표기 차이일 뿐이므로 같은 키로 접는다.
+  assert(parsePRRef('Owner/Repo#007') === 'owner/repo#7', 'parsePRRef: 선행 0 과 대소문자 정규화');
+  assert(invalidPRRefs({ skip: ['owner/repo#007'] }).length === 0, '선행 0 은 오류가 아니다');
+  assert(
+    !passesFilters(pr({ owner: 'lpaiu-cs', repo: 'osk-system', number: 7 }), {
+      skip: ['lpaiu-cs/osk-system#007'],
+    }).ok,
+    '#007 로 적어도 7번 PR 이 실제로 제외된다 (검증 통과 = 대조 성립)',
+  );
+
+  // 불변식: 형식 검증을 통과한 참조는 반드시 어떤 PR 과 대조될 수 있어야 한다.
+  const probes = ['owner/repo#12', ' Owner/Repo#007 ', 'a-b.c/d_e#1'];
+  assert(
+    probes.every((p) => {
+      const key = parsePRRef(p);
+      if (!key) return false;
+      const [slug, num] = key.split('#');
+      const [owner, repo] = slug.split('/');
+      return !passesFilters(pr({ owner, repo, number: Number(num) }), { skip: [p] }).ok;
+    }),
+    '통과한 참조는 예외 없이 실제 매치로 이어진다',
+  );
   assert(
     invalidPRRefs({ skip: ['bad1'], only: ['bad2'] }).join(' ') === 'skip: "bad1" only: "bad2"',
     '어느 목록의 어떤 항목이 틀렸는지 알려준다',

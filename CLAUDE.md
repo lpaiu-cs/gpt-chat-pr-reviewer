@@ -36,6 +36,7 @@ src/
 scripts/
   smoke-machine.ts  — 상태 머신 스모크 테스트 (npm run smoke)
   copy-ui.mjs       — app.html 을 dist 로 복사 (tsc 는 .html 을 안 옮긴다)
+  notify.mjs        — 대시보드 SSE 구독 → 리뷰 게시 알림 (의존성 없음, node 로 직접 실행)
 ```
 
 ## 상태 머신
@@ -98,6 +99,12 @@ read-modify-write 를 붙잡으므로, 다른 읽기·쓰기 경로가 끼어들
 
 **읽기 전용이다.** 제어(지금 리뷰·일시정지·지침 편집)는 아직 없다. 넣을 때는 POST 가
 상태를 직접 건드리지 말고 의도 큐에 넣어 루프가 안전한 지점에서 소비해야 한다.
+
+`scripts/notify.mjs` 가 이 SSE 의 첫 소비자다. **상태 파일을 읽지 않고 SSE 만 구독하므로
+별도 프로세스로 띄워도 안전하다** — 대시보드를 만들 때 세운 규칙이 그대로 배당금이 됐다.
+전이 판정은 `active.phase` 가 아니라 **컨텍스트 카드의 state** 로 한다: `endReview` 직후
+스냅샷의 카드는 아직 라운드 이전 값이고 결과는 다음 publish 에 실리는데, 카드만 보면 그
+타이밍을 신경 쓸 필요가 없다.
 
 ## 핵심 흐름
 
@@ -164,6 +171,7 @@ npm run dev -- watch [--once|--headless|--observe|--ui|--ui-port <port>]
 npm run dev -- queue [--json]   # 리뷰 대기열
 npm run dev -- status [pr] [--json]
 npm run dev -- graph [pr]   # mermaid 다이어그램
+npm run notify       # 대시보드 이벤트 알림 (watch --ui 가 떠 있어야 한다)
 ```
 
 ## 설정
