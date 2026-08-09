@@ -20,6 +20,7 @@ import {
   reconcileCachedOrigin,
   countTurn,
   buildPreviousBlock,
+  judgeReclaimHead,
 } from '../src/reviewer.js';
 import { parseConversationUrl, findRoundBaseline } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
@@ -423,12 +424,17 @@ const fakePR: PRInfo = {
   assert(pl.action === 'resume' && pl.turnsUsed === 0, '구버전 컨텍스트는 이번 라운드가 첫 사용');
 
   // 해제
+  tracked.pendingSend = { round: 2, headSha: 'aaa' };
   releaseConversation(tracked);
   assert(
     tracked.conversationUrl === undefined &&
       tracked.conversationStartRound === undefined &&
       tracked.conversationTurns === undefined,
     'releaseConversation 이 대화 참조를 지운다',
+  );
+  assert(
+    tracked.pendingSend === undefined,
+    '대기 기록은 그 대화 안의 질문을 가리키므로 함께 버린다',
   );
   assert(
     planConversation(cfg, tracked, 5).action === 'new',
@@ -1017,6 +1023,28 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 35: 회수 전 head 검증 ─────────────────────────
+
+{
+  // 대화 + 라운드 번호만으로 회수하면, 죽어 있는 동안 들어온 커밋을 못 본다.
+  // 낡은 head 를 보고 만든 답을 게시한 뒤 **현재** head 를 검토 완료로 적으면
+  // 한 번도 보지 않은 커밋이 approve 하나로 CONVERGED 가 된다.
+  const c = createContext(fakePR);
+
+  assert(judgeReclaimHead(c, 2, 'A') === 'no-record', '전송 기록이 없으면 회수하지 않는다');
+
+  c.pendingSend = { round: 2, headSha: 'A' };
+  assert(judgeReclaimHead(c, 3, 'A') === 'no-record', '다른 라운드의 기록은 쓰지 않는다');
+  assert(judgeReclaimHead(c, 2, 'A') === 'ok', '같은 라운드 · 같은 head 면 회수한다');
+  assert(judgeReclaimHead(c, 2, 'B') === 'moved', 'head 가 달라졌으면 다시 묻는다');
+
+  // 판별 불가는 전부 "다시 묻기" 로 떨어진다. 다시 묻는 비용은 대화 1회지만
+  // 잘못 회수하면 리뷰를 통째로 건너뛴다 — 방향이 다르다.
+  assert(judgeReclaimHead(c, 2, null) === 'unknown-current', '현재 head 를 모르면 다시 묻는다');
+  c.pendingSend = { round: 2, headSha: null };
+  assert(judgeReclaimHead(c, 2, 'A') === 'unknown-sent', '질문 당시 head 를 모르면 다시 묻는다');
 }
 
 // ── 시나리오 34: 대화에서 라운드 기준점 찾기 ───────────────

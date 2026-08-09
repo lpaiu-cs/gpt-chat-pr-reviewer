@@ -138,6 +138,18 @@ export interface PRContext {
    */
   conversationTurns?: number;
   /**
+   * **응답을 기다리는 중인 전송** — 어느 라운드를, 어느 head SHA 를 보고 물었는지.
+   *
+   * 대기 구간이 2~15분이라 그 사이에 죽으면 질문만 대화에 남는다. 재시작 후 그
+   * 응답을 회수(reclaim)하려면 "이 답이 지금 코드에 대한 답인가" 를 알아야 한다.
+   * 대화 + 라운드 번호만으로는 알 수 없다 — 죽어 있는 동안 작성자가 push 하면
+   * 낡은 head 를 보고 만든 답을 회수하고, 게시 후에는 **현재** head 를
+   * `headShaAtLastReview` 로 적어버려 검토한 적 없는 커밋이 CONVERGED 가 된다.
+   *
+   * 응답을 확보하면 지운다. 없거나 head 가 달라졌으면 회수하지 않고 다시 묻는다.
+   */
+  pendingSend?: { round: number; headSha: string | null };
+  /**
    * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).
    * 관측된 GitHub 현황을 캐시한 것일 뿐 상태가 아니다 — 필터를 통과하면 지워진다.
    * 이게 없으면 `queue` 명령이 watch 가 실제로 돌리지 않을 PR 까지 보여준다.
