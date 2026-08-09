@@ -9,7 +9,12 @@ import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/m
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
-import { ghErrorMessage, THREAD_ALIAS_CHUNK, type PRProbe } from '../src/github.js';
+import {
+  ghErrorMessage,
+  buildReviewPayload,
+  THREAD_ALIAS_CHUNK,
+  type PRProbe,
+} from '../src/github.js';
 import {
   roundMarker,
   syncPRFromProbe,
@@ -194,6 +199,19 @@ const fakePR: PRInfo = {
     '타인 PR: request_changes 유지',
   );
   assert(resolveEvent('approve', false).event === 'APPROVE', '타인 PR: approve 유지');
+
+  // 리뷰 지적 [P1]: commit_id 를 빼면 GitHub 이 **게시 시점의 최신 커밋**에 리뷰를
+  // 붙인다. 대기하는 2~15분 사이에 push 가 들어오면 모델이 본 적 없는 커밋에
+  // APPROVE 가 직접 달려 branch protection 승인 조건까지 만족시킨다.
+  const c1 = [{ path: 'src/a.ts', line: 3, body: '지적' }];
+  const pinned = JSON.parse(buildReviewPayload('본문', 'approve', c1, 'abc123'));
+  assert(pinned.commit_id === 'abc123', '검토한 커밋에 리뷰를 고정한다');
+  assert(pinned.event === 'APPROVE', 'event 는 대문자로 정규화된다');
+  assert(pinned.comments.length === 1, '인라인 코멘트가 실린다');
+
+  const loose = JSON.parse(buildReviewPayload('본문', 'COMMENT', [], null));
+  assert(!('commit_id' in loose), '커밋을 모르면 넣지 않는다 (기존 동작)');
+  assert(!('comments' in loose), '코멘트가 없으면 빈 배열을 보내지 않는다');
 }
 
 // ── 시나리오 8: gh 오류 메시지 추출 ────────────────────────

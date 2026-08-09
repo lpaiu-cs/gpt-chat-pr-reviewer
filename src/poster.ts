@@ -10,6 +10,8 @@ import chalk from 'chalk';
 import type { ReviewResult, DiffHunk, ReviewComment } from './types.js';
 import {
   fetchDiff,
+  fetchDiffAt,
+  getPRInfo,
   parseDiffHunks,
   postReview,
   postSimpleReview,
@@ -52,6 +54,32 @@ export interface PostOptions {
   dryRun?: boolean;
   /** PR 작성자 == 리뷰 계정 인지 여부 */
   isSelfReview?: boolean;
+  /**
+   * **모델이 실제로 검토한 커밋.** 리뷰를 여기에 고정한다.
+   *
+   * 빼면 GitHub 이 게시 시점의 최신 커밋에 리뷰를 붙인다 — 응답을 기다리는 2~15분
+   * 사이에 push 가 들어오면 본 적 없는 커밋에 APPROVE 가 직접 달린다. 라인 검증에
+   * 쓰는 diff 도 같은 커밋 기준이어야 한다 (아니면 고정한 커밋에 없는 라인에
+   * 코멘트를 달아 422 가 난다).
+   */
+  commitId?: string | null;
+}
+
+/** 게시 대상 커밋과 **같은 기준**의 diff 를 가져온다. */
+function diffForPost(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  commitId: string | null | undefined,
+): string {
+  if (commitId) {
+    try {
+      return fetchDiffAt(owner, repo, getPRInfo(owner, repo, prNumber).baseBranch, commitId);
+    } catch {
+      console.log(chalk.dim('  검토 커밋 기준 diff 를 가져오지 못해 현재 diff 로 검증합니다.'));
+    }
+  }
+  return fetchDiff(owner, repo, prNumber);
 }
 
 export async function postReviewToGitHub(
@@ -61,12 +89,12 @@ export async function postReviewToGitHub(
   review: ReviewResult,
   opts: PostOptions = {},
 ): Promise<void> {
-  const { dryRun = false, isSelfReview = false } = opts;
+  const { dryRun = false, isSelfReview = false, commitId = null } = opts;
 
   // ── diff 로 유효 라인 확인 ──
   let hunks: DiffHunk[] = [];
   try {
-    hunks = parseDiffHunks(fetchDiff(owner, repo, prNumber));
+    hunks = parseDiffHunks(diffForPost(owner, repo, prNumber, commitId));
   } catch {
     console.log(chalk.yellow('  diff 를 가져올 수 없어 모든 코멘트를 본문에 포함합니다.'));
   }
@@ -102,6 +130,7 @@ export async function postReviewToGitHub(
   if (dryRun) {
     console.log(chalk.cyan('\n  [DRY RUN] 게시 예정 리뷰:'));
     console.log(chalk.dim(`  Event: ${event}${downgraded ? ' (셀프 리뷰로 하향)' : ''}`));
+    if (commitId) console.log(chalk.dim(`  대상 커밋: ${commitId}`));
     console.log(chalk.dim(`  인라인 코멘트: ${valid.length}개`));
     console.log(chalk.dim(`  본문 포함 코멘트: ${invalid.length}개`));
     console.log(chalk.dim(`  ---\n${body}\n  ---`));
@@ -114,9 +143,9 @@ export async function postReviewToGitHub(
   // ── 게시 ──
   try {
     if (valid.length > 0) {
-      postReview(owner, repo, prNumber, body, event, valid);
+      postReview(owner, repo, prNumber, body, event, valid, commitId);
     } else {
-      postSimpleReview(owner, repo, prNumber, body, event);
+      postSimpleReview(owner, repo, prNumber, body, event, commitId);
     }
     console.log(
       chalk.green(`  ✓ 리뷰 게시 완료 (인라인 ${valid.length}개 · 본문 ${invalid.length}개)`),
@@ -133,7 +162,7 @@ export async function postReviewToGitHub(
     [...valid, ...invalid].map((c) => `\n- **\`${c.path}:${c.line}\`** — ${c.body}`).join('');
 
   try {
-    postSimpleReview(owner, repo, prNumber, allBody, event);
+    postSimpleReview(owner, repo, prNumber, allBody, event, commitId);
     console.log(chalk.green('  ✓ 리뷰 게시 완료 (본문 포함)'));
     return;
   } catch (err) {
@@ -141,7 +170,7 @@ export async function postReviewToGitHub(
     // 이벤트 자체가 거부된 경우 COMMENT 로 한 번 더 시도
     if (event !== 'COMMENT' && /own pull request|event/i.test(msg)) {
       console.log(chalk.yellow(`  ⚠ ${msg} — COMMENT 로 재시도`));
-      postSimpleReview(owner, repo, prNumber, allBody, 'COMMENT');
+      postSimpleReview(owner, repo, prNumber, allBody, 'COMMENT', commitId);
       console.log(chalk.green('  ✓ 리뷰 게시 완료 (COMMENT 로 하향)'));
       return;
     }

@@ -96,6 +96,12 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 아니다). 대기하는 2~15분 사이의 push 가 "검토함" 으로 삼켜지면 안 된다 — 검토한
 head 를 적어두면 그 push 는 다음 sync 에서 새 커밋으로 잡혀 라운드가 한 번 더 돈다.
 
+내부 기록만으로는 부족하다. **게시하는 리뷰도 검토한 커밋에 고정한다**(`commit_id`).
+빼면 GitHub 이 게시 시점의 최신 커밋에 리뷰를 붙여, 본 적 없는 커밋에 APPROVE 가
+직접 달리고 branch protection 승인 조건까지 만족시킨다. 라인 검증에 쓰는 diff 도
+같은 커밋 기준이어야 한다 (`fetchDiffAt` — 3-dot 이라 PR diff 와 merge-base 가 같다).
+`gh pr diff` 는 언제나 현재 head 를 준다.
+
 ## 리뷰 큐
 
 리뷰 대기열은 `REVIEW_DUE` 인 컨텍스트에서 매번 파생하며 저장하지 않는다 (`queue.ts`).

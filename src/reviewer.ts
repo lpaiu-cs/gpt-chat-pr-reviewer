@@ -768,8 +768,11 @@ export async function runRound(
     console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
 
     progress.phase('posting');
+    // 검토한 커밋에 고정한다. 빼면 GitHub 이 게시 시점의 최신 커밋에 리뷰를 붙여,
+    // 대기하는 2~15분 사이의 push 에 **본 적 없는 APPROVE** 가 직접 달린다.
     await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
       isSelfReview: resolveSelfReview(ctx),
+      commitId: reviewedHeadSha,
     });
 
     // 게시 직후 head SHA · 새 스레드 동기화
