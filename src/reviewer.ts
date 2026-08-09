@@ -511,6 +511,51 @@ export interface RunRoundOptions {
  * 새로 받은 응답은 즉시 저장해, 게시 실패 시 대화 한도를 다시 쓰지 않고
  * --from-cache 로 재시도할 수 있게 한다.
  */
+/**
+ * 이번 라운드 질문이 저장된 대화에 이미 있으면, 다시 묻지 않고 그 응답을 회수한다.
+ *
+ * 응답 대기는 2~15분이다. 그 사이에 죽으면 질문은 대화에 남았는데 우리는 응답을
+ * 못 받은 상태다. 그대로 다시 보내면 같은 질문이 한 번 더 들어가 대화 한도를 버린다.
+ *
+ * 회수하지 않는 경우(전부 null → 평소 경로로 다시 묻는다):
+ *  - dry-run          저장된 대화를 건드리지 않는 것이 목적이다
+ *  - 마커 없음         템플릿에 {{round}} 가 없어 라운드를 식별할 수 없다
+ *  - 이미 응답을 받아봄  받고도 실패했다는 뜻이라 같은 답을 다시 써도 결과가 같다
+ *  - 복귀 실패          대화가 삭제·이동됐다
+ *  - 그 라운드가 마지막 질문이 아님  어느 응답이 그 라운드 것인지 단정할 수 없다
+ */
+async function reclaimRound(
+  cfg: AppConfig,
+  driver: ChatGPTDriver,
+  ctx: PRContext,
+  round: number,
+  opts: RunRoundOptions,
+): Promise<string | null> {
+  if (opts.dryRun) return null;
+  const url = ctx.conversationUrl;
+  if (!url) return null;
+
+  const marker = roundMarker(cfg, round);
+  if (!marker) return null;
+  if (hasResponseForRound(cfg, ctx, round)) return null;
+
+  // 재전송하지 않으므로 어시스턴트 메시지가 없어도 된다 — 응답 전에 죽은 대화가
+  // 정확히 그 모습이고, 여기서 실패로 보면 이 복구가 통째로 무의미해진다.
+  if (!(await driver.resumeChat(url, { requireAssistant: false }))) return null;
+
+  const baseline = await driver.findRound(marker);
+  if (baseline === null) return null;
+
+  console.log(chalk.dim('  이 라운드 질문이 대화에 이미 있습니다 — 재질문 없이 응답만 회수합니다.'));
+  progress.phase('waiting');
+  // 기준점을 findRound 가 준 값으로 넘긴다. 완료 판정(스트리밍 종료 + 안정)은
+  // collectResponse 가 하므로, 이미 와 있는 답이면 즉시, 생성 중이면 끝까지 기다린다.
+  const raw = await driver.collectFrom(baseline);
+  const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl: url });
+  console.log(chalk.dim(`  응답 저장: ${saved}`));
+  return raw;
+}
+
 async function obtainRaw(
   cfg: AppConfig,
   driver: ChatGPTDriver | null,
@@ -535,44 +580,17 @@ async function obtainRaw(
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
+
+  // ── 이미 보낸 라운드 회수 ──
+  // **enterConversation 보다 먼저** 해야 한다. 회전 판정이나 복귀 실패가 저장된
+  // 대화를 놓아버리면 확인할 기회 자체가 사라진다. 특히 응답 대기 중에 죽으면
+  // countTurn 때문에 회전 조건이 이미 충족돼 있어, 그대로 두면 매번 새 대화에
+  // 같은 질문을 다시 보낸다.
+  const reclaimed = await reclaimRound(cfg, driver, ctx, round, opts);
+  if (reclaimed !== null) return reclaimed;
+
   const continued = await enterConversation(cfg, driver, ctx, round, opts);
   const prompt = buildPrompt(cfg, ctx, round, instructions, continued);
-
-  // ── 이미 물어본 라운드인가 ──
-  //
-  // 응답 대기는 2~15분이다. 그 사이에 프로세스가 죽으면 질문은 대화에 남아 있는데
-  // 우리 쪽 기록은 없다. 그대로 다시 보내면 **같은 질문이 한 번 더** 들어가고 대화
-  // 한도를 그냥 버린다 (실제로 여러 번 발생했다).
-  //
-  // 이어가는 대화일 때만 본다. 새 대화에는 애초에 있을 수 없다.
-  const marker = continued ? roundMarker(cfg, round) : null;
-  if (marker) {
-    const found = await driver.inspectRound(marker);
-    // 이 라운드의 응답을 이미 받아본 적이 있으면 대화에 남은 답을 재사용하지 않는다.
-    // 받고도 실패했다는 뜻이라(파싱 실패·ACCESS_FAILED 등) 같은 답을 다시 써도
-    // 같은 결과다 — 그때는 다시 묻는 게 맞다. 안 그러면 재시도가 무의미해진다.
-    const seenBefore = hasResponseForRound(cfg, ctx, round);
-    if (found.state === 'answered' && found.text && !seenBefore) {
-      console.log(chalk.dim(`  이 라운드 질문의 응답이 대화에 이미 있습니다 — 재질문하지 않습니다.`));
-      const saved = saveResponse(cfg, ctx, round, found.text, {
-        conversationUrl: ctx.conversationUrl,
-        dryRun: opts.dryRun,
-      });
-      console.log(chalk.dim(`  응답 저장: ${saved}`));
-      return found.text;
-    }
-    if (found.state === 'pending') {
-      console.log(chalk.dim('  이 라운드 질문은 이미 전송돼 있습니다 — 응답만 기다립니다.'));
-      progress.phase('prompt');
-      const raw = await driver.collectPending();
-      const saved = saveResponse(cfg, ctx, round, raw, {
-        conversationUrl: ctx.conversationUrl,
-        dryRun: opts.dryRun,
-      });
-      console.log(chalk.dim(`  응답 저장: ${saved}`));
-      return raw;
-    }
-  }
 
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.

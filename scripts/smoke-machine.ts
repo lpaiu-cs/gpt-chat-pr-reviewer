@@ -21,7 +21,7 @@ import {
   countTurn,
   buildPreviousBlock,
 } from '../src/reviewer.js';
-import { parseConversationUrl, classifyRound } from '../src/chatgpt.js';
+import { parseConversationUrl, findRoundBaseline } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
@@ -1019,56 +1019,44 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
 }
 
-// ── 시나리오 34: 대화에서 라운드 상태 판정 ────────────────
+// ── 시나리오 34: 대화에서 라운드 기준점 찾기 ───────────────
 
 {
   const M = '리뷰 라운드: 3차';
   const u = (t: string) => ({ role: 'user', text: t });
   const a = (t: string) => ({ role: 'assistant', text: t });
 
-  assert(classifyRound([], M).state === 'absent', '빈 대화는 absent');
+  assert(findRoundBaseline([], M) === null, '빈 대화는 null');
+  assert(findRoundBaseline([u('리뷰 라운드: 2차'), a('r2')], M) === null, '다른 라운드만 있으면 null');
+
+  // 응답 대기 중 죽은 경우 — 질문만 있다
+  assert(findRoundBaseline([u(M)], M) === 0, '첫 질문이면 기준점 0');
   assert(
-    classifyRound([u('리뷰 라운드: 2차'), a('...')], M).state === 'absent',
-    '다른 라운드만 있으면 absent (새로 물어야 한다)',
+    findRoundBaseline([u('리뷰 라운드: 2차'), a('r2'), u(M)], M) === 1,
+    '앞선 응답 1건이 있으면 기준점 1',
   );
 
-  // 응답 대기 중에 죽은 경우 — 질문만 있고 답이 없다
+  // **기준점은 대상 노드를 포함하지 않아야 한다.** 포함하면 collectResponse 가
+  // 오지 않을 다음 메시지를 기다리다 60초 뒤 실패한다.
   assert(
-    classifyRound([u('리뷰 라운드: 2차'), a('r2'), u(M)], M).state === 'pending',
-    '질문만 있으면 pending (재질문 없이 기다린다)',
+    findRoundBaseline([u('리뷰 라운드: 2차'), a('r2'), u(M), a('생성 중…')], M) === 1,
+    '대상 응답이 이미 떠 있어도 기준점은 그대로 1 (다시 세면 안 된다)',
   );
 
-  // 답까지 나온 경우
-  const done = classifyRound([u(M), a('r3 응답')], M);
-  assert(done.state === 'answered' && done.text === 'r3 응답', '답이 있으면 answered + 본문');
-
-  // **뒤에 다음 라운드가 이어지는 경우** — 그 라운드 답만 집어야 한다.
-  // (픽스처 검증에서 잡힌 버그: 마지막 답을 집으면 3차 응답이 2차 것으로 나온다)
-  const M2 = '리뷰 라운드: 2차';
-  const chain = [u(M2), a('2차 답'), u(M), a('3차 답')];
+  // 뒤에 다른 질문이 이어지면 어느 응답이 그 라운드 것인지 단정할 수 없다
   assert(
-    classifyRound(chain, M2).text === '2차 답',
-    '뒤에 다음 라운드가 있어도 그 질문 바로 다음 답을 쓴다',
+    findRoundBaseline([u(M), a('r3'), u('리뷰 라운드: 4차')], M) === null,
+    '그 라운드가 마지막 질문이 아니면 null (평소 경로로 다시 묻는다)',
   );
-  assert(classifyRound(chain, M).text === '3차 답', '마지막 라운드도 정확히 집는다');
-
-  // 이 버그가 만들어낸 상태 — 같은 라운드를 두 번 물어본 대화
-  const dup = classifyRound([u(M), a('낡은 답'), u(M), a('최신 답')], M);
-  assert(dup.state === 'answered' && dup.text === '최신 답', '중복 질문 대화에서는 나중 질문의 답을 쓴다');
   assert(
-    classifyRound([u(M), a('낡은 답'), u(M)], M).state === 'pending',
-    '중복 질문 후 답이 아직이면 pending (앞의 낡은 답을 쓰면 안 된다)',
+    findRoundBaseline([u(M), a('r3'), u('리뷰 라운드: 4차')], '리뷰 라운드: 4차') === 1,
+    '마지막 질문이면 그 기준점을 준다',
   );
 
-  // 빈 어시스턴트 메시지(렌더 직후 껍데기)는 답으로 세지 않는다
+  // 같은 라운드를 두 번 물어본 대화(이 버그가 만들어낸 상태)
   assert(
-    classifyRound([u(M), a('   ')], M).state === 'pending',
-    '공백뿐인 응답은 아직 답이 아니다',
-  );
-  // 질문 앞의 답은 그 라운드 것이 아니다
-  assert(
-    classifyRound([a('이전 라운드 답'), u(M)], M).state === 'pending',
-    '질문보다 앞선 답은 세지 않는다',
+    findRoundBaseline([u(M), a('낡은 답'), u(M)], M) === 1,
+    '중복 질문이면 나중 질문 기준으로 센다',
   );
 }
 
