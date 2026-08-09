@@ -566,6 +566,10 @@ program
     let lastRemaining = -1; // 마지막 probe 가 보고한 GraphQL 잔여 한도
     let lastCycleCost = 0; // 직전 사이클이 실제로 쓴 GraphQL point 합계
     let watchedRepos = 0; // 마지막 스캔에서 실제로 폴링한 레포 수
+    /** 레포별 마지막 probe 시각 — resolve 를 기다리지 않는 레포를 늦추는 기준. */
+    const lastProbeAt = new Map<string, number>();
+    /** 레포별 마지막으로 관측한 열린 PR 수 — probe 를 건너뛴 주기의 표시용. */
+    const lastOpenAt = new Map<string, number>();
 
     // 쿼터 쿨다운. 큐를 버리지 않고 이 시각까지 실행만 멈춘다.
     // watch 를 재시작해도 컨텍스트에서 복원되도록 시작 시 한 번 읽어둔다.
@@ -814,6 +818,9 @@ program
      */
     const scan = (): { eligible: PRContext[]; openCount: number; seen: PRContext[] } => {
       progress.cycle({ scanning: true });
+      // 한 스캔 안에서는 같은 시각을 쓴다 — 레포마다 now 가 달라지면 주기 판정이
+      // 미세하게 어긋나 어떤 레포는 매번 한 박자씩 밀린다.
+      const now = Date.now();
       const discovered = repoSource.list();
       const all = listContexts(cfg);
 
@@ -830,8 +837,8 @@ program
       );
 
       const repos = [...discovered, ...lingering];
-      watchedRepos = repos.length;
       const eligible: PRContext[] = [];
+      let probedRepos = 0;
       // 이번 스캔이 실제로 손댄 컨텍스트. 대시보드는 이걸 그대로 보여준다.
       // listContexts 를 다시 읽지 않는 이유: 여기서 ctx.title·excludedReason 을
       // 이벤트 없이 갱신하는 경로가 있어 디스크가 아직 최신이 아닐 수 있다.
@@ -850,6 +857,29 @@ program
           .filter((c) => c.state === 'AWAITING_AUTHOR')
           .map((c) => c.prNumber);
 
+        // ── probe 주기 판정 ──
+        //
+        // probe 는 **레포당** 1 point 라 비용이 레포 수에 선형 비례한다 (실측: PR
+        // 개수·alias 와 무관하게 항상 1). 레포 20개면 10초 주기가 시간당 7,200 point
+        // 로 한도를 넘는다.
+        //
+        // 그런데 10초가 정말 필요한 건 `AWAITING_AUTHOR` 레포뿐이다 — 작성자가 방금
+        // 응답했고 사람이 결과를 기다리는 상태다. 나머지에서 probe 가 잡는 것(새 PR ·
+        // 새 커밋 · 닫힘)은 몇십 초 늦어도 무해하다. 라운드 자체가 2~15분이다.
+        const hot = needThreads.length > 0;
+        const since = now - (lastProbeAt.get(repoSlug) ?? 0);
+        if (!hot && since < cfg.probeIdleIntervalMs) {
+          // GitHub 을 부르지 않을 뿐, **이미 아는 컨텍스트는 그대로 큐에 남긴다.**
+          // 여기서 빼면 REVIEW_DUE PR 이 건너뛴 주기마다 큐에서 사라져 리뷰 시작이
+          // 들쭉날쭉해진다. 새 정보가 없을 뿐 판정이 바뀐 게 아니다.
+          openCount += lastOpenAt.get(repoSlug) ?? tracked.length;
+          for (const c of tracked) {
+            seen.push(c);
+            if (!c.excludedReason) eligible.push(c);
+          }
+          continue;
+        }
+
         let probe;
         try {
           probe = fetchRepoProbe(repoSlug, needThreads);
@@ -857,6 +887,9 @@ program
           console.log(chalk.yellow(`  ⚠ ${repoSlug} probe 실패 — 건너뜁니다.`));
           continue;
         }
+        lastProbeAt.set(repoSlug, now);
+        lastOpenAt.set(repoSlug, probe.prs.length);
+        probedRepos++;
         openCount += probe.prs.length;
         // 잔여 한도는 사이클 끝에서 takeGraphQLUsage() 로 한 번에 읽는다.
         // probe 시점 값을 쓰면 폴백 동기화 이전 상태라 과대평가된다.
@@ -917,6 +950,9 @@ program
         }
       }
 
+      // 실제로 GitHub 을 부른 레포 수. nextDelay 의 비용 추정과 대시보드 표시가
+      // 둘 다 이 값을 봐야 "왜 이만큼 썼는지" 가 맞는다.
+      watchedRepos = probedRepos;
       progress.cycle({ scanning: false, lastScanAt: Date.now() });
       return { eligible, openCount, seen };
     };

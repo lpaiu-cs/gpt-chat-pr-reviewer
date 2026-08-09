@@ -75,6 +75,9 @@ const DEFAULT_CONFIG: AppConfig = {
   maxAutoRetries: 2,
   maxTurnsPerConversation: 5, // 전송마다 diff 가 대화에 쌓이므로 무한 연장은 불가
   watchIntervalMs: 10_000, // 10초 — 스캔 1회 = 레포당 1 point 이므로 부담이 없다
+  // 레포 20개면 10초 주기 probe 가 시간당 7,200 point 로 한도(5,000)를 넘는다.
+  // resolve 를 기다리는 레포만 10초로 두고 나머지는 이 주기로 늦춘다.
+  probeIdleIntervalMs: 60_000,
   watchRepos: [],
   dataDir: './data',
 };
