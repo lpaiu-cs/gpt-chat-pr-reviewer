@@ -97,6 +97,13 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 base 브랜치가 앞으로 나가는 건 대상에 안 들어온다 — 3-dot 은 merge-base 기준이라
 그때 diff 가 바뀌지 않는다. 판별 불가(구버전 기록 포함)는 전부 "다시 묻기" 다.
 
+**게시 직전 대조로는 못 막는다.** 판정과 응답 확보 사이가 2~15분이고, 크래시가
+없는 정상 경로(전송 → 대기 → 게시)에도 같은 창이 있다. 그래서 base 를 상태로
+추적한다 — `baseRefAtLastReview` + `SyncSnapshot.baseRef` 로 `targetChanged` 가
+head 와 같이 판정해, 그 사이의 변경이 다음 sync 에서 `AUTHOR_RESPONDED` /
+`NEW_COMMITS` 로 잡힌다. 구버전 컨텍스트·스냅샷은 값이 없으므로 판정하지 않는다
+(모르는 값으로 전이시키면 매 tick 리뷰가 재개된다).
+
 같은 이유로 `headShaAtLastReview` 에는 **검토한** head 를 적는다 (게시 후 조회값이
 아니다). 대기하는 2~15분 사이의 push 가 "검토함" 으로 삼켜지면 안 된다 — 검토한
 head 를 적어두면 그 push 는 다음 sync 에서 새 커밋으로 잡혀 라운드가 한 번 더 돈다.

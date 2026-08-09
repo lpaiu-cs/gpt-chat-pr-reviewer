@@ -106,6 +106,15 @@ export interface PRContext {
   requestedCount: number;
   /** 마지막 리뷰 시점의 head SHA — 새 커밋 감지 기준 */
   headShaAtLastReview: string | null;
+  /**
+   * 마지막 리뷰 시점의 base ref — **base 변경 감지 기준**.
+   *
+   * 리뷰 대상은 `base...head` 다. base 를 main → release 로 바꾸면 head 가
+   * 그대로여도 다른 코드인데, head 만 추적하면 그 변경이 영영 감지되지 않아
+   * 검토한 적 없는 diff 가 approve 하나로 CONVERGED 에 눌러앉는다.
+   * 구버전 컨텍스트에는 없다 (없으면 판정하지 않는다).
+   */
+  baseRefAtLastReview?: string | null;
   threads: ThreadRecord[];
   /**
    * 이 PR 에서 관측한 **모든** 리뷰 스레드 id (남이 만든 것 포함).

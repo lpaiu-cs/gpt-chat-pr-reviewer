@@ -1075,6 +1075,43 @@ const fakePR: PRInfo = {
   assert(judgeReclaim(c, 2, at('A')) === 'unknown-sent', '구버전 기록(base 없음)은 회수하지 않는다');
 }
 
+// ── 시나리오 36: base 변경도 리뷰 대상 변경이다 ────────────
+
+{
+  // 회수 직전에 한 번 대조하는 것만으로는 못 막는다. 판정과 응답 확보 사이가
+  // 2~15분이고, 정상 경로(전송 → 대기 → 게시)에도 같은 창이 있다. base 를 상태로
+  // 추적해야 그 사이의 변경이 다음 sync 에서 잡힌다.
+  const cfg = loadConfig();
+
+  const conv = createContext(fakePR);
+  fire(conv, 'START_REVIEW');
+  fire(conv, 'POSTED_CLEAN', {
+    patch: { round: 1, headShaAtLastReview: 'A', baseRefAtLastReview: 'main' },
+  });
+  applySyncEvents(cfg, conv, { status: 'OPEN', headSha: 'A', baseRef: 'main' });
+  assert(conv.state === 'CONVERGED', '같은 대상이면 수렴 유지');
+  applySyncEvents(cfg, conv, { status: 'OPEN', headSha: 'A', baseRef: 'release' });
+  assert(conv.state === 'REVIEW_DUE', 'head 가 같아도 base 가 바뀌면 리뷰를 재개한다');
+
+  const waiting = createContext(fakePR);
+  fire(waiting, 'START_REVIEW');
+  fire(waiting, 'POSTED_COMMENTS', {
+    patch: { round: 1, headShaAtLastReview: 'A', baseRefAtLastReview: 'main' },
+  });
+  applySyncEvents(cfg, waiting, { status: 'OPEN', headSha: 'A', baseRef: 'release' });
+  assert(waiting.state === 'REVIEW_DUE', 'AWAITING_AUTHOR 에서도 base 변경은 작성자 응답');
+
+  // 구버전 컨텍스트(base 기록 없음)나 base 를 안 싣는 스냅샷은 판정하지 않는다 —
+  // 모르는 값으로 전이시키면 매 tick 리뷰가 재개된다.
+  const legacy = createContext(fakePR);
+  fire(legacy, 'START_REVIEW');
+  fire(legacy, 'POSTED_CLEAN', { patch: { round: 1, headShaAtLastReview: 'A' } });
+  applySyncEvents(cfg, legacy, { status: 'OPEN', headSha: 'A', baseRef: 'release' });
+  assert(legacy.state === 'CONVERGED', 'base 기록이 없으면 base 로 전이시키지 않는다');
+  applySyncEvents(cfg, legacy, { status: 'OPEN', headSha: 'A' });
+  assert(legacy.state === 'CONVERGED', 'base 를 안 싣는 스냅샷도 그대로 둔다');
+}
+
 // ── 시나리오 34: 대화에서 라운드 기준점 찾기 ───────────────
 
 {

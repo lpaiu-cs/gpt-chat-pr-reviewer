@@ -81,6 +81,12 @@ export function adoptThreads(
 export interface SyncSnapshot {
   status: 'OPEN' | 'CLOSED' | 'MERGED';
   headSha: string;
+  /**
+   * base ref. 리뷰 대상은 커밋 하나가 아니라 `base...head` 라서, base 가 바뀌면
+   * head 가 그대로여도 **다른 코드**다. head 만 보면 그 변경이 영영 감지되지 않아
+   * 검토한 적 없는 diff 가 CONVERGED 로 남는다. 구버전 경로는 없을 수 있다.
+   */
+  baseRef?: string;
 }
 
 /**
@@ -148,27 +154,43 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
     fire(ctx, 'COOLDOWN_ELAPSED', { note: '쿼터 쿨다운 종료' });
   }
 
-  // 5. 작성자 응답 감지 (새 커밋 or 마지막 라운드 스레드 전체 resolve)
+  // 5. 작성자 응답 감지 (리뷰 대상 변경 or 마지막 라운드 스레드 전체 resolve)
   if (ctx.state === 'AWAITING_AUTHOR') {
-    const headChanged =
-      !!ctx.headShaAtLastReview && data.headSha !== ctx.headShaAtLastReview;
+    const moved = targetChanged(ctx, data);
     const lastRound = ctx.threads.filter((t) => t.round === ctx.round);
     const allResolved = lastRound.length > 0 && lastRound.every((t) => t.isResolved);
-    if (headChanged || allResolved) {
-      fire(ctx, 'AUTHOR_RESPONDED', {
-        note: headChanged ? '새 커밋 감지' : '전체 스레드 resolve 확인',
-      });
+    if (moved || allResolved) {
+      fire(ctx, 'AUTHOR_RESPONDED', { note: moved ?? '전체 스레드 resolve 확인' });
     }
   }
 
-  // 6. 수렴 후 새 커밋 → 리뷰 재개
-  if (
-    ctx.state === 'CONVERGED' &&
-    ctx.headShaAtLastReview &&
-    data.headSha !== ctx.headShaAtLastReview
-  ) {
-    fire(ctx, 'NEW_COMMITS', { note: '수렴 후 새 커밋 — 리뷰 재개' });
+  // 6. 수렴 후 리뷰 대상 변경 → 리뷰 재개
+  if (ctx.state === 'CONVERGED') {
+    const moved = targetChanged(ctx, data);
+    if (moved) fire(ctx, 'NEW_COMMITS', { note: `수렴 후 ${moved} — 리뷰 재개` });
   }
+}
+
+/**
+ * 마지막으로 검토한 대상과 달라졌는가 (달라졌으면 사유 문구, 아니면 null).
+ *
+ * **base 도 본다.** 리뷰 대상은 `base...head` 라서 base 를 main → release 로 바꾸면
+ * head 가 그대로여도 다른 코드다. head 만 비교하면 그 변경을 영영 못 잡아, 검토한
+ * 적 없는 diff 가 approve 하나로 CONVERGED 에 눌러앉는다. 대기 구간이 2~15분이라
+ * 게시 직전에 한 번 더 확인하는 것으로는 못 막는다 — 상태로 추적해야 한다.
+ *
+ * base 브랜치가 앞으로 나가는 것(main 에 새 커밋)은 여기 안 들어온다: 3-dot 은
+ * merge-base 기준이라 그때 리뷰 diff 가 바뀌지 않는다.
+ */
+function targetChanged(ctx: PRContext, data: SyncSnapshot): string | null {
+  if (ctx.headShaAtLastReview && data.headSha !== ctx.headShaAtLastReview) {
+    return '새 커밋 감지';
+  }
+  // 구버전 컨텍스트·구버전 스냅샷에는 base 가 없다 — 없으면 판정하지 않는다.
+  if (ctx.baseRefAtLastReview && data.baseRef && data.baseRef !== ctx.baseRefAtLastReview) {
+    return `base 변경 감지 (${ctx.baseRefAtLastReview} → ${data.baseRef})`;
+  }
+  return null;
 }
 
 /**
@@ -199,7 +221,11 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
     }
   }
 
-  applySyncEvents(cfg, ctx, { status: probe.status, headSha: probe.headSha });
+  applySyncEvents(cfg, ctx, {
+    status: probe.status,
+    headSha: probe.headSha,
+    baseRef: probe.baseBranch,
+  });
   saveContext(cfg, ctx);
   return needsFull;
 }
@@ -806,9 +832,11 @@ export async function runRound(
     // approve 였다면 그대로 CONVERGED 가 된다. 검토한 head 를 적으면 그 push 는
     // 다음 sync 에서 새 커밋으로 잡혀 라운드가 한 번 더 돈다.
     let headSha = reviewed.headSha ?? ctx.headShaAtLastReview;
+    let baseRef = reviewed.baseRef ?? ctx.baseRefAtLastReview ?? null;
     try {
       const sync = fetchPRSyncData(ctx.owner, ctx.repo, ctx.prNumber);
       if (!reviewed.headSha) headSha = sync.headSha;
+      if (!reviewed.baseRef) baseRef = sync.baseRef;
       adoptThreads(ctx, sync.threads, getViewerLogin(), round);
     } catch {
       console.log(chalk.yellow('  ⚠ 게시 후 스레드 동기화 실패 — 다음 sync 에서 보정됩니다.'));
@@ -822,6 +850,7 @@ export async function runRound(
         round,
         requestedCount: ctx.requestedCount + n,
         headShaAtLastReview: headSha,
+        baseRefAtLastReview: baseRef,
         retryCount: 0,
         lastError: undefined,
       },

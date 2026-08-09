@@ -113,6 +113,8 @@ export interface SyncThread {
 export interface PRSyncData {
   status: 'OPEN' | 'CLOSED' | 'MERGED';
   headSha: string;
+  /** 리뷰 대상 diff 는 `base...head` 라 base 도 전이 판정의 입력이다 */
+  baseRef: string;
   threads: SyncThread[];
 }
 
@@ -122,6 +124,7 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
     pullRequest(number:$num){
       state
       headRefOid
+      baseRefName
       reviewThreads(first:100){
         nodes{
           id isResolved path line originalLine
@@ -143,6 +146,7 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
   return {
     status: pr.state,
     headSha: pr.headRefOid,
+    baseRef: pr.baseRefName,
     threads: (pr.reviewThreads?.nodes ?? []).map((n: any) => ({
       id: n.id,
       isResolved: n.isResolved,
