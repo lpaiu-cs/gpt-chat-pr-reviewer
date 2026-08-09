@@ -78,10 +78,12 @@ const MESSAGE_ID_ATTR = 'data-message-id';
 const SHRINK_TOLERANCE = 3;
 
 /**
- * 중지 버튼이 남아 있어도 생성 네트워크가 이만큼 조용하면 스트림이 끝난 것으로 본다.
+ * 생성 네트워크가 이만큼 조용하면 (a) 스트림 사망 **후보**로 기록한다.
  *
- * 넉넉히 잡는다. 추론 모드는 화면도 네트워크도 한동안 조용할 수 있고, 잘못 낮추면
- * 정상 응답을 절단한다 — 이슈 #1 이 "근인 확정 전 수정 금지" 를 건 이유가 그것이다.
+ * 판정이 아니라 관측이다. 무트래픽 시간은 종료의 적극적 근거가 못 된다 —
+ * 생성 POST 가 먼저 끝나고 결과가 비동기로 오는 구조라면, 서버가 오래 추론하는
+ * 동안 조용한 게 정상이다. 여기서 종료로 승격하면 부분 응답을 완성본으로
+ * 게시하게 되고, 그건 이슈 #1 이 애초에 경계한 조기 절단이다.
  */
 const STREAM_QUIET_LIMIT_MS = 180_000;
 
@@ -101,25 +103,31 @@ export interface StreamSignals {
 }
 
 /**
- * 정말 생성 중인지 판정한다 (순수 함수 — 이슈 #1).
+ * 정체 구간의 성격을 분류한다 (순수 함수 — 이슈 #1 의 판별 근거).
  *
- * 중지 버튼 하나로 판정하면 "버튼이 안 사라진 상태" 에서 복구 경로(`!streaming`)에
- * 영영 진입하지 못하고 예산을 통째로 태운다. 그렇다고 정체 타임아웃만 넣으면
- * 오래 걸리는 추론을 절단한다. 그래서 **네트워크가 죽었다는 적극적 근거**가 있을
- * 때만 판정을 내린다.
+ * **판정이 아니라 관측이다.** 이 값으로 대기를 끊지 않는다. 이슈가 가려야 한다고
+ * 적어둔 (a)스트림 사망 / (b)셀렉터 오탐 / (c)실제 생성 중을 사후에 구분할 수 있게
+ * 근거를 남기는 것이 목적이다.
  *
- * 추적이 한 번도 안 걸렸으면(`sawGeneration === false`) 근거가 없는 것이므로
- * 버튼을 그대로 믿는다 — 종전 동작이다.
+ * 무트래픽 시간을 종료로 승격하지 않는 이유: 생성 POST 가 먼저 끝나고 결과가
+ * 비동기로 전달되는 구조라면 서버가 오래 추론하는 동안 조용한 게 정상이고,
+ * 그때 끊으면 안정돼 보이는 부분 응답을 완성본으로 게시한다. 정상 응답이 수 분
+ * 걸리는 게 실제 운영 범위다.
  */
-export function judgeStreaming(
+export type StallEvidence =
+  | 'idle' // 중지 버튼이 없다 — 생성 중이 아니다
+  | 'generating' // 생성 요청이 진행 중 — (c) 실제 생성으로 보인다
+  | 'network-quiet' // 버튼은 남았는데 네트워크가 오래 조용 — (a) 후보
+  | 'untracked'; // 생성 요청을 한 번도 못 봄 — 판별 불가
+
+export function classifyStall(
   s: StreamSignals,
   quietLimitMs: number = STREAM_QUIET_LIMIT_MS,
-): { streaming: boolean; downgraded: boolean } {
-  if (!s.button) return { streaming: false, downgraded: false };
-  if (!s.sawGeneration) return { streaming: true, downgraded: false };
-  if (s.inFlight > 0) return { streaming: true, downgraded: false };
-  if (s.quietMs < quietLimitMs) return { streaming: true, downgraded: false };
-  return { streaming: false, downgraded: true };
+): StallEvidence {
+  if (!s.button) return 'idle';
+  if (!s.sawGeneration) return 'untracked';
+  if (s.inFlight > 0) return 'generating';
+  return s.quietMs >= quietLimitMs ? 'network-quiet' : 'generating';
 }
 
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
@@ -774,7 +782,6 @@ export class ChatGPTDriver {
     let lastQuotaCheckAt = Date.now();
     let lastChangeAt = Date.now();
     let lastDumpAt = Date.now();
-    let downgradeLogged = false;
     const t0 = Date.now();
 
     while (Date.now() - t0 < timeout) {
@@ -810,40 +817,39 @@ export class ChatGPTDriver {
       }
       shrinks = 0;
 
-      if (cur.length > 0 && cur === lastText) {
+      // **덮어쓰기 전에** 변경 여부를 잡는다. 아래에서 lastText = cur 을 해버리면
+      // 그 뒤에는 언제나 같아 보여서, 정상 스트리밍도 "변화 없음" 으로 기록된다.
+      const changed = cur !== lastText;
+      if (changed) lastChangeAt = Date.now();
+
+      if (cur.length > 0 && !changed) {
         stable++;
       } else {
         stable = 0;
         lastText = cur;
       }
 
-      const probe = await this.probeStreaming(page);
-      const streaming = probe.streaming;
-      if (probe.downgraded && !downgradeLogged) {
-        downgradeLogged = true;
-        console.log(
-          chalk.yellow(
-            '  ⚠ 중지 버튼은 남아 있지만 생성 네트워크가 조용합니다 — 스트림이 끝난 것으로 봅니다 (이슈 #1).',
-          ),
-        );
-      }
+      // 대기 판정은 **종전 그대로** 중지 버튼만 본다. 네트워크 관측은 근거를
+      // 남기는 용도이고, 무트래픽 시간으로 대기를 끊으면 오래 걸리는 추론의
+      // 부분 응답을 완성본으로 게시하게 된다 (이슈 #1 이 경계한 조기 절단).
+      const streaming = await this.isStreaming(page);
       const phase = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
 
       // ── 정체 진단 (이슈 #1) ──
       // 화면이 멎었는데 계속 "생성 중" 이면, 그 순간의 근거를 남긴다. 재현될 때
       // 사람이 붙어 있지 않아도 (a) 스트림 사망 / (b) 셀렉터 오탐 / (c) 실제 생성
       // 중을 사후에 가릴 수 있어야 한다.
-      if (cur !== '' && cur === lastText) {
-        if (lastChangeAt === 0) lastChangeAt = Date.now();
-      } else {
-        lastChangeAt = Date.now();
-      }
-      if (streaming && Date.now() - lastDumpAt > STALL_DUMP_EVERY_MS && Date.now() - lastChangeAt > STALL_DUMP_EVERY_MS) {
+      const stalledMs = Date.now() - lastChangeAt;
+      if (
+        streaming &&
+        stalledMs > STALL_DUMP_EVERY_MS &&
+        Date.now() - lastDumpAt > STALL_DUMP_EVERY_MS
+      ) {
         lastDumpAt = Date.now();
         const quiet = this.lastNetAt ? Math.round((Date.now() - this.lastNetAt) / 1000) : -1;
         console.log(
           chalk.yellow(
-            `  ⚠ ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 화면 변화 없음 · ` +
+            `  ⚠ ${Math.round(stalledMs / 1000)}초째 화면 변화 없음 · 근거=${this.stallEvidence(true)} · ` +
               `생성요청 ${this.netInFlight}건 진행 · 네트워크 ${quiet}초째 조용 · ` +
               `중지버튼 ${await this.dumpStopButtons(page)}`,
           ),
@@ -939,13 +945,10 @@ export class ChatGPTDriver {
     console.log(chalk.dim('  이전 생성이 끝났습니다 — 전송을 계속합니다.'));
   }
 
-  /**
-   * 지금 정말 생성 중인가 — 버튼 + 네트워크를 함께 본다 (이슈 #1).
-   * `downgraded` 는 "버튼은 남았는데 네트워크가 죽었다" 는 뜻이다.
-   */
-  private async probeStreaming(page: Page): Promise<{ streaming: boolean; downgraded: boolean }> {
-    return judgeStreaming({
-      button: await this.isStreaming(page),
+  /** 정체 구간의 성격 (관측용 — 대기 판정에는 쓰지 않는다). */
+  private stallEvidence(button: boolean): StallEvidence {
+    return classifyStall({
+      button,
       sawGeneration: this.sawGeneration,
       inFlight: this.netInFlight,
       quietMs: this.lastNetAt ? Date.now() - this.lastNetAt : Number.POSITIVE_INFINITY,
