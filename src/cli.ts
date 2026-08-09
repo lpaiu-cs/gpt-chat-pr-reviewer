@@ -141,6 +141,24 @@ function formatDuration(ms: number): string {
 /** `watch --ui` 대시보드 기본 포트. 쓰이고 있으면 서버가 다음 포트로 물러선다. */
 const DEFAULT_UI_PORT = 4478;
 
+/** PR 컨텍스트의 표시용 키. 카드·큐 항목·스캔 로그가 모두 같은 값을 써야 한다. */
+function ctxKey(c: Pick<PRContext, 'owner' | 'repo' | 'prNumber'>): string {
+  return `${c.owner}/${c.repo}#${c.prNumber}`;
+}
+
+/**
+ * "이 PR 에 대해 이미 보고한 것과 같은 상황인가" 를 판정하는 서명.
+ *
+ * 계산하는 쪽(reportIfChanged)과 저장하는 쪽(리뷰 직후 캐시 갱신)이 **반드시 이
+ * 함수를 함께** 써야 한다. 한쪽만 고치면 서명이 영원히 어긋나서, 아무것도 바뀌지
+ * 않았는데 매 스캔마다 같은 PR 을 '변경됨' 으로 다시 찍는다 — 10초 폴링에서는
+ * 그게 곧 로그 도배이고, 그 캐시가 존재하는 이유 자체가 사라진다.
+ * (실제로 excludedReason 을 여기에만 더했다가 그 회귀를 냈다.)
+ */
+function ctxSignature(c: PRContext): string {
+  return `${c.state}:${c.round}:${c.excludedReason ?? ''}`;
+}
+
 /**
  * PRContext · QueueEntry → 대시보드가 쓰는 납작한 뷰 모델.
  *
@@ -149,7 +167,7 @@ const DEFAULT_UI_PORT = 4478;
  */
 function toCard(c: PRContext): ContextCard {
   return {
-    key: `${c.owner}/${c.repo}#${c.prNumber}`,
+    key: ctxKey(c),
     title: c.title,
     url: c.prUrl,
     state: c.state,
@@ -170,7 +188,7 @@ function toCard(c: PRContext): ContextCard {
 
 function toItem(e: QueueEntry): QueueItem {
   return {
-    key: `${e.ctx.owner}/${e.ctx.repo}#${e.ctx.prNumber}`,
+    key: ctxKey(e.ctx),
     title: e.ctx.title,
     url: e.ctx.prUrl,
     round: e.ctx.round,
@@ -491,9 +509,9 @@ program
     let observeNotified = 0;
 
     const reportIfChanged = (ctx: PRContext): void => {
-      const key = `${ctx.owner}/${ctx.repo}#${ctx.prNumber}`;
+      const key = ctxKey(ctx);
       // 제외 사유도 서명에 넣는다 — skip 을 넣거나 뺀 것도 상태 변화로 보고해야 한다.
-      const sig = `${ctx.state}:${ctx.round}:${ctx.excludedReason ?? ''}`;
+      const sig = ctxSignature(ctx);
       if (reported.get(key) === sig) return;
       reported.set(key, sig);
       // REVIEW_DUE 인데 필터에 걸린 PR 을 상태만 찍으면 곧 리뷰될 것처럼 보인다.
@@ -708,7 +726,7 @@ program
             (queue.length > 1 ? chalk.dim(`  대기열 ${i + 1}/${queue.length}`) : ''),
         );
         progress.beginReview({
-          key: `${ctx.owner}/${ctx.repo}#${ctx.prNumber}`,
+          key: ctxKey(ctx),
           title: ctx.title,
           url: ctx.prUrl,
           round: ctx.round + 1,
@@ -723,7 +741,7 @@ program
           // 대시보드가 끝난 리뷰를 영원히 "진행 중" 으로 붙잡고 있게 된다.
           progress.endReview();
         }
-        reported.set(`${ctx.owner}/${ctx.repo}#${ctx.prNumber}`, `${ctx.state}:${ctx.round}`);
+        reported.set(ctxKey(ctx), ctxSignature(ctx));
         reviewRan = true;
         publish(seen, buildQueue(eligible), openCount, quotaUntil);
 
@@ -942,7 +960,7 @@ program
     console.log(chalk.bold(`  대기열 ${entries.length}건`) + chalk.dim('  (위에서부터 처리)'));
     entries.forEach((e, i) => {
       console.log(
-        `  ${String(i + 1).padStart(2)}. ${chalk.bold(`${e.ctx.owner}/${e.ctx.repo}#${e.ctx.prNumber}`)}` +
+        `  ${String(i + 1).padStart(2)}. ${chalk.bold(ctxKey(e.ctx))}` +
           `  ${chalk.cyan(`[${QUEUE_REASON_LABELS[e.reason]}]`)}` +
           `  ${chalk.dim(`대기 ${formatWaiting(e.waitingMs)}`)}`,
       );
