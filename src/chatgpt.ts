@@ -18,6 +18,36 @@ export class QuotaLimitError extends Error {
   }
 }
 
+/** 대화에서 읽어온 메시지 하나 (역할 + 본문). */
+export interface ConversationMessage {
+  role: string;
+  text: string;
+}
+
+/**
+ * 이 대화에서 그 라운드 질문이 **마지막 질문**인지 보고, 맞으면 그 질문 직전까지의
+ * 어시스턴트 메시지 수를 돌려준다 (없으면 null).
+ *
+ * 이 숫자가 응답 수집의 기준점이다. 다시 세면 안 된다 — 대상 응답의 노드가 이미
+ * 만들어져 스트리밍 중이면 그것까지 기준에 포함돼, 오지 않을 **그 다음** 메시지를
+ * 60초 기다리다 실패한다.
+ *
+ * **마지막 질문일 때만** 인정한다. 뒤에 다른 질문이 이어져 있으면 "우리가 묻고
+ * 기다리는 중" 이 아니라 이미 진행된 대화이므로, 어느 응답이 그 라운드 것인지
+ * 단정할 수 없다. 그때는 null 을 돌려 평소 경로(다시 묻기)로 보낸다.
+ */
+export function findRoundBaseline(msgs: ConversationMessage[], marker: string): number | null {
+  let lastUser = -1;
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role === 'user') lastUser = i;
+  }
+  if (lastUser < 0 || !msgs[lastUser].text.includes(marker)) return null;
+  return msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
+}
+
+/** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
+const CONVERSATION_URL_TIMEOUT_MS = 15_000;
+
 /** 스트림이 끊겼을 때 ChatGPT 가 표시하는 안내 문구. */
 const INTERRUPT_PATTERNS: RegExp[] = [
   /connection interrupted/i,
@@ -237,7 +267,7 @@ export class ChatGPTDriver {
    * 루트로 되돌린다. 둘 다 "복귀 실패" 로 취급해야 이전 대화에 이어 쓴 것처럼
    * 착각한 채 엉뚱한 화면에 프롬프트를 넣는 일을 막을 수 있다.
    */
-  async resumeChat(url: string): Promise<boolean> {
+  async resumeChat(url: string, opts: { requireAssistant?: boolean } = {}): Promise<boolean> {
     const p = this.requirePage();
     const want = parseConversationUrl(url);
     if (!want) return false;
@@ -262,6 +292,12 @@ export class ChatGPTDriver {
 
     // 이전 라운드의 응답이 하나도 안 보이면 본문 로드에 실패한 것이다.
     // 그대로 진행하면 sendAndCollect 가 기존 메시지를 새 응답으로 오인한다.
+    //
+    // 다만 **응답이 오기 전에 죽은 대화**는 어시스턴트 메시지가 하나도 없는 게
+    // 정상이다. 그걸 실패로 보면 대화를 놓아버리고 같은 질문을 새 창에 다시 보내게
+    // 된다 — 이 검사가 막으려던 것보다 나쁜 결과다. 재전송하지 않는 경로
+    // (findRound 로 확인만 하는 복구)에서는 이 검사를 건너뛴다.
+    if (opts.requireAssistant === false) return true;
     try {
       await p
         .locator(this.cfg.selectors.assistantMessage)
@@ -285,9 +321,11 @@ export class ChatGPTDriver {
    * 2. 전송 버튼 클릭
    * 3. 어시스턴트 메시지가 안정될 때까지 폴링
    */
-  async sendAndCollect(prompt: string): Promise<string> {
+  async sendAndCollect(
+    prompt: string,
+    onSent?: (conversationUrl: string | null) => void,
+  ): Promise<string> {
     const p = this.requirePage();
-    const sel = this.cfg.selectors;
 
     // ── 기존 어시스턴트 메시지 수 기록 ──
     // 이어가는 대화에서는 지난 응답들이 순차적으로 렌더링되므로, 개수가 멎기 전에
@@ -301,8 +339,88 @@ export class ChatGPTDriver {
     // ── 전송 ──
     await this.clickSend(p);
 
+    // ── 대화 주소 확보 ──
+    // **응답을 기다리기 전에** 알린다. 대기 구간이 2~15분이라 그 사이에 프로세스가
+    // 죽으면, 여기서 안 남겨둔 URL 은 영영 잃는다. 그러면 다음 라운드가 대화가 없는
+    // 줄 알고 새 창을 열어 **같은 질문을 다시 보낸다** (대화 한도를 그냥 버린다).
+    if (onSent) onSent(await this.waitForConversationUrl(p));
+
     // ── 응답 수집 ──
     return this.collectResponse(p, before);
+  }
+
+  /**
+   * 이미 보낸 프롬프트의 응답을 기다린다 (재전송 없이).
+   *
+   * 복귀했더니 그 라운드 질문은 이미 가 있고 답만 없는 경우에 쓴다.
+   */
+  async collectPending(): Promise<string> {
+    const p = this.requirePage();
+    return this.collectResponse(p, await this.countSettledMessages(p));
+  }
+
+  /**
+   * 이 대화에 그 라운드 질문이 이미 있는지, 답까지 나왔는지 본다.
+   *
+   *   answered — 답이 있다. 다시 묻지 말고 그대로 쓴다.
+   *   pending  — 질문만 있고 답이 없다. 다시 묻지 말고 기다린다.
+   *   absent   — 그 라운드 질문이 없다. 새로 보내야 한다.
+   *
+   * 판별 실패는 전부 absent 로 떨어뜨린다 — 잘못 answered 로 보면 낡은 응답을
+   * 게시하게 되고, 그건 다시 묻는 것보다 훨씬 나쁘다.
+   */
+  /**
+   * 이 대화에 그 라운드 질문이 이미 있는지 본다.
+   *
+   * 있으면 응답 수집의 기준점(그 질문 직전까지의 어시스턴트 메시지 수)을 돌려준다.
+   * 판별 실패는 전부 null 로 떨어뜨린다 — 잘못 "있다" 고 보면 엉뚱한 응답을
+   * 게시하게 되고, 그건 다시 묻는 것보다 훨씬 나쁘다.
+   */
+  async findRound(marker: string): Promise<number | null> {
+    const p = this.requirePage();
+    await this.countSettledMessages(p); // 렌더가 멎을 때까지 기다린다
+
+    // selectors.assistantMessage 를 일반화한 형태다 — 역할별로 나눠 읽어야
+    // "그 질문이 마지막인가" 를 판정할 수 있다.
+    try {
+      const msgs = await p.evaluate((contentSel) => {
+        return [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
+          role: el.getAttribute('data-message-author-role') ?? '',
+          text: (el.querySelector(contentSel) ?? el).textContent ?? '',
+        }));
+      }, this.cfg.selectors.messageContent);
+      return findRoundBaseline(msgs, marker);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 이미 보낸 프롬프트의 응답을 기준점부터 수집한다 (재전송 없이).
+   *
+   * 기준점을 findRound 가 준 값으로 쓰는 것이 핵심이다. 여기서 다시 세면 스트리밍
+   * 중인 대상 노드가 기준에 포함돼 영영 오지 않을 다음 메시지를 기다리게 된다.
+   * 완료 판정(스트리밍 종료 + 내용 안정)은 collectResponse 가 그대로 맡는다 —
+   * 그래서 스트리밍 중인 부분 응답을 완성본으로 오인하지 않는다.
+   */
+  async collectFrom(assistantBefore: number): Promise<string> {
+    return this.collectResponse(this.requirePage(), assistantBefore);
+  }
+
+  /**
+   * 전송 직후 대화 주소가 확정될 때까지 짧게 기다린다.
+   *
+   * 새 대화는 첫 메시지를 보낸 뒤에야 /c/<uuid> 로 바뀐다. 이어가는 대화면 이미
+   * 그 주소이므로 즉시 돌아온다.
+   */
+  private async waitForConversationUrl(page: Page): Promise<string | null> {
+    const deadline = Date.now() + CONVERSATION_URL_TIMEOUT_MS;
+    for (;;) {
+      const url = parseConversationUrl(page.url());
+      if (url) return url;
+      if (Date.now() >= deadline) return null;
+      await page.waitForTimeout(500);
+    }
   }
 
   // ── 내부 헬퍼 ─────────────────────────────────────────────

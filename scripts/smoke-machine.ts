@@ -9,8 +9,14 @@ import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/m
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
-import { ghErrorMessage, THREAD_ALIAS_CHUNK, type PRProbe } from '../src/github.js';
 import {
+  ghErrorMessage,
+  buildReviewPayload,
+  THREAD_ALIAS_CHUNK,
+  type PRProbe,
+} from '../src/github.js';
+import {
+  roundMarker,
   syncPRFromProbe,
   adoptThreads,
   applySyncEvents,
@@ -19,8 +25,9 @@ import {
   reconcileCachedOrigin,
   countTurn,
   buildPreviousBlock,
+  judgeReclaim,
 } from '../src/reviewer.js';
-import { parseConversationUrl } from '../src/chatgpt.js';
+import { parseConversationUrl, findRoundBaseline } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import {
   acquireLock,
@@ -55,7 +62,13 @@ import {
   TIER_FIRST_ROUND,
   TIER_OTHER,
 } from '../src/queue.js';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  saveResponse,
+  loadLatestResponse,
+  hasResponseForRound,
+  hasResponseSince,
+} from '../src/cache.js';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, utimesSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -201,6 +214,19 @@ const fakePR: PRInfo = {
     '타인 PR: request_changes 유지',
   );
   assert(resolveEvent('approve', false).event === 'APPROVE', '타인 PR: approve 유지');
+
+  // 리뷰 지적 [P1]: commit_id 를 빼면 GitHub 이 **게시 시점의 최신 커밋**에 리뷰를
+  // 붙인다. 대기하는 2~15분 사이에 push 가 들어오면 모델이 본 적 없는 커밋에
+  // APPROVE 가 직접 달려 branch protection 승인 조건까지 만족시킨다.
+  const c1 = [{ path: 'src/a.ts', line: 3, body: '지적' }];
+  const pinned = JSON.parse(buildReviewPayload('본문', 'approve', c1, 'abc123'));
+  assert(pinned.commit_id === 'abc123', '검토한 커밋에 리뷰를 고정한다');
+  assert(pinned.event === 'APPROVE', 'event 는 대문자로 정규화된다');
+  assert(pinned.comments.length === 1, '인라인 코멘트가 실린다');
+
+  const loose = JSON.parse(buildReviewPayload('본문', 'COMMENT', [], null));
+  assert(!('commit_id' in loose), '커밋을 모르면 넣지 않는다 (기존 동작)');
+  assert(!('comments' in loose), '코멘트가 없으면 빈 배열을 보내지 않는다');
 }
 
 // ── 시나리오 8: gh 오류 메시지 추출 ────────────────────────
@@ -431,12 +457,17 @@ const fakePR: PRInfo = {
   assert(pl.action === 'resume' && pl.turnsUsed === 0, '구버전 컨텍스트는 이번 라운드가 첫 사용');
 
   // 해제
+  tracked.pendingSend = { round: 2, headSha: 'aaa' };
   releaseConversation(tracked);
   assert(
     tracked.conversationUrl === undefined &&
       tracked.conversationStartRound === undefined &&
       tracked.conversationTurns === undefined,
     'releaseConversation 이 대화 참조를 지운다',
+  );
+  assert(
+    tracked.pendingSend === undefined,
+    '대기 기록은 그 대화 안의 질문을 가리키므로 함께 버린다',
   );
   assert(
     planConversation(cfg, tracked, 5).action === 'new',
@@ -1025,6 +1056,198 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 35: 회수 전 리뷰 대상 검증 ────────────────────
+
+{
+  // 대화 + 라운드 번호만으로 회수하면, 죽어 있는 동안 들어온 커밋을 못 본다.
+  // 낡은 diff 를 보고 만든 답을 게시한 뒤 **현재** 상태를 검토 완료로 적으면
+  // 한 번도 보지 않은 코드가 approve 하나로 CONVERGED 가 된다.
+  const c = createContext(fakePR);
+  const at = (headSha: string | null, baseRef: string | null = 'main') => ({ headSha, baseRef });
+
+  assert(judgeReclaim(c, 2, at('A')) === 'no-record', '전송 기록이 없으면 회수하지 않는다');
+
+  c.pendingSend = { round: 2, headSha: 'A', baseRef: 'main' };
+  assert(judgeReclaim(c, 3, at('A')) === 'no-record', '다른 라운드의 기록은 쓰지 않는다');
+  assert(judgeReclaim(c, 2, at('A')) === 'ok', '같은 라운드 · 같은 대상이면 회수한다');
+  assert(judgeReclaim(c, 2, at('B')) === 'moved', 'head 가 달라졌으면 다시 묻는다');
+
+  // 리뷰가 보는 건 커밋 하나가 아니라 `base...head` 다. base 가 바뀌면 head 가
+  // 그대로여도 완전히 다른 diff 이고, 그 답으로 approve 하면 바뀐 diff 를 한 번도
+  // 검토하지 않은 채 CONVERGED 로 남는다.
+  assert(judgeReclaim(c, 2, at('A', 'release')) === 'rebased', 'base 가 바뀌었으면 다시 묻는다');
+
+  // 판별 불가는 전부 "다시 묻기" 로 떨어진다. 다시 묻는 비용은 대화 1회지만
+  // 잘못 회수하면 리뷰를 통째로 건너뛴다 — 방향이 다르다.
+  assert(judgeReclaim(c, 2, at(null)) === 'unknown-current', '현재 대상을 모르면 다시 묻는다');
+  assert(judgeReclaim(c, 2, at('A', null)) === 'unknown-current', '현재 base 를 모르면 다시 묻는다');
+  c.pendingSend = { round: 2, headSha: null, baseRef: 'main' };
+  assert(judgeReclaim(c, 2, at('A')) === 'unknown-sent', '질문 당시 head 를 모르면 다시 묻는다');
+  // base 를 안 남기던 구버전 컨텍스트도 같은 길로 떨어진다 — 조용히 회수하면 안 된다.
+  c.pendingSend = { round: 2, headSha: 'A' };
+  assert(judgeReclaim(c, 2, at('A')) === 'unknown-sent', '구버전 기록(base 없음)은 회수하지 않는다');
+}
+
+// ── 시나리오 36: base 변경도 리뷰 대상 변경이다 ────────────
+
+{
+  // 회수 직전에 한 번 대조하는 것만으로는 못 막는다. 판정과 응답 확보 사이가
+  // 2~15분이고, 정상 경로(전송 → 대기 → 게시)에도 같은 창이 있다. base 를 상태로
+  // 추적해야 그 사이의 변경이 다음 sync 에서 잡힌다.
+  const cfg = loadConfig();
+
+  const conv = createContext(fakePR);
+  fire(conv, 'START_REVIEW');
+  fire(conv, 'POSTED_CLEAN', {
+    patch: { round: 1, headShaAtLastReview: 'A', baseRefAtLastReview: 'main' },
+  });
+  applySyncEvents(cfg, conv, { status: 'OPEN', headSha: 'A', baseRef: 'main' });
+  assert(conv.state === 'CONVERGED', '같은 대상이면 수렴 유지');
+  applySyncEvents(cfg, conv, { status: 'OPEN', headSha: 'A', baseRef: 'release' });
+  assert(conv.state === 'REVIEW_DUE', 'head 가 같아도 base 가 바뀌면 리뷰를 재개한다');
+
+  const waiting = createContext(fakePR);
+  fire(waiting, 'START_REVIEW');
+  fire(waiting, 'POSTED_COMMENTS', {
+    patch: { round: 1, headShaAtLastReview: 'A', baseRefAtLastReview: 'main' },
+  });
+  applySyncEvents(cfg, waiting, { status: 'OPEN', headSha: 'A', baseRef: 'release' });
+  assert(waiting.state === 'REVIEW_DUE', 'AWAITING_AUTHOR 에서도 base 변경은 작성자 응답');
+
+  // 구버전 컨텍스트(base 기록 없음)나 base 를 안 싣는 스냅샷은 판정하지 않는다 —
+  // 모르는 값으로 전이시키면 매 tick 리뷰가 재개된다.
+  const legacy = createContext(fakePR);
+  fire(legacy, 'START_REVIEW');
+  fire(legacy, 'POSTED_CLEAN', { patch: { round: 1, headShaAtLastReview: 'A' } });
+  applySyncEvents(cfg, legacy, { status: 'OPEN', headSha: 'A', baseRef: 'release' });
+  assert(legacy.state === 'CONVERGED', 'base 기록이 없으면 base 로 전이시키지 않는다');
+  applySyncEvents(cfg, legacy, { status: 'OPEN', headSha: 'A' });
+  assert(legacy.state === 'CONVERGED', 'base 를 안 싣는 스냅샷도 그대로 둔다');
+}
+
+// ── 시나리오 34: 대화에서 라운드 기준점 찾기 ───────────────
+
+{
+  const M = '리뷰 라운드: 3차';
+  const u = (t: string) => ({ role: 'user', text: t });
+  const a = (t: string) => ({ role: 'assistant', text: t });
+
+  assert(findRoundBaseline([], M) === null, '빈 대화는 null');
+  assert(findRoundBaseline([u('리뷰 라운드: 2차'), a('r2')], M) === null, '다른 라운드만 있으면 null');
+
+  // 응답 대기 중 죽은 경우 — 질문만 있다
+  assert(findRoundBaseline([u(M)], M) === 0, '첫 질문이면 기준점 0');
+  assert(
+    findRoundBaseline([u('리뷰 라운드: 2차'), a('r2'), u(M)], M) === 1,
+    '앞선 응답 1건이 있으면 기준점 1',
+  );
+
+  // **기준점은 대상 노드를 포함하지 않아야 한다.** 포함하면 collectResponse 가
+  // 오지 않을 다음 메시지를 기다리다 60초 뒤 실패한다.
+  assert(
+    findRoundBaseline([u('리뷰 라운드: 2차'), a('r2'), u(M), a('생성 중…')], M) === 1,
+    '대상 응답이 이미 떠 있어도 기준점은 그대로 1 (다시 세면 안 된다)',
+  );
+
+  // 뒤에 다른 질문이 이어지면 어느 응답이 그 라운드 것인지 단정할 수 없다
+  assert(
+    findRoundBaseline([u(M), a('r3'), u('리뷰 라운드: 4차')], M) === null,
+    '그 라운드가 마지막 질문이 아니면 null (평소 경로로 다시 묻는다)',
+  );
+  assert(
+    findRoundBaseline([u(M), a('r3'), u('리뷰 라운드: 4차')], '리뷰 라운드: 4차') === 1,
+    '마지막 질문이면 그 기준점을 준다',
+  );
+
+  // 같은 라운드를 두 번 물어본 대화(이 버그가 만들어낸 상태)
+  assert(
+    findRoundBaseline([u(M), a('낡은 답'), u(M)], M) === 1,
+    '중복 질문이면 나중 질문 기준으로 센다',
+  );
+}
+
+// ── 시나리오 37: 응답 존재 판정은 라운드가 아니라 전송 단위 ─
+
+{
+  // 2차 첫 응답이 파싱 실패로 저장된 뒤 자동 재시도가 2차 질문을 **다시** 보내고,
+  // 그 응답을 기다리다 죽으면 — 두 번째 전송은 답을 받은 적이 없는데 첫 응답
+  // 파일 때문에 회수가 막힌다. 그러면 같은 질문이 또 나가서, 이 PR 이 막으려는
+  // 낭비가 그대로 재발한다.
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-review-cache-'));
+  const cfg = { ...loadConfig(), dataDir: dir };
+  const ctx = createContext(fakePR);
+
+  const first = saveResponse(cfg, ctx, 2, '첫 응답 (파싱 실패)');
+  const T1 = Date.parse('2026-08-09T10:00:00Z');
+  utimesSync(first, new Date(T1), new Date(T1));
+
+  assert(hasResponseForRound(cfg, ctx, 2), '라운드 단위로는 응답이 있다');
+  assert(hasResponseSince(cfg, ctx, 2, T1), '그 전송 시점 이후로도 있다');
+  assert(
+    !hasResponseSince(cfg, ctx, 2, T1 + 1_000),
+    '이후 재전송은 아직 답을 받은 적이 없다 — 회수를 막지 않는다',
+  );
+
+  const second = saveResponse(cfg, ctx, 2, '두 번째 응답');
+  utimesSync(second, new Date(T1 + 2_000), new Date(T1 + 2_000));
+  assert(hasResponseSince(cfg, ctx, 2, T1 + 1_000), '두 번째 전송이 답을 받으면 그때는 막는다');
+
+  // 전송 시각을 모르는 구버전 기록은 라운드 단위로 물러선다 — 회수를 놓치는 쪽이
+  // 낡은 응답을 게시하는 쪽보다 낫다.
+  assert(hasResponseSince(cfg, ctx, 2, null), '전송 시각을 모르면 라운드 단위로 판정');
+  assert(!hasResponseSince(cfg, ctx, 3, null), '응답이 없는 라운드는 그대로 false');
+
+  // 검토 대상은 사이드카에 남는다. --from-cache 는 아무것도 전송하지 않으므로
+  // 여기 없으면 게시 시점의 최신 커밋에 리뷰가 붙고 그게 검토 완료로 기록된다.
+  saveResponse(cfg, ctx, 4, '4차 응답', { headSha: 'sha4', baseRef: 'main' });
+  const hit = loadLatestResponse(cfg, ctx);
+  assert(hit?.meta?.headSha === 'sha4' && hit?.meta?.baseRef === 'main', '캐시가 검토 대상을 남긴다');
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── 시나리오 33: 라운드 마커 (중복 질문 방지) ─────────────
+
+{
+  // 응답 대기(2~15분) 중에 죽으면 질문은 대화에 남고 우리 기록은 없다. 그대로 다시
+  // 보내면 같은 질문이 한 번 더 들어가 대화 한도를 버린다. 대화에서 그 라운드를
+  // 식별하는 기준이 이 마커다.
+  const base = loadConfig();
+  const mk = createContext(fakePR);
+  assert(roundMarker(base, mk, 3) === '리뷰 라운드: 3차', '기본 템플릿에서 마커 추출');
+  assert(roundMarker(base, mk, 12) === '리뷰 라운드: 12차', '두 자리 라운드');
+
+  // 부분 일치로 오판하면 안 된다 — 1차 마커가 12차 메시지에 걸리면 재질문을
+  // 건너뛰고 엉뚱한 라운드의 응답을 쓰게 된다.
+  const m1 = roundMarker(base, mk, 1) as string;
+  assert(!'리뷰 라운드: 12차'.includes(m1), '1차 마커가 12차 메시지에 걸리지 않는다');
+  assert(!'리뷰 라운드: 21차'.includes(m1), '1차 마커가 21차 메시지에 걸리지 않는다');
+  assert('리뷰 라운드: 1차 리뷰 요청'.includes(m1), '같은 라운드 메시지에는 걸린다');
+
+  // 마커는 **실제로 전송되는 문자열**과 같아야 한다. {{round}} 만 치환하면 같은 줄의
+  // 다른 변수가 남아 findRound 가 못 찾고, 멱등성이 조용히 깨진다.
+  assert(
+    roundMarker({ ...base, promptTemplate: 'PR {{url}} — 리뷰 라운드: {{round}}차' }, mk, 3) ===
+      `PR ${mk.prUrl} — 리뷰 라운드: 3차`,
+    '같은 줄의 {{url}} 도 렌더링한다',
+  );
+
+  // 판별 불가는 항상 "다시 묻기" 로 떨어져야 한다 (null → 호출부가 종전대로 전송).
+  assert(
+    roundMarker({ ...base, promptTemplate: ['PR: {{url}}', '리뷰해줘'].join('\n') }, mk, 3) === null,
+    '{{round}} 가 없는 템플릿이면 판별하지 않는다',
+  );
+  assert(roundMarker({ ...base, promptTemplate: '' }, mk, 3) === null, '빈 템플릿도 null');
+  assert(
+    roundMarker({ ...base, promptTemplate: '{{round}}차 {{previous}}' }, mk, 3) === null,
+    '여러 줄로 펼쳐지는 블록이 같은 줄에 있으면 재현할 수 없다',
+  );
+  assert(
+    roundMarker({ ...base, promptTemplate: '{{round}}차 {{unknown}}' }, mk, 3) === null,
+    '렌더링하지 못한 변수가 남으면 판별하지 않는다',
+  );
 }
 
 // ── 시나리오 32: probe 를 건너뛴 주기의 제외 판정 ──────────

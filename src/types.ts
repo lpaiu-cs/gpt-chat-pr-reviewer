@@ -106,6 +106,15 @@ export interface PRContext {
   requestedCount: number;
   /** 마지막 리뷰 시점의 head SHA — 새 커밋 감지 기준 */
   headShaAtLastReview: string | null;
+  /**
+   * 마지막 리뷰 시점의 base ref — **base 변경 감지 기준**.
+   *
+   * 리뷰 대상은 `base...head` 다. base 를 main → release 로 바꾸면 head 가
+   * 그대로여도 다른 코드인데, head 만 추적하면 그 변경이 영영 감지되지 않아
+   * 검토한 적 없는 diff 가 approve 하나로 CONVERGED 에 눌러앉는다.
+   * 구버전 컨텍스트에는 없다 (없으면 판정하지 않는다).
+   */
+  baseRefAtLastReview?: string | null;
   threads: ThreadRecord[];
   /**
    * 이 PR 에서 관측한 **모든** 리뷰 스레드 id (남이 만든 것 포함).
@@ -137,6 +146,28 @@ export interface PRContext {
    * 확보하지 못한 채 끝난 대화의 잔여물이며, 다음 전송에서 버려진다(countTurn).
    */
   conversationTurns?: number;
+  /**
+   * **응답을 기다리는 중인 전송** — 어느 라운드를, 어느 head SHA 를 보고 물었는지.
+   *
+   * 대기 구간이 2~15분이라 그 사이에 죽으면 질문만 대화에 남는다. 재시작 후 그
+   * 응답을 회수(reclaim)하려면 "이 답이 지금 코드에 대한 답인가" 를 알아야 한다.
+   * 대화 + 라운드 번호만으로는 알 수 없다 — 죽어 있는 동안 작성자가 push 하면
+   * 낡은 head 를 보고 만든 답을 회수하고, 게시 후에는 **현재** head 를
+   * `headShaAtLastReview` 로 적어버려 검토한 적 없는 커밋이 CONVERGED 가 된다.
+   *
+   * head 만으로는 부족하다. 리뷰 대상 diff 는 `base...head` 라서 **base 가 바뀌면
+   * head 가 같아도 다른 코드**다 (main → release 로 base 변경). 그래서 base ref 도
+   * 함께 남긴다.
+   *
+   * 응답을 확보하면 지운다. 없거나 대상이 달라졌으면 회수하지 않고 다시 묻는다.
+   */
+  pendingSend?: {
+    round: number;
+    headSha: string | null;
+    baseRef?: string | null;
+    /** 전송 시각 (ISO) — "이 전송이 이미 답을 받았는가" 를 라운드가 아니라 전송 단위로 본다 */
+    at?: string;
+  };
   /**
    * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).
    * 관측된 GitHub 현황을 캐시한 것일 뿐 상태가 아니다 — 필터를 통과하면 지워진다.

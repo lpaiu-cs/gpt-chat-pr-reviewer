@@ -113,6 +113,8 @@ export interface SyncThread {
 export interface PRSyncData {
   status: 'OPEN' | 'CLOSED' | 'MERGED';
   headSha: string;
+  /** 리뷰 대상 diff 는 `base...head` 라 base 도 전이 판정의 입력이다 */
+  baseRef: string;
   threads: SyncThread[];
 }
 
@@ -122,6 +124,7 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
     pullRequest(number:$num){
       state
       headRefOid
+      baseRefName
       reviewThreads(first:100){
         nodes{
           id isResolved path line originalLine
@@ -143,6 +146,7 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
   return {
     status: pr.state,
     headSha: pr.headRefOid,
+    baseRef: pr.baseRefName,
     threads: (pr.reviewThreads?.nodes ?? []).map((n: any) => ({
       id: n.id,
       isResolved: n.isResolved,
@@ -458,6 +462,24 @@ export function fetchDiff(owner: string, repo: string, number: number): string {
 }
 
 /**
+ * **특정 커밋 기준** diff. 3-dot 이라 PR diff 와 같은 merge-base 를 쓴다.
+ *
+ * `gh pr diff` 는 언제나 현재 head 를 준다. 응답을 기다리는 2~15분 사이에 새 커밋이
+ * 들어오면, 검토한 커밋에 리뷰를 고정해 놓고 라인 검증만 새 diff 로 하게 된다.
+ */
+export function fetchDiffAt(owner: string, repo: string, base: string, sha: string): string {
+  return gh(
+    [
+      'api',
+      `repos/${owner}/${repo}/compare/${base}...${sha}`,
+      '-H',
+      'Accept: application/vnd.github.v3.diff',
+    ],
+    { maxBuffer: 10 * 1024 * 1024 },
+  );
+}
+
+/**
  * unified-diff 텍스트를 파싱하여
  * 파일별로 new-side 에 존재하는 라인 번호 집합을 반환한다.
  */
@@ -500,6 +522,36 @@ export function parseDiffHunks(diff: string): DiffHunk[] {
 
 // ── 리뷰 게시 ───────────────────────────────────────────────
 
+/**
+ * 리뷰 게시 페이로드 (순수 함수).
+ *
+ * `commit_id` 를 빼면 GitHub 은 **게시 시점의 최신 커밋**에 리뷰를 붙인다. 응답을
+ * 기다리는 2~15분 사이에 새 커밋이 들어오면, 모델이 본 적 없는 커밋에 APPROVE 가
+ * 직접 달린다. 검토한 커밋을 알면 반드시 고정한다.
+ */
+export function buildReviewPayload(
+  body: string,
+  event: string,
+  comments: ReviewComment[],
+  commitId?: string | null,
+): string {
+  return JSON.stringify({
+    body,
+    event: event.toUpperCase(),
+    ...(commitId ? { commit_id: commitId } : {}),
+    ...(comments.length > 0
+      ? { comments: comments.map((c) => ({ path: c.path, line: c.line, body: c.body })) }
+      : {}),
+  });
+}
+
+function submitReview(owner: string, repo: string, number: number, payload: string): void {
+  gh(
+    ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
+    { input: payload },
+  );
+}
+
 /** 인라인 코멘트 포함 리뷰 게시. */
 export function postReview(
   owner: string,
@@ -508,16 +560,9 @@ export function postReview(
   body: string,
   event: string,
   comments: ReviewComment[],
+  commitId?: string | null,
 ): void {
-  const payload = JSON.stringify({
-    body,
-    event: event.toUpperCase(),
-    comments: comments.map((c) => ({ path: c.path, line: c.line, body: c.body })),
-  });
-  gh(
-    ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
-    { input: payload },
-  );
+  submitReview(owner, repo, number, buildReviewPayload(body, event, comments, commitId));
 }
 
 /** 본문만 있는 단순 리뷰 게시. */
@@ -527,10 +572,7 @@ export function postSimpleReview(
   number: number,
   body: string,
   event: 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' = 'COMMENT',
+  commitId?: string | null,
 ): void {
-  const payload = JSON.stringify({ body, event });
-  gh(
-    ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
-    { input: payload },
-  );
+  submitReview(owner, repo, number, buildReviewPayload(body, event, [], commitId));
 }
