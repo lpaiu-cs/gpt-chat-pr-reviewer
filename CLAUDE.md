@@ -29,6 +29,7 @@ src/
   instructions.ts   — 맞춤 지침 파일 (instructions.md → {{instructions}} 주입)
   config.ts         — 설정 로드/저장 (pr-review.config.json)
   progress.ts       — 진행 상황 버스 (리프 — http·config·상태 머신을 모른다)
+  intents.ts        — 제어 의도 큐 (리프 — UI POST 와 루프 사이의 완충 지대)
   ui/
     server.ts       — 관측 대시보드: node:http + SSE, 127.0.0.1 전용
     app.html        — 대시보드 (단일 파일 · 빌드 스텝 없음)
@@ -98,8 +99,26 @@ read-modify-write 를 붙잡으므로, 다른 읽기·쓰기 경로가 끼어들
   watch 재시작 후 클라이언트가 새 로그를 전부 "이미 본 것" 으로 버린다.
 - `--ui` 없이 돌면 `progress.enabled === false` 라 모든 기록 호출이 no-op 이다.
 
-**읽기 전용이다.** 제어(지금 리뷰·일시정지·지침 편집)는 아직 없다. 넣을 때는 POST 가
-상태를 직접 건드리지 말고 의도 큐에 넣어 루프가 안전한 지점에서 소비해야 한다.
+### 제어 (의도 큐)
+
+POST 는 상태를 직접 건드리지 않는다. `intents.ts` 에 쌓아두고 루프가 **스캔 직전**
+(= `applyIntents()`, 라운드가 돌지 않는 유일한 지점)에서 한 번에 꺼내 적용한다.
+라운드 하나가 2~15분 동안 ctx 와 scope 를 붙잡고 있으므로 그 사이에 끼어들면
+반쯤 낡은 기준으로 판정한 결과가 저장된다. 대기 건수는 스냅샷의
+`control.pendingIntents` 로 나가 화면에 "적용 대기" 로 뜬다.
+
+필터·범위 변경은 메모리(`scope` 객체 in-place)와 설정 파일에 **함께** 반영한다.
+저장은 `patchConfigFile` 로 `watch` 키만 갈아 끼운다 — `saveConfig(loadConfig())` 로
+쓰면 프롬프트 템플릿·셀렉터 기본값이 사용자 파일에 박제되어 이후 기본값 개선이
+반영되지 않는다. `scope.include` 를 바꿀 때는 `repoSource.lastAt = 0` 으로 탐색
+캐시를 무효화해야 `discoveryIntervalMs`(5분)를 기다리지 않는다.
+
+지침(`instructions.md`)만 의도 큐를 건너뛰고 즉시 쓴다. 상태가 아니라 **입력**이고
+루프가 라운드마다 새로 읽으므로 붙잡고 있는 주체가 없다.
+
+POST 는 `Origin` 검사와 `application/json` 요구로 막는다. 127.0.0.1 바인딩만으로는
+부족하다 — 사용자가 열어둔 아무 페이지나 localhost 로 요청을 보낼 수 있고, 이제
+POST 가 설정 파일을 바꾸기 때문이다.
 
 `scripts/notify.mjs` 가 이 SSE 의 첫 소비자다. **상태 파일을 읽지 않고 SSE 만 구독하므로
 별도 프로세스로 띄워도 안전하다** — 대시보드를 만들 때 세운 규칙이 그대로 배당금이 됐다.

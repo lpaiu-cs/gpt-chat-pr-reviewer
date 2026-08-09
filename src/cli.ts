@@ -20,18 +20,19 @@ import { spawn } from 'node:child_process';
 import { Command } from 'commander';
 import chalk from 'chalk';
 
-import { loadConfig, initConfig, ensureDataDir } from './config.js';
+import { loadConfig, initConfig, ensureDataDir, patchConfigFile } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
 import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage } from './github.js';
 import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
-import { ensureInstructionsFile } from './instructions.js';
+import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
 import {
   admitsNewPR,
   createRepoSource,
   describeScope,
   invalidPRRefs,
+  parsePRRef,
   matchesScope,
   passesFilters,
   resolveWatchScope,
@@ -44,6 +45,7 @@ import {
   type QueueEntry,
 } from './queue.js';
 import { progress, type ContextCard, type QueueItem } from './progress.js';
+import { intents, type Intent } from './intents.js';
 import { startUIServer, type UIServerHandle } from './ui/server.js';
 import type { AppConfig, PRContext, PREvent, PRState } from './types.js';
 
@@ -454,13 +456,16 @@ program
         return;
       }
       try {
-        ui = await startUIServer(port);
+        ui = await startUIServer(port, {
+          readInstructions: () => readInstructionsRaw(cfg),
+          writeInstructions: (body) => saveInstructions(cfg, body),
+        });
         progress.patch({
           startedAt: Date.now(),
           scope: describeScope(scope),
           dryRun: opts.dryRun,
         });
-        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (읽기 전용 · localhost 전용)'));
+        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
       } catch (e) {
         // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
         console.log(
@@ -507,6 +512,161 @@ program
     let quotaUntil = quotaGateUntil(listContexts(cfg)) ?? 0;
     let quotaNotified = 0;
     let observeNotified = 0;
+    let pauseNotified = 0;
+
+    // ── 제어 상태 (UI 의도 큐가 바꾼다) ──
+    let paused = false;
+    /** '지금 리뷰' 로 큐 앞으로 당긴 PR (정규화 키). 그 라운드가 돌면 빠진다. */
+    const prioritized = new Set<string>();
+    scope.filters ??= {};
+
+    const publishControl = (): void => {
+      progress.control({
+        paused,
+        pendingIntents: intents.pending,
+        include: [...scope.include],
+        exclude: [...(scope.exclude ?? [])],
+        skip: [...(scope.filters?.skip ?? [])],
+        only: [...(scope.filters?.only ?? [])],
+        prioritized: [...prioritized],
+      });
+    };
+
+    publishControl(); // 첫 스캔 전에도 현재 필터·일시정지 상태가 화면에 보이게
+
+    /** 바뀐 감시 범위를 설정 파일에 남긴다 (바뀐 키만 패치 — config.ts 참고). */
+    const persistScope = (): void => {
+      try {
+        patchConfigFile({ watch: scope });
+      } catch (e) {
+        console.log(
+          chalk.red(`  ✗ 설정 저장 실패: ${e instanceof Error ? e.message : String(e)}`),
+        );
+        console.log(chalk.dim('    메모리에는 적용됐지만 watch 를 재시작하면 되돌아갑니다.'));
+      }
+    };
+
+    /** 정규화 키로 추적 중인 컨텍스트를 찾는다 (파일명 대소문자에 기대지 않는다). */
+    const findContext = (key: string): PRContext | undefined =>
+      listContexts(cfg).find((c) => parsePRRef(ctxKey(c)) === key);
+
+    /**
+     * 쌓인 제어 의도를 적용한다.
+     *
+     * **사이클 시작점에서만** 호출한다. 라운드가 도는 중에 감시 범위가 바뀌면
+     * 그 라운드가 끝나고 저장할 때 반쯤 낡은 기준으로 판정한 결과가 섞인다.
+     * HTTP 핸들러가 여기까지 들어오지 않는 이유가 이것이다 (intents.ts 참고).
+     */
+    const applyIntents = (): void => {
+      const queued = intents.drain();
+      if (queued.length === 0) return;
+
+      const f = scope.filters!;
+      let scopeChanged = false;
+
+      /** skip/only 목록에서 참조 하나를 넣거나 뺀다. 저장은 정규화 키로 한다. */
+      const editList = (name: 'skip' | 'only', ref: string, add: boolean): void => {
+        const key = parsePRRef(ref);
+        if (!key) {
+          console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${ref}" — 'owner/repo#12' 형식이어야 합니다.`));
+          return;
+        }
+        const list = f[name] ?? [];
+        const next = list.filter((e) => parsePRRef(e) !== key);
+        if (add) next.push(key);
+        if (next.length === list.length && add) return; // 이미 있음
+        if (next.length === list.length && !add) return; // 원래 없음
+        f[name] = next;
+        scopeChanged = true;
+        console.log(
+          chalk.cyan(`    ${add ? '추가' : '해제'}: ${name} ${key}`),
+        );
+      };
+
+      for (const it of queued) {
+        switch (it.kind) {
+          case 'pause':
+            if (!paused) console.log(chalk.magenta('    ⏸ 일시정지 — 리뷰 실행만 멈춥니다 (감시·동기화는 계속).'));
+            paused = true;
+            break;
+          case 'resume':
+            if (paused) console.log(chalk.green('    ▶ 재개'));
+            paused = false;
+            break;
+          case 'skip-add':
+            editList('skip', it.ref, true);
+            break;
+          case 'skip-remove':
+            editList('skip', it.ref, false);
+            break;
+          case 'only-set': {
+            const keys: string[] = [];
+            for (const ref of it.refs) {
+              const key = parsePRRef(ref);
+              if (key) keys.push(key);
+              else console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${ref}"`));
+            }
+            f.only = keys;
+            scopeChanged = true;
+            console.log(
+              keys.length > 0
+                ? chalk.cyan(`    리뷰 대상 한정: ${keys.join(', ')}`)
+                : chalk.cyan('    리뷰 대상 한정 해제 — 범위 전체가 대상입니다.'),
+            );
+            break;
+          }
+          case 'scope-set': {
+            scope.include = it.include;
+            scope.exclude = it.exclude;
+            scopeChanged = true;
+            // 탐색 캐시를 무효화해 다음 스캔이 바로 새 범위로 검색하게 한다
+            // (안 그러면 discoveryIntervalMs, 기본 5분을 기다린다).
+            repoSource.lastAt = 0;
+            console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
+            break;
+          }
+          case 'review-now': {
+            const key = parsePRRef(it.ref);
+            if (!key) {
+              console.log(chalk.yellow(`  ⚠ 잘못된 PR 참조: "${it.ref}"`));
+              break;
+            }
+            const target = findContext(key);
+            if (!target) {
+              console.log(chalk.yellow(`  ⚠ ${key} 는 추적 중이 아닙니다.`));
+              break;
+            }
+            if (target.state === 'REVIEWING') {
+              console.log(chalk.dim(`    ${key} 는 이미 리뷰 중입니다.`));
+              break;
+            }
+            // REVIEW_DUE 가 아니면 강제로 되돌린다 — review --force 와 같은 경로다.
+            if (target.state !== 'REVIEW_DUE') {
+              const ev = FORCE_EVENTS[target.state];
+              if (!ev || !canFire(target.state, ev)) {
+                console.log(chalk.yellow(`  ⚠ ${key} 는 ${target.state} 에서 강제 실행할 수 없습니다.`));
+                break;
+              }
+              fire(target, ev, { note: 'UI: 지금 리뷰' });
+              saveContext(cfg, target);
+            }
+            prioritized.add(key);
+            console.log(chalk.cyan(`    지금 리뷰: ${key} — 큐 맨 앞으로 올립니다.`));
+            break;
+          }
+        }
+      }
+
+      if (scopeChanged) {
+        persistScope();
+        progress.patch({ scope: describeScope(scope) }); // 헤더의 범위 표시도 갱신
+        const bad = invalidPRRefs(scope.filters);
+        if (bad.length > 0) {
+          console.log(chalk.yellow(`  ⚠ 저장된 필터에 형식 오류가 남아 있습니다: ${bad.join(', ')}`));
+        }
+      }
+      publishControl();
+    };
 
     const reportIfChanged = (ctx: PRContext): void => {
       const key = ctxKey(ctx);
@@ -675,6 +835,7 @@ program
         quotaUntil: quotaAt > Date.now() ? quotaAt : null,
       });
       progress.cycle({ openCount, watchedRepos });
+      publishControl();
     };
 
     const loop = async (drain: boolean): Promise<boolean> => {
@@ -682,8 +843,18 @@ program
       // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
       takeGraphQLUsage();
 
+      // 제어 의도는 스캔 직전에만 적용한다 — 라운드가 돌지 않는 유일한 지점이다.
+      applyIntents();
+
       const { eligible, openCount, seen } = scan();
-      const queue = buildQueue(eligible);
+
+      // '지금 리뷰' 로 지목된 PR 을 맨 앞으로. sort 는 안정적이므로 그 안에서는
+      // buildQueue 가 매긴 원래 우선순위가 그대로 유지된다.
+      const isPrioritized = (e: QueueEntry): boolean =>
+        prioritized.has(parsePRRef(ctxKey(e.ctx)) ?? '');
+      const queue = buildQueue(eligible).sort(
+        (a, b) => Number(isPrioritized(b)) - Number(isPrioritized(a)),
+      );
 
       // ── 쿼터 게이트: 큐는 보존하고 실행만 멈춘다 ──
       // 컨텍스트에서 다시 읽어 review 명령 등 다른 경로가 걸린 한도도 반영한다.
@@ -700,6 +871,16 @@ program
           console.log(
             chalk.cyan(`    관측 모드 — 대기열 ${queue.length}건을 표시만 하고 실행하지 않습니다.`),
           );
+        }
+        return false;
+      }
+
+      // ── 일시정지: 감시·동기화는 계속하고 실행만 멈춘다 ──
+      if (paused) {
+        tally();
+        if (queue.length > 0 && Date.now() - pauseNotified > HEARTBEAT_MS) {
+          pauseNotified = Date.now();
+          console.log(chalk.magenta(`    ⏸ 일시정지 중 — 대기열 ${queue.length}건 보존`));
         }
         return false;
       }
@@ -742,6 +923,9 @@ program
           progress.endReview();
         }
         reported.set(ctxKey(ctx), ctxSignature(ctx));
+        // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
+        prioritized.delete(parsePRRef(ctxKey(ctx)) ?? '');
+        publishControl();
         reviewRan = true;
         publish(seen, buildQueue(eligible), openCount, quotaUntil);
 

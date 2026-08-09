@@ -108,6 +108,30 @@ export function saveConfig(config: Partial<AppConfig>, configPath?: string): voi
   writeFileSync(file, JSON.stringify(config, null, 2), 'utf-8');
 }
 
+/**
+ * 설정 파일에서 **지정한 키만** 갈아 끼운다 (나머지는 원본 그대로).
+ *
+ * `saveConfig(loadConfig())` 로 저장하면 안 된다 — loadConfig 는 기본값을 합쳐서
+ * 돌려주므로, 그대로 쓰면 60줄짜리 프롬프트 템플릿과 셀렉터·타임아웃 기본값이
+ * 전부 사용자 설정 파일에 박제된다. 그러면 (1) 손으로 관리하던 간결한 파일이
+ * 부풀고 (2) 이후 기본값이 개선돼도 그 파일이 옛 값을 고정해 버린다.
+ *
+ * UI 에서 설정을 바꾸는 경로는 반드시 이쪽을 쓴다.
+ */
+export function patchConfigFile(patch: Partial<AppConfig>, configPath?: string): void {
+  const file = configPath ?? CONFIG_FILE;
+  let raw: Record<string, unknown> = {};
+  if (existsSync(file)) {
+    try {
+      raw = JSON.parse(readFileSync(file, 'utf-8'));
+    } catch {
+      // 손상된 파일을 조용히 덮어써서 사용자 설정을 날리지 않는다.
+      throw new Error(`${file} 을 읽을 수 없습니다 (JSON 형식 오류) — 저장을 중단합니다.`);
+    }
+  }
+  writeFileSync(file, JSON.stringify({ ...raw, ...patch }, null, 2), 'utf-8');
+}
+
 /** config.json 의 스켈레톤을 생성한다 (이미 있으면 스킵). */
 export function initConfig(configPath?: string): string {
   const file = configPath ?? CONFIG_FILE;
