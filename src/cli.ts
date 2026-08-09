@@ -17,6 +17,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { Command } from 'commander';
 import chalk from 'chalk';
 
@@ -27,6 +28,7 @@ import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
+import { acquireLock, LockHeldError, LockPortBusyError } from './lock.js';
 import {
   admitsNewPR,
   createRepoSource,
@@ -203,6 +205,36 @@ function toItem(e: QueueEntry): QueueItem {
   };
 }
 
+/**
+ * 단일 인스턴스 잠금을 잡는다. 이미 돌고 있으면 안내하고 null 을 돌려준다.
+ *
+ * store.ts 에 잠금이 없어 두 프로세스가 같은 상태 파일을 다투면 라운드 결과가
+ * 사라지거나 같은 PR 에 중복 리뷰가 올라간다. 문서로만 막던 걸 실제로 막는다.
+ */
+async function lockOrExplain(cfg: AppConfig, command: string): Promise<(() => void) | null> {
+  try {
+    const release = await acquireLock(cfg.dataDir, command);
+    // 반환 경로마다 해제를 부르면 하나 빠뜨렸을 때 다음 실행이 막힌다.
+    // 종료 훅에 한 번 걸어두면 어떤 경로로 끝나도 정리된다 (release 는 멱등이다).
+    process.once('exit', release);
+    return release;
+  } catch (e) {
+    if (e instanceof LockHeldError) {
+      console.log(chalk.red(`  ✗ ${e.message}`));
+      console.log(chalk.dim('    상태 파일에 잠금이 없어 두 프로세스가 같이 돌면 서로의 결과를 덮어씁니다.'));
+      console.log(chalk.dim('    그 프로세스를 먼저 끝내세요. 죽으면 커널이 잠금을 즉시 회수합니다.'));
+      return null;
+    }
+    if (e instanceof LockPortBusyError) {
+      console.log(chalk.red(`  ✗ ${e.message}`));
+      console.log(chalk.dim('    잠금은 루프백 포트로 잡습니다 (프로세스가 죽으면 커널이 회수).'));
+      console.log(chalk.dim('    그 구간을 쓰는 프로그램을 끄거나, dataDir 을 바꾸면 다른 구간을 씁니다.'));
+      return null;
+    }
+    throw e;
+  }
+}
+
 /** OS 기본 편집기로 파일 열기 (실패해도 무시). */
 function openInEditor(file: string): void {
   try {
@@ -348,6 +380,10 @@ program
       }
       ensureDataDir(cfg);
 
+      // watch 와 같은 상태 파일을 쓴다. 동시에 돌면 서로의 결과를 덮어쓴다.
+      const releaseLock = await lockOrExplain(cfg, 'review');
+      if (!releaseLock) return;
+
       const ctx = loadOrCreateContext(cfg, pr);
       syncPR(cfg, ctx);
 
@@ -426,6 +462,11 @@ program
       );
       cfg.watchIntervalMs = MIN_INTERVAL_MS;
     }
+
+    // 잠금은 **UI 서버를 띄우기 전에** 잡는다. 중복 인스턴스가 포트 폴백까지
+    // 도달하면 4479 에 조용히 붙어 "정상" 처럼 보인다 — 실제로 그렇게 사고가 났다.
+    const releaseLock = await lockOrExplain(cfg, 'watch');
+    if (!releaseLock) return;
 
     const scope = resolveWatchScope(cfg);
     if (!scope) {
@@ -691,6 +732,7 @@ program
       const port = Number(opts.uiPort ?? DEFAULT_UI_PORT);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         console.log(chalk.red(`  ✗ 잘못된 포트: ${opts.uiPort}`));
+        releaseLock();
         return;
       }
       try {
@@ -1177,6 +1219,7 @@ program
     if (opts.once) {
       await driver?.close();
       await ui?.close();
+      releaseLock();
       return;
     }
 
@@ -1218,6 +1261,7 @@ program
       if (timer) clearTimeout(timer);
       await driver?.close();
       await ui?.close();
+      releaseLock();
       process.exit(0);
     };
     process.on('SIGINT', cleanup);
