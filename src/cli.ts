@@ -8,7 +8,8 @@
  *   init              설정 파일 + 맞춤 지침 파일 생성
  *   instructions      맞춤 지침 파일 열기/생성
  *   review <pr>       특정 PR 리뷰 라운드 실행
- *   watch             레포 폴링 → 상태 머신 동기화 → 자동 리뷰
+ *   watch             감시 범위 폴링 → 상태 머신 동기화 → 큐 순서대로 자동 리뷰
+ *   queue             리뷰 대기열 조회 (--json)
  *   status [pr]       추적 중인 PR 상태 조회 (--json)
  *   graph [pr]        상태 머신 mermaid 다이어그램 출력
  *   rounds <pr>       특정 PR 의 리뷰 라운드 이력 조회
@@ -25,6 +26,19 @@ import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile } from './instructions.js';
+import {
+  createRepoSource,
+  describeScope,
+  passesFilters,
+  resolveWatchScope,
+} from './watch-scope.js';
+import {
+  buildQueue,
+  formatWaiting,
+  quotaGateUntil,
+  QUEUE_REASON_LABELS,
+  type QueueEntry,
+} from './queue.js';
 import type { AppConfig, PRContext, PREvent, PRState } from './types.js';
 
 // ── 배너 ────────────────────────────────────────────────────
@@ -208,7 +222,8 @@ program
     const instrPath = ensureInstructionsFile(cfg);
     console.log(chalk.green(`  ✓ ${configPath} 생성 완료`));
     console.log(chalk.green(`  ✓ ${instrPath} 생성 완료 (맞춤 리뷰 지침)`));
-    console.log(chalk.dim('    watchRepos 에 owner/repo 를 추가한 뒤 watch 를 실행하세요.\n'));
+    console.log(chalk.dim('    watch.include 에 감시 범위를 추가한 뒤 watch 를 실행하세요.'));
+    console.log(chalk.dim('      예: "include": ["myorg/*"]  또는  ["owner/repo"]\n'));
   });
 
 // ── instructions ──
@@ -311,10 +326,10 @@ program
 
 program
   .command('watch')
-  .description('레포 폴링 → 상태 머신 동기화 → REVIEW_DUE 인 PR 자동 리뷰')
+  .description('감시 범위 폴링 → 상태 머신 동기화 → 리뷰 큐 순서대로 자동 리뷰')
   .option('--headless', '헤드리스 모드로 실행', false)
   .option('--dry-run', '게시·상태 전이 없이 결과만 출력', false)
-  .option('--once', '1회만 스캔 후 종료', false)
+  .option('--once', '1회만 스캔 후 큐를 모두 소진하고 종료', false)
   .action(async (opts: { headless: boolean; dryRun: boolean; once: boolean }) => {
     banner();
     const cfg = loadConfig();
@@ -330,11 +345,16 @@ program
       cfg.watchIntervalMs = MIN_INTERVAL_MS;
     }
 
-    if (cfg.watchRepos.length === 0) {
-      console.log(chalk.red('  ✗ watchRepos 가 비어 있습니다.'));
-      console.log(chalk.dim('    pr-review.config.json 의 watchRepos 에 owner/repo 를 추가하세요.\n'));
+    const scope = resolveWatchScope(cfg);
+    if (!scope) {
+      console.log(chalk.red('  ✗ 감시 범위가 비어 있습니다.'));
+      console.log(chalk.dim('    pr-review.config.json 에 다음 중 하나를 설정하세요:'));
+      console.log(chalk.dim('      watch.include  — 예: ["myorg/*"] (mode: "account")'));
+      console.log(chalk.dim('      watchRepos     — 예: ["owner/repo"] (구버전 설정)\n'));
       return;
     }
+    console.log(chalk.dim(`  감시 범위: ${describeScope(scope)}`));
+    const repoSource = createRepoSource(scope);
 
     const driver = new ChatGPTDriver(cfg);
     await driver.launch();
@@ -354,6 +374,12 @@ program
     let lastHeartbeat = 0;
     let lastRemaining = -1; // 마지막 probe 가 보고한 GraphQL 잔여 한도
     let lastCycleCost = 0; // 직전 사이클이 실제로 쓴 GraphQL point 합계
+    let watchedRepos = 0; // 마지막 스캔에서 실제로 폴링한 레포 수
+
+    // 쿼터 쿨다운. 큐를 버리지 않고 이 시각까지 실행만 멈춘다.
+    // watch 를 재시작해도 컨텍스트에서 복원되도록 시작 시 한 번 읽어둔다.
+    let quotaUntil = quotaGateUntil(listContexts(cfg)) ?? 0;
+    let quotaNotified = 0;
 
     const reportIfChanged = (ctx: PRContext): void => {
       const key = `${ctx.owner}/${ctx.repo}#${ctx.prNumber}`;
@@ -361,24 +387,25 @@ program
       if (reported.get(key) === sig) return;
       reported.set(key, sig);
       console.log(
-        `    #${String(ctx.prNumber).padEnd(5)} ${stateBadge(ctx.state)} ${chalk.dim(ctx.title.slice(0, 50))}`,
+        `    ${chalk.dim(`${ctx.owner}/${ctx.repo}`)}#${String(ctx.prNumber).padEnd(5)} ` +
+          `${stateBadge(ctx.state)} ${chalk.dim(ctx.title.slice(0, 45))}`,
       );
     };
 
-    /** 한 사이클. 리뷰를 1건이라도 실행했으면 true. */
-    const loop = async (): Promise<boolean> => {
-      let quotaHit = false;
-      let reviewRan = false;
-      let scanned = 0;
+    /**
+     * 스캔 — 감시 범위의 모든 레포를 동기화하고, 리뷰 후보 컨텍스트를 모은다.
+     * 여기서는 리뷰를 실행하지 않는다. 실행 순서는 큐가 정한다.
+     */
+    const scan = (): { eligible: PRContext[]; openCount: number } => {
+      const repos = repoSource.list();
+      watchedRepos = repos.length;
+      const eligible: PRContext[] = [];
+      let openCount = 0;
 
-      // 사이클 시작 시점에 카운터를 비운다. probe 뿐 아니라 폴백 전체 동기화·
-      // 닫힘 확인까지 모든 GraphQL 경로가 여기에 집계된다.
-      takeGraphQLUsage();
+      const all = listContexts(cfg);
 
-      for (const repoSlug of cfg.watchRepos) {
-        if (quotaHit) break;
-
-        const tracked = listContexts(cfg).filter(
+      for (const repoSlug of repos) {
+        const tracked = all.filter(
           (c) => `${c.owner}/${c.repo}` === repoSlug && c.state !== 'CLOSED',
         );
 
@@ -396,7 +423,16 @@ program
           console.log(chalk.yellow(`  ⚠ ${repoSlug} probe 실패 — 건너뜁니다.`));
           continue;
         }
-        scanned += probe.prs.length;
+        openCount += probe.prs.length;
+        // 잔여 한도는 사이클 끝에서 takeGraphQLUsage() 로 한 번에 읽는다.
+        // probe 시점 값을 쓰면 폴백 동기화 이전 상태라 과대평가된다.
+        if (probe.truncated) {
+          console.log(
+            chalk.yellow(
+              `  ⚠ ${repoSlug} 열린 PR ${probe.totalOpen}건 중 ${probe.prs.length}건만 조회했습니다 (최근 갱신 순).`,
+            ),
+          );
+        }
 
         // 추적 중이지만 열린 목록에 없는 PR → 닫힘 확인 (여기서만 개별 조회)
         for (const c of tracked) {
@@ -407,8 +443,14 @@ program
         }
 
         for (const pr of probe.prs) {
-          if (quotaHit) break;
-          const ctx = loadContext(cfg, pr.owner, pr.repo, pr.number) ?? createContext(pr);
+          const existing = loadContext(cfg, pr.owner, pr.repo, pr.number);
+          const verdict = passesFilters(pr, scope.filters);
+
+          // 필터에 걸린 PR 은 추적 자체를 시작하지 않는다. 이미 추적 중이라면
+          // (초안으로 되돌렸거나 라벨을 뗀 경우) 상태는 계속 갱신하되 큐에서 뺀다.
+          if (!existing && !verdict.ok) continue;
+
+          const ctx = existing ?? createContext(pr);
           ctx.title = pr.title;
 
           // 1단계: probe 만으로 전이 판정 (API 추가 호출 없음)
@@ -417,27 +459,88 @@ program
           // 2단계: 모르는 스레드가 생겼을 때만 전체 동기화
           if (needsFull) syncPR(cfg, ctx);
 
-          if (ctx.state !== 'REVIEW_DUE') {
-            reportIfChanged(ctx);
-            continue;
-          }
-
-          console.log(chalk.bold(`\n  🔍 ${repoSlug}`));
-          const outcome = await runRound(cfg, driver, ctx, { dryRun: opts.dryRun });
-          reported.set(`${ctx.owner}/${ctx.repo}#${ctx.prNumber}`, `${ctx.state}:${ctx.round}`);
-          reviewRan = true;
-          if (outcome === 'quota') quotaHit = true;
+          reportIfChanged(ctx);
+          if (verdict.ok) eligible.push(ctx);
         }
       }
 
-      if (quotaHit) {
-        console.log(chalk.yellow('\n  ⚠ 쿼터 한도 도달 — 이번 사이클을 중단하고 쿨다운 후 재개합니다.'));
-      }
+      return { eligible, openCount };
+    };
 
-      // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.
+    /**
+     * 한 사이클. 리뷰를 1건이라도 실행했으면 true.
+     *
+     * drain=false 면 큐의 맨 앞 1건만 돌린다. 라운드는 2~15분 걸리므로 그 사이
+     * 다른 PR 의 상황이 바뀐다 — 한 건 끝날 때마다 다시 스캔해 우선순위를 새로
+     * 매기는 편이 정확하다 (리뷰 직후 재스캔은 대기 없이 즉시 예약된다).
+     */
+    /**
+     * 이번 사이클이 쓴 GraphQL 비용을 확정한다.
+     * 어느 경로로 사이클이 끝나든 반드시 호출해야 한다 — 빠뜨리면 소모량이
+     * 다음 사이클로 이월되어 실제보다 비싸 보이고 주기가 과하게 늘어난다.
+     */
+    const tally = (): number => {
       const usage = takeGraphQLUsage();
       lastCycleCost = usage.cost;
       lastRemaining = usage.remaining;
+      return usage.cost;
+    };
+
+    const loop = async (drain: boolean): Promise<boolean> => {
+      // 사이클 시작 시점에 카운터를 비운다. 레포 탐색·probe 뿐 아니라 폴백 전체
+      // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
+      takeGraphQLUsage();
+
+      const { eligible, openCount } = scan();
+      const queue = buildQueue(eligible);
+
+      // ── 쿼터 게이트: 큐는 보존하고 실행만 멈춘다 ──
+      // 컨텍스트에서 다시 읽어 review 명령 등 다른 경로가 걸린 한도도 반영한다.
+      // dry-run 은 상태를 전이시키지 않으므로 메모리 값도 함께 본다.
+      quotaUntil = Math.max(quotaUntil, quotaGateUntil(eligible) ?? 0);
+      if (queue.length > 0 && Date.now() < quotaUntil) {
+        tally(); // 실행은 건너뛰어도 스캔 비용은 이번 사이클 몫이다
+        if (Date.now() - quotaNotified > HEARTBEAT_MS) {
+          quotaNotified = Date.now();
+          console.log(
+            chalk.magenta(
+              `    쿼터 대기 — 큐 ${queue.length}건 보존 · ${new Date(quotaUntil).toLocaleString('ko-KR')} 이후 재개`,
+            ),
+          );
+        }
+        return false;
+      }
+
+      let reviewRan = false;
+      for (let i = 0; i < queue.length; i++) {
+        const { ctx, reason } = queue[i];
+        console.log(
+          chalk.bold(`\n  🔍 ${ctx.owner}/${ctx.repo}#${ctx.prNumber}`) +
+            chalk.dim(`  [${QUEUE_REASON_LABELS[reason]}]`) +
+            (queue.length > 1 ? chalk.dim(`  대기열 ${i + 1}/${queue.length}`) : ''),
+        );
+        const outcome = await runRound(cfg, driver, ctx, { dryRun: opts.dryRun });
+        reported.set(`${ctx.owner}/${ctx.repo}#${ctx.prNumber}`, `${ctx.state}:${ctx.round}`);
+        reviewRan = true;
+
+        if (outcome === 'quota') {
+          // 한도는 계정 단위라 남은 큐도 지금은 못 돈다. 버리지 않고 미룬다.
+          quotaUntil = Date.now() + cfg.quotaCooldownMs;
+          quotaNotified = Date.now();
+          const left = queue.length - i - 1;
+          console.log(
+            chalk.yellow(
+              `\n  ⚠ 쿼터 한도 도달 — 남은 큐 ${left}건을 보존하고 ` +
+                `${new Date(quotaUntil).toLocaleString('ko-KR')} 이후 재개합니다.`,
+            ),
+          );
+          break;
+        }
+        if (!drain) break; // 한 건만 돌리고 즉시 재스캔
+      }
+
+      // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.
+      const cost = tally();
 
       // 아무 변화 없이 조용한 구간에서도 살아있음을 알린다
       if (!reviewRan && Date.now() - lastHeartbeat > HEARTBEAT_MS) {
@@ -445,7 +548,9 @@ program
         const at = new Date().toLocaleTimeString('ko-KR');
         const budget = lastRemaining >= 0 ? ` · 잔여 한도 ${lastRemaining.toLocaleString()}` : '';
         console.log(
-          chalk.dim(`    ${at} · 감시 중 (열린 PR ${scanned}건, ${usage.cost} point)${budget}`),
+          chalk.dim(
+            `    ${at} · 감시 중 (레포 ${watchedRepos} · 열린 PR ${openCount}건, ${cost} point)${budget}`,
+          ),
         );
       }
 
@@ -463,7 +568,9 @@ program
       const base = cfg.watchIntervalMs;
       if (lastRemaining < 0) return base;
 
-      const perScan = Math.max(1, lastCycleCost || cfg.watchRepos.length);
+      // 폴백도 설정값(watchRepos)이 아니라 실제로 폴링한 레포 수를 쓴다.
+      // 계정 모드에서는 watchRepos 가 비어 있고 레포 수는 실행 중에 늘어난다.
+      const perScan = Math.max(1, lastCycleCost || watchedRepos);
       const scansPerHour = 3_600_000 / base;
       const needed = perScan * scansPerHour;
       const budget = lastRemaining * RATE_BUDGET_RATIO;
@@ -478,7 +585,8 @@ program
       return scaled;
     };
 
-    await loop();
+    // --once 는 "1회 스캔" 이므로 그 스캔에서 나온 큐를 끝까지 소진한다.
+    await loop(opts.once);
 
     if (opts.once) {
       await driver.close();
@@ -502,7 +610,7 @@ program
         if (stopped) return;
         let reviewRan = false;
         try {
-          reviewRan = await loop();
+          reviewRan = await loop(false);
         } catch (e) {
           console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
         }
@@ -525,6 +633,72 @@ program
     };
     process.on('SIGINT', cleanup);
     process.on('SIGTERM', cleanup);
+  });
+
+// ── queue ──
+
+program
+  .command('queue')
+  .description('리뷰 대기열 조회 — watch 가 처리할 순서대로')
+  .option('--json', 'JSON 으로 출력 (UI/스크립트 연동용)', false)
+  .action((opts: { json: boolean }) => {
+    const cfg = loadConfig();
+    ensureDataDir(cfg);
+
+    // 큐는 저장되지 않는다 — 컨텍스트에서 매번 다시 계산한다 (queue.ts 참고).
+    const all = listContexts(cfg);
+    const entries = buildQueue(all);
+    const blockedUntil = quotaGateUntil(all);
+
+    if (opts.json) {
+      console.log(
+        JSON.stringify(
+          {
+            blockedUntil: blockedUntil ? new Date(blockedUntil).toISOString() : null,
+            entries: entries.map((e: QueueEntry) => ({
+              owner: e.ctx.owner,
+              repo: e.ctx.repo,
+              prNumber: e.ctx.prNumber,
+              title: e.ctx.title,
+              url: e.ctx.prUrl,
+              round: e.ctx.round,
+              tier: e.tier,
+              reason: e.reason,
+              waitingSince: e.waitingSince,
+              waitingMs: e.waitingMs,
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    banner();
+    if (blockedUntil) {
+      console.log(
+        chalk.magenta(
+          `  ⏸ 쿼터 대기 중 — ${new Date(blockedUntil).toLocaleString('ko-KR')} 이후 재개`,
+        ),
+      );
+      console.log(chalk.dim('    대기열은 그대로 보존됩니다.\n'));
+    }
+    if (entries.length === 0) {
+      console.log(chalk.dim('  대기열이 비어 있습니다.\n'));
+      return;
+    }
+
+    console.log(chalk.bold(`  대기열 ${entries.length}건`) + chalk.dim('  (위에서부터 처리)'));
+    entries.forEach((e, i) => {
+      console.log(
+        `  ${String(i + 1).padStart(2)}. ${chalk.bold(`${e.ctx.owner}/${e.ctx.repo}#${e.ctx.prNumber}`)}` +
+          `  ${chalk.cyan(`[${QUEUE_REASON_LABELS[e.reason]}]`)}` +
+          `  ${chalk.dim(`대기 ${formatWaiting(e.waitingMs)}`)}`,
+      );
+      console.log(chalk.dim(`      ${e.ctx.title.slice(0, 60)}`));
+    });
+    console.log();
   });
 
 // ── status ──

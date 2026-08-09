@@ -21,10 +21,18 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
+import { globToRegExp, matchesScope, passesFilters, resolveWatchScope } from '../src/watch-scope.js';
+import {
+  buildQueue,
+  quotaGateUntil,
+  TIER_AUTHOR_RESPONDED,
+  TIER_FIRST_ROUND,
+  TIER_OTHER,
+} from '../src/queue.js';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { PRInfo, PRState, PRContext, AppConfig } from '../src/types.js';
+import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
 
 let passed = 0;
 let failed = 0;
@@ -563,6 +571,191 @@ const fakePR: PRInfo = {
     buildPreviousBlock(recovered, 3, false).text.includes('널 체크 누락'),
     '해제 후 프롬프트는 스니펫을 다시 실어 맥락을 이월한다',
   );
+}
+
+// ── 시나리오 16: 감시 범위 글롭 ────────────────────────────
+
+{
+  assert(globToRegExp('lpaiu-cs/*').test('lpaiu-cs/anything'), '글롭: owner/* 는 그 계정을 매치');
+  assert(!globToRegExp('lpaiu-cs/*').test('other/anything'), '글롭: 다른 계정은 매치하지 않음');
+  assert(globToRegExp('lpaiu-cs').test('lpaiu-cs/repo'), '글롭: 슬래시 없는 패턴은 owner/* 로 해석');
+  assert(globToRegExp('LPAIU-CS/*').test('lpaiu-cs/repo'), '글롭: 대소문자 무시');
+  assert(globToRegExp('*/archived-*').test('any/archived-old'), '글롭: 접두/접미 혼합');
+
+  // `*` 가 슬래시를 넘으면 'a/*' 가 'a/b/c' 같은 값까지 삼킨다. 넘지 않아야 한다.
+  assert(!globToRegExp('a/*').test('a/b/c'), '글롭: * 는 슬래시를 넘지 않음');
+
+  assert(matchesScope('lpaiu-cs/tool', ['lpaiu-cs/*'], []), 'include 매치');
+  assert(
+    !matchesScope('lpaiu-cs/archived-x', ['lpaiu-cs/*'], ['*/archived-*']),
+    'exclude 가 include 를 이긴다',
+  );
+  assert(matchesScope('any/repo', [], []), 'include 가 비면 전부 통과 (review-requested 용)');
+}
+
+// ── 시나리오 17: 대상 필터 ─────────────────────────────────
+
+{
+  const pr = (over: Partial<{ author: string; isDraft: boolean; labels: string[] }> = {}) => ({
+    author: 'lpaiu-cs',
+    isDraft: false,
+    labels: ['needs-review'],
+    ...over,
+  });
+
+  assert(passesFilters(pr()).ok, '필터 없음: 통과');
+
+  // draft 는 기본 제외 — 초안까지 대화 한도를 먹으면 안 된다
+  assert(!passesFilters(pr({ isDraft: true })).ok, 'draft 는 기본 제외');
+  assert(passesFilters(pr({ isDraft: true }), { draft: true }).ok, 'draft: true 면 초안도 통과');
+
+  assert(passesFilters(pr(), { authors: ['LPAIU-CS'] }).ok, '작성자 필터는 대소문자 무시');
+  assert(!passesFilters(pr(), { authors: ['someone'] }).ok, '작성자 불일치 시 제외');
+
+  assert(passesFilters(pr(), { labels: ['needs-review'] }).ok, '라벨 하나라도 맞으면 통과');
+  assert(!passesFilters(pr({ labels: [] }), { labels: ['needs-review'] }).ok, '라벨 없으면 제외');
+
+  // 조건이 여러 개면 AND
+  assert(
+    !passesFilters(pr(), { authors: ['lpaiu-cs'], labels: ['nope'] }).ok,
+    '조건이 여러 개면 AND 로 적용',
+  );
+
+  const verdict = passesFilters(pr({ isDraft: true }));
+  assert(!!verdict.reason, '제외 사유가 붙는다');
+}
+
+// ── 시나리오 18: 감시 범위 해석 (구버전 설정 호환) ─────────
+
+{
+  const base = loadConfig();
+
+  const legacy: AppConfig = { ...base, watch: undefined, watchRepos: ['o/r'] };
+  const s1 = resolveWatchScope(legacy);
+  assert(s1?.mode === 'repos' && s1.include[0] === 'o/r', 'watchRepos 만 있으면 repos 모드로 폴백');
+
+  const both: AppConfig = {
+    ...base,
+    watch: { mode: 'account', include: ['org/*'], filters: { draft: true } },
+    watchRepos: ['o/r'],
+  };
+  const s2 = resolveWatchScope(both);
+  assert(s2?.mode === 'account' && s2.include[0] === 'org/*', 'watch.include 가 watchRepos 를 이긴다');
+
+  // include 가 비어 있으면 watchRepos 로 내려가되 필터는 watch 것을 이어받는다
+  const emptyInclude: AppConfig = {
+    ...base,
+    watch: { mode: 'account', include: [], filters: { draft: true }, exclude: ['*/x-*'] },
+    watchRepos: ['o/r'],
+  };
+  const s3 = resolveWatchScope(emptyInclude);
+  assert(s3?.mode === 'repos' && s3.include[0] === 'o/r', 'include 가 비면 watchRepos 로 폴백');
+  assert(s3?.filters?.draft === true && s3.exclude?.[0] === '*/x-*', '폴백 시에도 필터·exclude 유지');
+
+  // review-requested 는 검색 자체가 범위라 include 없이도 성립한다
+  const rr: AppConfig = { ...base, watch: { mode: 'review-requested', include: [] }, watchRepos: [] };
+  assert(resolveWatchScope(rr)?.mode === 'review-requested', 'review-requested 는 include 없이 성립');
+
+  const nothing: AppConfig = { ...base, watch: undefined, watchRepos: [] };
+  assert(resolveWatchScope(nothing) === null, '대상이 없으면 null');
+}
+
+// ── 시나리오 19: 리뷰 큐 우선순위 ──────────────────────────
+
+{
+  /** REVIEW_DUE 진입 시각을 고정해 정렬을 결정적으로 만든다. */
+  const stamp = (ctx: PRContext, at: string): PRContext => {
+    for (let i = ctx.history.length - 1; i >= 0; i--) {
+      if (ctx.history[i].to === 'REVIEW_DUE') {
+        ctx.history[i].at = at;
+        return ctx;
+      }
+    }
+    ctx.createdAt = at;
+    return ctx;
+  };
+
+  const at = (n: number) => `2026-01-0${n}T00:00:00.000Z`;
+
+  // 라운드 미진행 — 오래된 쪽이 먼저
+  const fresh = (num: number, when: string) =>
+    stamp(createContext({ ...fakePR, number: num }), when);
+
+  const a = fresh(1, at(1));
+  const d = fresh(2, at(3));
+
+  // 작성자 응답 완료
+  const b = createContext({ ...fakePR, number: 3 });
+  fire(b, 'START_REVIEW');
+  fire(b, 'POSTED_COMMENTS', { patch: { round: 1 } });
+  fire(b, 'AUTHOR_RESPONDED');
+  stamp(b, at(2));
+
+  // 그 외 (실패 후 재시도) — round 를 올려 "라운드 미진행" 과 구분한다
+  const c = createContext({ ...fakePR, number: 4 });
+  fire(c, 'START_REVIEW');
+  fire(c, 'POSTED_COMMENTS', { patch: { round: 1 } });
+  fire(c, 'AUTHOR_RESPONDED');
+  fire(c, 'START_REVIEW');
+  fire(c, 'REVIEW_FAILED');
+  fire(c, 'RETRY', { patch: { retryCount: 1 } });
+  stamp(c, at(1));
+
+  // REVIEW_DUE 가 아닌 것은 큐에 오르지 않는다
+  const waiting = createContext({ ...fakePR, number: 5 });
+  fire(waiting, 'START_REVIEW');
+  fire(waiting, 'POSTED_COMMENTS', { patch: { round: 1 } });
+
+  const q = buildQueue([d, c, b, waiting, a]);
+  assert(q.length === 4, `REVIEW_DUE 4건만 큐에 오름 (실제 ${q.length})`);
+  assert(!q.some((e) => e.ctx.prNumber === 5), 'AWAITING_AUTHOR 는 큐에서 제외');
+
+  assert(
+    q.map((e) => e.ctx.prNumber).join(',') === '1,2,3,4',
+    `우선순위: 라운드 미진행 > 작성자 응답 > 그 외, 동순위는 오래 기다린 순 (실제 ${q.map((e) => e.ctx.prNumber).join(',')})`,
+  );
+  assert(q[0].tier === TIER_FIRST_ROUND && q[0].reason === 'first-round', '1순위 티어/사유');
+  assert(q[2].tier === TIER_AUTHOR_RESPONDED && q[2].reason === 'author-responded', '2순위 티어/사유');
+  assert(q[3].tier === TIER_OTHER && q[3].reason === 'retry', '3순위 티어/사유');
+  assert(q[0].waitingMs >= q[1].waitingMs, '오래 기다린 항목의 대기 시간이 더 길다');
+
+  // 같은 입력이면 순서가 항상 같아야 한다 (재스캔마다 큐를 다시 만들기 때문)
+  const again = buildQueue([a, b, c, d]);
+  assert(
+    again.map((e) => e.ctx.prNumber).join(',') === q.map((e) => e.ctx.prNumber).join(','),
+    '입력 순서가 달라도 큐 순서는 동일 (결정적)',
+  );
+}
+
+// ── 시나리오 20: 쿼터 게이트 — 큐 보존 ─────────────────────
+
+{
+  const now = Date.parse('2026-01-01T00:00:00.000Z');
+  const blocked = createContext({ ...fakePR, number: 9 });
+  fire(blocked, 'START_REVIEW');
+  fire(blocked, 'QUOTA_EXCEEDED', { patch: { quotaRetryAt: '2026-01-01T03:00:00.000Z' } });
+
+  const pending = createContext({ ...fakePR, number: 10 });
+
+  const gate = quotaGateUntil([blocked, pending], now);
+  assert(gate === Date.parse('2026-01-01T03:00:00.000Z'), '쿨다운이 남으면 해제 시각을 반환');
+
+  // 핵심: 한도에 걸려도 나머지 대상은 큐에 그대로 남는다 (사이클 중단이 아니라 보류)
+  assert(buildQueue([blocked, pending], now).length === 1, '쿼터 중에도 대기 항목은 큐에 보존');
+
+  const after = Date.parse('2026-01-01T04:00:00.000Z');
+  assert(quotaGateUntil([blocked, pending], after) === null, '쿨다운 경과 후에는 게이트 해제');
+
+  // 여러 건이 막혔으면 가장 늦게 풀리는 시각을 따른다
+  const later = createContext({ ...fakePR, number: 11 });
+  fire(later, 'START_REVIEW');
+  fire(later, 'QUOTA_EXCEEDED', { patch: { quotaRetryAt: '2026-01-01T05:00:00.000Z' } });
+  assert(
+    quotaGateUntil([blocked, later], now) === Date.parse('2026-01-01T05:00:00.000Z'),
+    '가장 늦은 해제 시각을 따른다',
+  );
+
+  assert(quotaGateUntil([pending], now) === null, '막힌 PR 이 없으면 게이트 없음');
 }
 
 // ── 결과 ────────────────────────────────────────────────────
