@@ -5,7 +5,7 @@
  * 최초 1회 수동 로그인 후 세션을 재사용한다.
  */
 
-import { chromium, type BrowserContext, type Page } from 'playwright';
+import { chromium, type BrowserContext, type Locator, type Page } from 'playwright';
 import chalk from 'chalk';
 import { progress } from './progress.js';
 import type { AppConfig } from './types.js';
@@ -64,6 +64,18 @@ const QUOTA_RECHECK_MS = 30_000;
 
 /** 전송 전, 진행 중인 생성이 끝나기를 기다리는 폴링 간격. */
 const IDLE_POLL_MS = 3_000;
+
+/**
+ * 어시스턴트 메시지의 **안정적 식별자**.
+ *
+ * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
+ * 9차 라운드가 7차 응답을 게시한 경로가 그것이다. 노드가 뜨는 즉시 이 값으로
+ * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
+ */
+const MESSAGE_ID_ATTR = 'data-message-id';
+
+/** 식별자를 못 잡았을 때, 축소 관측을 이만큼 연속으로 보면 수집 실패로 본다. */
+const SHRINK_TOLERANCE = 3;
 
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
 const SETTLE_STABLE_READS = 3;
@@ -626,18 +638,36 @@ export class ChatGPTDriver {
     progress.phase('waiting');
     console.log(chalk.dim('  응답 대기 중...'));
 
-    // **기다린 그 노드를 읽는다.** `.last()` 로 읽으면 안 된다 — 위에서 기다린 건
-    // nth(messageCountBefore) 인데 DOM 에 다른 어시스턴트 노드가 섞이면 둘이
-    // 달라지고, 그러면 **엉뚱한 메시지를 응답으로 저장해 게시한다.** 실제로 9차
+    // **기다린 그 노드를 읽는다.** `.last()` 로 읽으면 안 된다 — 기다리는 대상과
+    // 읽는 대상이 갈리면 **엉뚱한 메시지를 응답으로 저장해 게시한다.** 실제로 9차
     // 라운드가 7차의 응답을 그대로 게시했다 (관측 길이가 845자로 272초 고정되다가
     // 341자로 급감 — 스트리밍이면 있을 수 없는 변화다).
-    const target = page.locator(sel.assistantMessage).nth(messageCountBefore);
+    //
+    // 위치(nth)조차 재렌더·가상화 때 다른 메시지를 가리킬 수 있으므로, 노드가 뜨는
+    // 즉시 **식별자로 고정**한다. 그 뒤로는 DOM 이 어떻게 흔들려도 같은 메시지만
+    // 읽는다. 고정 후 노드가 사라지면 그건 진짜 이상이므로 수집을 실패시킨다 —
+    // 다른 메시지를 대신 읽어 게시하는 것보다 낫다.
+    let boundId: string | null = null;
+    const targetLocator = (): Locator =>
+      boundId
+        ? page.locator(`[${MESSAGE_ID_ATTR}="${boundId}"]`)
+        : page.locator(sel.assistantMessage).nth(messageCountBefore);
+
+    const bindTarget = async (): Promise<void> => {
+      if (boundId) return;
+      const byIndex = page.locator(sel.assistantMessage).nth(messageCountBefore);
+      if ((await byIndex.count().catch(() => 0)) === 0) return;
+      const id = await byIndex.getAttribute(MESSAGE_ID_ATTR).catch(() => null);
+      // 따옴표가 섞이면 셀렉터가 깨진다 — 그때는 위치 기반으로 남고 축소 방어가 맡는다.
+      if (id && !/["\\]/.test(id)) boundId = id;
+    };
 
     // 메시지 컨테이너 전체를 읽으면 "Edit"·복사 버튼 같은 UI 텍스트가 섞인다.
     // 본문(.markdown)이 있으면 그쪽을 읽는다. 한 메시지 안에 본문 블록이 여러 개면
     // (산문 + 코드블록 + 산문) **전부 이어 붙인다** — 마지막 하나만 집으면 JSON 이
     // 앞에 있을 때 통째로 잃는다.
     const readTarget = async (): Promise<string> => {
+      const target = targetLocator();
       const bodies = target.locator(sel.messageContent);
       if ((await bodies.count().catch(() => 0)) > 0) {
         const parts = await bodies.allInnerTexts().catch(() => [] as string[]);
@@ -648,6 +678,7 @@ export class ChatGPTDriver {
 
     let lastText = '';
     let stable = 0;
+    let shrinks = 0;
     let recoveries = 0;
     let lastLogAt = Date.now();
     let lastQuotaCheckAt = Date.now();
@@ -656,19 +687,35 @@ export class ChatGPTDriver {
     while (Date.now() - t0 < timeout) {
       await page.waitForTimeout(3_000);
 
+      await bindTarget();
+
+      // 고정한 노드가 사라졌다 — DOM 이 통째로 갈렸다는 뜻이다. 위치로 물러서서
+      // 아무 메시지나 읽으면 그게 바로 낡은 응답 게시다.
+      if (boundId && (await targetLocator().count().catch(() => 0)) === 0) {
+        throw new Error('수집 중이던 응답 노드가 사라졌습니다 (대화 화면이 바뀐 것으로 보입니다).');
+      }
+
       const cur = await readTarget();
 
-      // 생성 중인 응답은 길어지기만 한다. 짧아졌다면 우리가 **다른 노드를 읽은**
-      // 것이다 (DOM 재렌더·가상화). 그 값을 완성본으로 굳히면 낡은 응답을 게시한다.
-      // 확정을 미루고 기록만 남긴다 — 이슈 #1 의 증상 창구이기도 하다.
-      if (lastText.length > 0 && cur.length < lastText.length) {
+      // 식별자를 못 잡아 위치로 읽는 중이라면, **짧아진 값을 채택하지 않는다.**
+      // 생성 중인 응답은 길어지기만 하므로 축소는 다른 노드를 읽었다는 신호다.
+      // (경고만 하고 덮어쓰면 그 값이 3회 안정 관측을 통과해 그대로 게시된다.)
+      if (!boundId && lastText.length > 0 && cur.length < lastText.length) {
+        shrinks++;
         console.log(
           chalk.yellow(
             `  ⚠ 읽은 응답이 짧아졌습니다 (${lastText.length.toLocaleString()} → ` +
-              `${cur.length.toLocaleString()}자) — 노드가 바뀐 것으로 보고 확정을 미룹니다.`,
+              `${cur.length.toLocaleString()}자) — 다른 노드로 보고 채택하지 않습니다 ` +
+              `(${shrinks}/${SHRINK_TOLERANCE}).`,
           ),
         );
+        stable = 0;
+        if (shrinks >= SHRINK_TOLERANCE) {
+          throw new Error('읽는 응답 노드가 계속 바뀝니다 — 낡은 응답을 게시하지 않기 위해 중단합니다.');
+        }
+        continue;
       }
+      shrinks = 0;
 
       if (cur.length > 0 && cur === lastText) {
         stable++;
