@@ -54,7 +54,8 @@ import {
   TIER_FIRST_ROUND,
   TIER_OTHER,
 } from '../src/queue.js';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { saveResponse, hasResponseForRound, hasResponseSince } from '../src/cache.js';
+import { mkdtempSync, rmSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
@@ -1153,6 +1154,40 @@ const fakePR: PRInfo = {
   );
 }
 
+// ── 시나리오 37: 응답 존재 판정은 라운드가 아니라 전송 단위 ─
+
+{
+  // 2차 첫 응답이 파싱 실패로 저장된 뒤 자동 재시도가 2차 질문을 **다시** 보내고,
+  // 그 응답을 기다리다 죽으면 — 두 번째 전송은 답을 받은 적이 없는데 첫 응답
+  // 파일 때문에 회수가 막힌다. 그러면 같은 질문이 또 나가서, 이 PR 이 막으려는
+  // 낭비가 그대로 재발한다.
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-review-cache-'));
+  const cfg = { ...loadConfig(), dataDir: dir };
+  const ctx = createContext(fakePR);
+
+  const first = saveResponse(cfg, ctx, 2, '첫 응답 (파싱 실패)');
+  const T1 = Date.parse('2026-08-09T10:00:00Z');
+  utimesSync(first, new Date(T1), new Date(T1));
+
+  assert(hasResponseForRound(cfg, ctx, 2), '라운드 단위로는 응답이 있다');
+  assert(hasResponseSince(cfg, ctx, 2, T1), '그 전송 시점 이후로도 있다');
+  assert(
+    !hasResponseSince(cfg, ctx, 2, T1 + 1_000),
+    '이후 재전송은 아직 답을 받은 적이 없다 — 회수를 막지 않는다',
+  );
+
+  const second = saveResponse(cfg, ctx, 2, '두 번째 응답');
+  utimesSync(second, new Date(T1 + 2_000), new Date(T1 + 2_000));
+  assert(hasResponseSince(cfg, ctx, 2, T1 + 1_000), '두 번째 전송이 답을 받으면 그때는 막는다');
+
+  // 전송 시각을 모르는 구버전 기록은 라운드 단위로 물러선다 — 회수를 놓치는 쪽이
+  // 낡은 응답을 게시하는 쪽보다 낫다.
+  assert(hasResponseSince(cfg, ctx, 2, null), '전송 시각을 모르면 라운드 단위로 판정');
+  assert(!hasResponseSince(cfg, ctx, 3, null), '응답이 없는 라운드는 그대로 false');
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── 시나리오 33: 라운드 마커 (중복 질문 방지) ─────────────
 
 {
@@ -1160,22 +1195,39 @@ const fakePR: PRInfo = {
   // 보내면 같은 질문이 한 번 더 들어가 대화 한도를 버린다. 대화에서 그 라운드를
   // 식별하는 기준이 이 마커다.
   const base = loadConfig();
-  assert(roundMarker(base, 3) === '리뷰 라운드: 3차', '기본 템플릿에서 마커 추출');
-  assert(roundMarker(base, 12) === '리뷰 라운드: 12차', '두 자리 라운드');
+  const mk = createContext(fakePR);
+  assert(roundMarker(base, mk, 3) === '리뷰 라운드: 3차', '기본 템플릿에서 마커 추출');
+  assert(roundMarker(base, mk, 12) === '리뷰 라운드: 12차', '두 자리 라운드');
 
   // 부분 일치로 오판하면 안 된다 — 1차 마커가 12차 메시지에 걸리면 재질문을
   // 건너뛰고 엉뚱한 라운드의 응답을 쓰게 된다.
-  const m1 = roundMarker(base, 1) as string;
+  const m1 = roundMarker(base, mk, 1) as string;
   assert(!'리뷰 라운드: 12차'.includes(m1), '1차 마커가 12차 메시지에 걸리지 않는다');
   assert(!'리뷰 라운드: 21차'.includes(m1), '1차 마커가 21차 메시지에 걸리지 않는다');
   assert('리뷰 라운드: 1차 리뷰 요청'.includes(m1), '같은 라운드 메시지에는 걸린다');
 
+  // 마커는 **실제로 전송되는 문자열**과 같아야 한다. {{round}} 만 치환하면 같은 줄의
+  // 다른 변수가 남아 findRound 가 못 찾고, 멱등성이 조용히 깨진다.
+  assert(
+    roundMarker({ ...base, promptTemplate: 'PR {{url}} — 리뷰 라운드: {{round}}차' }, mk, 3) ===
+      `PR ${mk.prUrl} — 리뷰 라운드: 3차`,
+    '같은 줄의 {{url}} 도 렌더링한다',
+  );
+
   // 판별 불가는 항상 "다시 묻기" 로 떨어져야 한다 (null → 호출부가 종전대로 전송).
   assert(
-    roundMarker({ ...base, promptTemplate: ['PR: {{url}}', '리뷰해줘'].join('\n') }, 3) === null,
+    roundMarker({ ...base, promptTemplate: ['PR: {{url}}', '리뷰해줘'].join('\n') }, mk, 3) === null,
     '{{round}} 가 없는 템플릿이면 판별하지 않는다',
   );
-  assert(roundMarker({ ...base, promptTemplate: '' }, 3) === null, '빈 템플릿도 null');
+  assert(roundMarker({ ...base, promptTemplate: '' }, mk, 3) === null, '빈 템플릿도 null');
+  assert(
+    roundMarker({ ...base, promptTemplate: '{{round}}차 {{previous}}' }, mk, 3) === null,
+    '여러 줄로 펼쳐지는 블록이 같은 줄에 있으면 재현할 수 없다',
+  );
+  assert(
+    roundMarker({ ...base, promptTemplate: '{{round}}차 {{unknown}}' }, mk, 3) === null,
+    '렌더링하지 못한 변수가 남으면 판별하지 않는다',
+  );
 }
 
 // ── 시나리오 32: probe 를 건너뛴 주기의 제외 판정 ──────────

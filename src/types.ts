@@ -161,7 +161,13 @@ export interface PRContext {
    *
    * 응답을 확보하면 지운다. 없거나 대상이 달라졌으면 회수하지 않고 다시 묻는다.
    */
-  pendingSend?: { round: number; headSha: string | null; baseRef?: string | null };
+  pendingSend?: {
+    round: number;
+    headSha: string | null;
+    baseRef?: string | null;
+    /** 전송 시각 (ISO) — "이 전송이 이미 답을 받았는가" 를 라운드가 아니라 전송 단위로 본다 */
+    at?: string;
+  };
   /**
    * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).
    * 관측된 GitHub 현황을 캐시한 것일 뿐 상태가 아니다 — 필터를 통과하면 지워진다.

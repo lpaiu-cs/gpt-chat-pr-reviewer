@@ -25,7 +25,7 @@ import { loadInstructions } from './instructions.js';
 import {
   saveResponse,
   loadLatestResponse,
-  hasResponseForRound,
+  hasResponseSince,
   type ResponseMeta,
 } from './cache.js';
 import { progress } from './progress.js';
@@ -353,16 +353,29 @@ async function enterConversation(
 }
 
 /**
- * 프롬프트에서 라운드를 식별할 수 있는 한 줄.
+ * 프롬프트에서 라운드를 식별할 수 있는 한 줄. **실제로 전송되는 문자열과 같아야 한다.**
  *
  * 기본 템플릿의 `리뷰 라운드: {{round}}차` 를 그대로 쓴다. 사용자가 템플릿에서
  * `{{round}}` 를 없앴다면 판별할 수 없으므로 null 을 돌려주고, 호출부는 종전대로
  * 다시 묻는다 (판별 실패는 항상 "다시 묻기" 로 떨어져야 안전하다).
+ *
+ * 같은 줄에 다른 변수가 있으면 그것도 렌더링한다. `{{round}}` 만 치환하면
+ * `PR {{url}} — 리뷰 라운드: {{round}}차` 같은 사용자 템플릿에서 마커가 실제
+ * 메시지와 달라져 `findRound` 가 못 찾고, 멱등성이 조용히 깨진다.
+ *
+ * `{{previous}}` · `{{instructions}}` 는 여러 줄로 펼쳐지는 블록이라 한 줄 마커로
+ * 재현할 수 없다. 같은 줄에 있으면 판별을 포기한다.
  */
-export function roundMarker(cfg: AppConfig, round: number): string | null {
+export function roundMarker(cfg: AppConfig, ctx: PRContext, round: number): string | null {
   const line = cfg.promptTemplate.split(/\r?\n/).find((l) => l.includes('{{round}}'));
   if (!line) return null;
-  const marker = line.replace(/\{\{round\}\}/g, String(round)).trim();
+  if (/\{\{(previous|instructions)\}\}/.test(line)) return null;
+  const marker = line
+    .replace(/\{\{round\}\}/g, String(round))
+    .replace(/\{\{url\}\}/g, ctx.prUrl)
+    .trim();
+  // 렌더링하지 못한 변수가 남았다 — 실제 전송 문자열과 다르다.
+  if (/\{\{[^}]*\}\}/.test(marker)) return null;
   return marker.length > 0 ? marker : null;
 }
 
@@ -548,8 +561,10 @@ export interface RunRoundOptions {
  * 회수하지 않는 경우(전부 null → 평소 경로로 다시 묻는다):
  *  - dry-run          저장된 대화를 건드리지 않는 것이 목적이다
  *  - 마커 없음         템플릿에 {{round}} 가 없어 라운드를 식별할 수 없다
- *  - 이미 응답을 받아봄  받고도 실패했다는 뜻이라 같은 답을 다시 써도 결과가 같다
  *  - 대기 중인 전송 기록 없음  언제·무엇을 보고 물었는지 모른다
+ *  - **이 전송이 이미 답을 받아봄**  받고도 실패했다는 뜻이라 같은 답을 다시 써도
+ *    결과가 같다. 라운드가 아니라 **전송** 단위다 — 앞선 시도의 실패 응답이 새
+ *    전송의 회수를 막으면 같은 질문이 또 나간다
  *  - **리뷰 대상이 달라짐**  새 커밋 또는 base 변경 — 낡은 diff 를 보고 만든 답이다
  *  - 복귀 실패          대화가 삭제·이동됐다
  *  - 그 라운드가 마지막 질문이 아님  어느 응답이 그 라운드 것인지 단정할 수 없다
@@ -565,9 +580,8 @@ async function reclaimRound(
   const url = ctx.conversationUrl;
   if (!url) return null;
 
-  const marker = roundMarker(cfg, round);
+  const marker = roundMarker(cfg, ctx, round);
   if (!marker) return null;
-  if (hasResponseForRound(cfg, ctx, round)) return null;
 
   // 대화 + 라운드 번호는 "무엇을 보고 만든 답인가" 를 말해주지 않는다. 죽어 있는
   // 동안 작성자가 push 하거나 base 를 바꿨다면 그 답은 이미 없는 diff 에 대한
@@ -584,6 +598,11 @@ async function reclaimRound(
     }
     return null;
   }
+
+  // **이 전송** 이후 저장된 응답이 있으면 이미 받아본 것이다. 라운드 단위로 보면
+  // 앞선 시도의 실패 응답이 새 전송의 회수까지 막아 같은 질문이 또 나간다.
+  const sentAt = ctx.pendingSend?.at ? Date.parse(ctx.pendingSend.at) : NaN;
+  if (hasResponseSince(cfg, ctx, round, Number.isFinite(sentAt) ? sentAt : null)) return null;
 
   // 재전송하지 않으므로 어시스턴트 메시지가 없어도 된다 — 응답 전에 죽은 대화가
   // 정확히 그 모습이고, 여기서 실패로 보면 이 복구가 통째로 무의미해진다.
@@ -738,7 +757,7 @@ async function obtainRaw(
     conversationUrl = url ?? undefined;
     if (!opts.dryRun) {
       rememberConversation(ctx, conversationUrl, round);
-      ctx.pendingSend = { round, ...target };
+      ctx.pendingSend = { round, ...target, at: new Date().toISOString() };
       saveContext(cfg, ctx);
     }
   });

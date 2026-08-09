@@ -73,10 +73,44 @@ function readMeta(txtPath: string): ResponseMeta | null {
  * 우리가 아직 못 본 새 답이다.
  */
 export function hasResponseForRound(cfg: AppConfig, ctx: PRContext, round: number): boolean {
+  return responseTimesForRound(cfg, ctx, round).length > 0;
+}
+
+/**
+ * **이 전송** 이후에 저장된 응답이 있는가 (`sinceMs` = 전송 시각).
+ *
+ * 라운드 단위로 보면 안 된다. 2차 첫 응답이 파싱 실패로 저장되고 자동 재시도가
+ * 2차 질문을 **다시** 보낸 뒤 응답 대기 중 죽으면, 그 두 번째 전송은 아직 답을
+ * 받은 적이 없는데 첫 응답 파일 때문에 회수가 막힌다. 그러면 같은 질문이 또
+ * 나가서 — 이 변경이 막으려는 바로 그 낭비가 재발한다.
+ *
+ * 전송 시각을 모르면(구버전 기록) 라운드 단위로 물러선다. 회수를 놓치는 쪽이
+ * 낡은 응답을 게시하는 쪽보다 낫다.
+ */
+export function hasResponseSince(
+  cfg: AppConfig,
+  ctx: PRContext,
+  round: number,
+  sinceMs: number | null,
+): boolean {
+  if (sinceMs === null) return hasResponseForRound(cfg, ctx, round);
+  return responseTimesForRound(cfg, ctx, round).some((t) => t >= sinceMs);
+}
+
+/** 해당 라운드로 저장된 응답들의 저장 시각(ms). */
+function responseTimesForRound(cfg: AppConfig, ctx: PRContext, round: number): number[] {
   const dir = responsesDir(cfg);
-  if (!existsSync(dir)) return false;
+  if (!existsSync(dir)) return [];
   const head = `${prefixFor(ctx)}r${round}__`;
-  return readdirSync(dir).some((f) => f.startsWith(head) && f.endsWith('.txt'));
+  return readdirSync(dir)
+    .filter((f) => f.startsWith(head) && f.endsWith('.txt'))
+    .map((f) => {
+      try {
+        return statSync(path.join(dir, f)).mtimeMs;
+      } catch {
+        return 0; // 사라졌다 — 없는 것으로 본다
+      }
+    });
 }
 
 /** 해당 PR 의 가장 최근 응답을 읽는다 (없으면 null). */
