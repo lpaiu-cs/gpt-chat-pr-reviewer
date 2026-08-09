@@ -161,10 +161,15 @@ review-requested + 글롭 `include`/`exclude` + `filters`). 계정 모드는 Gra
 않아 완전히 무비용이다 (`driver` 가 null 로 남는다). `--dry-run` 은 게시만 건너뛸 뿐
 ChatGPT 를 호출하므로 이 용도로 쓸 수 없다.
 
-**watch 와 review 를 동시에 돌리면 안 된다.** `syncPRFromProbe` 는 스캔마다 무조건
+**watch 와 review 는 동시에 못 돈다 (`data/watch.lock` 이 막는다).** `syncPRFromProbe` 는 스캔마다 무조건
 `saveContext` 하고(reviewer.ts) `runRound` 는 2~15분 동안 ctx 를 메모리에 물고 있다.
 잠금이 없으므로 서로의 결과를 덮어쓴다. "지켜보되 하나만 리뷰" 는 `filters.only` 로
 한 프로세스 안에서 푼다.
+
+잠금은 `src/lock.ts` 가 담당하고 **UI 서버를 띄우기 전에** 잡는다 — 중복이 포트
+폴백(4478 막히면 4479)까지 도달하면 조용히 붙어 정상처럼 보인다. 실제로 그렇게
+사고가 났다. 주인이 죽은 잔여 잠금은 pid 생존 확인 후 자동으로 넘겨받고, 해제는
+`process.once('exit')` 에 걸어 어떤 반환 경로로 끝나도 정리되게 한다.
 
 검색과 폴링의 역할을 나눈 이유: 검색 인덱스는 반영 지연이 있어 새 커밋 감지에 쓸 수
 없다. 발견은 `discoveryIntervalMs`(기본 30초) 주기로, 감지는 10초 주기 probe 가 맡는다.
