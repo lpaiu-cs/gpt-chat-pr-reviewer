@@ -18,6 +18,21 @@ export class QuotaLimitError extends Error {
   }
 }
 
+/**
+ * 정해진 시간 안에 응답을 받지 못했다 — **내용 실패와 성격이 다르다.**
+ *
+ * 파싱 실패·리뷰 거부는 같은 답을 다시 써도 결과가 같지만, 타임아웃은 환경 사정이라
+ * 다시 시도하면 대개 풀린다. 둘을 같은 "리뷰 실패" 로 표기하면 로그만 보고는
+ * 무엇이 잘못됐는지 구분할 수 없고, 실제로 그래서 "오류가 왜 이렇게 잦은가" 를
+ * 되묻게 됐다.
+ */
+export class ResponseTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResponseTimeoutError';
+  }
+}
+
 /** 대화에서 읽어온 메시지 하나 (역할 + 본문). */
 export interface ConversationMessage {
   role: string;
@@ -907,17 +922,29 @@ export class ChatGPTDriver {
       }
     }
 
-    // ── 타임아웃 ──
-    if (lastText.trim().length > 0) {
-      console.log(chalk.yellow('  ⚠ 응답 타임아웃 — 현재까지 수신된 텍스트를 사용합니다.'));
+    // ── 예산 소진 ──
+    // **아직 생성 중인지**로 가른다. 글자가 좀 쌓였다는 것만으로 "받았다" 고 보면,
+    // 15분 직전에 JSON 을 쓰기 시작한 응답이 잘린 채 파서로 넘어가 ReviewRejected
+    // 로 둔갑한다. 원인은 타임아웃인데 표기는 붉은 "리뷰 실패" 가 되어, 이 구분이
+    // 느린 생성에서 통째로 우회된다.
+    const stillGenerating = await this.isStreaming(page);
+    const minutes = Math.round(timeout / 60_000);
+
+    if (!stillGenerating && lastText.trim().length > 0) {
+      // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
+      // 완성본일 가능성이 높으므로 복구용으로 쓴다 — 종전 동작.
+      console.log(chalk.yellow('  ⚠ 예산 소진 — 생성은 끝나 있어 현재 텍스트를 사용합니다.'));
       return lastText;
     }
 
     const quota = await this.detectQuotaLimit(page);
     if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
-    throw new Error(
-      `응답을 수신하지 못했습니다 (${Math.round(timeout / 60_000)}분 대기). ` +
-        '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
+    throw new ResponseTimeoutError(
+      lastText.trim().length > 0
+        ? `${minutes}분 안에 응답이 끝나지 않았습니다 (${lastText.length.toLocaleString()}자까지 생성). ` +
+          '잘린 응답은 게시하지 않습니다 — responseTimeoutMs 를 늘리거나 다음 라운드에서 다시 시도합니다.'
+        : `${minutes}분 동안 응답을 받지 못했습니다. ` +
+          '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
     );
   }
 
@@ -936,7 +963,7 @@ export class ChatGPTDriver {
     const deadline = Date.now() + this.cfg.responseTimeoutMs;
     while (await this.isStreaming(page)) {
       if (Date.now() > deadline) {
-        throw new Error(
+        throw new ResponseTimeoutError(
           '이전 응답이 계속 생성 중이라 전송을 보류했습니다 — 끊지 않기 위해 라운드를 넘깁니다.',
         );
       }
