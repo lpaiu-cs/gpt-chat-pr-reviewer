@@ -8,8 +8,10 @@ import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/m
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
-import { ghErrorMessage } from '../src/github.js';
-import type { PRInfo, PRState } from '../src/types.js';
+import { ghErrorMessage, type PRProbe } from '../src/github.js';
+import { syncPRFromProbe } from '../src/reviewer.js';
+import { loadConfig } from '../src/config.js';
+import type { PRInfo, PRState, PRContext } from '../src/types.js';
 
 let passed = 0;
 let failed = 0;
@@ -165,6 +167,70 @@ const fakePR: PRInfo = {
   assert(!msg.includes('at genericNodeError'), '스택 트레이스 미포함');
 
   assert(ghErrorMessage(new Error('plain failure')) === 'plain failure', '일반 Error 는 첫 줄');
+}
+
+// ── 시나리오 9: probe 기반 동기화 ──────────────────────────
+
+{
+  const cfg = loadConfig();
+
+  const awaiting = (): PRContext => {
+    const c = createContext(fakePR);
+    fire(c, 'START_REVIEW');
+    fire(c, 'POSTED_COMMENTS', {
+      patch: { round: 1, headShaAtLastReview: 'abc123' },
+    });
+    c.threads = [
+      { id: 'T1', path: 'a.ts', line: 1, isResolved: false, authorReplied: false, round: 1, snippet: 'x' },
+      { id: 'T2', path: 'b.ts', line: 2, isResolved: false, authorReplied: false, round: 1, snippet: 'y' },
+    ];
+    return c;
+  };
+
+  const probeOf = (c: PRContext, over: Partial<PRProbe>): PRProbe =>
+    ({
+      owner: c.owner, repo: c.repo, number: c.prNumber, url: c.prUrl, title: c.title,
+      author: 'a', baseBranch: 'main', headBranch: 'feat',
+      headSha: 'abc123', status: 'OPEN', updatedAt: '2026-01-01T00:00:00Z',
+      ...over,
+    }) as PRProbe;
+
+  // Phase 0 핵심: resolve 는 updatedAt 을 갱신하지 않으므로 스레드 상태를 직접 봐야 한다
+  const c1 = awaiting();
+  syncPRFromProbe(cfg, c1, probeOf(c1, {
+    threads: [{ id: 'T1', isResolved: true }, { id: 'T2', isResolved: true }],
+  }));
+  assert(c1.state === 'REVIEW_DUE', 'probe: 전체 resolve → AUTHOR_RESPONDED (updatedAt 무관)');
+
+  // 일부만 resolve 면 아직 대기
+  const c2 = awaiting();
+  syncPRFromProbe(cfg, c2, probeOf(c2, {
+    threads: [{ id: 'T1', isResolved: true }, { id: 'T2', isResolved: false }],
+  }));
+  assert(c2.state === 'AWAITING_AUTHOR', 'probe: 일부 resolve 는 전이하지 않음');
+
+  // 새 커밋 감지
+  const c3 = awaiting();
+  syncPRFromProbe(cfg, c3, probeOf(c3, { headSha: 'def456' }));
+  assert(c3.state === 'REVIEW_DUE', 'probe: head SHA 변경 → AUTHOR_RESPONDED');
+
+  // PR 닫힘
+  const c4 = awaiting();
+  syncPRFromProbe(cfg, c4, probeOf(c4, { status: 'MERGED' }));
+  assert(c4.state === 'CLOSED', 'probe: 머지 → CLOSED');
+
+  // 모르는 스레드가 보이면 전체 동기화를 요구한다
+  const c5 = awaiting();
+  const needsFull = syncPRFromProbe(cfg, c5, probeOf(c5, {
+    threads: [{ id: 'T1', isResolved: false }, { id: 'T9', isResolved: false }],
+  }));
+  assert(needsFull, 'probe: 미지의 스레드 발견 시 전체 동기화 요구');
+
+  const c6 = awaiting();
+  const noFull = syncPRFromProbe(cfg, c6, probeOf(c6, {
+    threads: [{ id: 'T1', isResolved: false }, { id: 'T2', isResolved: false }],
+  }));
+  assert(!noFull, 'probe: 알던 스레드만 있으면 전체 동기화 불필요');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

@@ -62,16 +62,6 @@ export function getPRInfo(owner: string, repo: string, number: number): PRInfo {
   return toPRInfo(owner, repo, JSON.parse(raw));
 }
 
-/** 열린 PR 목록 반환. */
-export function listOpenPRs(ownerSlashRepo: string): PRInfo[] {
-  const raw = execSync(
-    `gh pr list --repo ${ownerSlashRepo} --state open --json ${PR_JSON_FIELDS} --limit 50`,
-    { encoding: 'utf-8' },
-  );
-  const [owner, repo] = ownerSlashRepo.split('/');
-  return (JSON.parse(raw) as any[]).map((d) => toPRInfo(owner, repo, d));
-}
-
 // ── GraphQL 동기화 (스레드 resolve · head SHA · PR 상태) ────
 
 export interface SyncThread {
@@ -150,6 +140,90 @@ export function ghErrorMessage(e: unknown): string {
   }
   const raw = e instanceof Error ? e.message : String(e);
   return raw.split('\n').find((l) => l.trim()) ?? raw;
+}
+
+// ── 배치 probe (감시 루프용) ────────────────────────────────
+
+/** probe 로 얻는 PR 1건의 요약. */
+export interface PRProbe extends PRInfo {
+  status: 'OPEN' | 'CLOSED' | 'MERGED';
+  updatedAt: string;
+  /** 스레드 상태를 함께 조회한 경우에만 채워진다 (resolve 감지용). */
+  threads?: { id: string; isResolved: boolean }[];
+}
+
+export interface RepoProbe {
+  prs: PRProbe[];
+  /** GitHub 이 계산한 이 쿼리의 실제 비용 */
+  cost: number;
+  remaining: number;
+}
+
+/** 한 쿼리에 붙일 스레드 alias 최대 개수 — 쿼리가 과도하게 커지지 않게 제한. */
+export const MAX_THREAD_ALIASES = 20;
+
+const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName headRefName author{ login }`;
+
+/**
+ * 레포 1개의 감시 스냅샷을 **GraphQL 1회**로 가져온다.
+ *
+ * 열린 PR 목록에 더해, `threadsFor` 로 지정한 PR 들의 리뷰 스레드 resolve 상태를
+ * alias 로 함께 조회한다. 실측 결과 목록 + alias 여러 개를 합쳐도 cost 는 1 이므로,
+ * 스캔 1회 비용이 PR 개수와 무관한 상수가 된다.
+ *
+ * 주의: PR.updatedAt 은 스레드 resolve 로 갱신되지 않는다(실측). 따라서
+ * resolve 감지가 필요한 PR 은 반드시 threadsFor 에 포함시켜야 한다.
+ */
+export function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []): RepoProbe {
+  const [owner, repo] = ownerSlashRepo.split('/');
+  const aliases = threadsFor
+    .slice(0, MAX_THREAD_ALIASES)
+    .map(
+      (n) => `    t${n}: pullRequest(number:${n}){ reviewThreads(first:100){ nodes{ id isResolved } } }`,
+    )
+    .join('\n');
+
+  const query = `query($owner:String!,$name:String!){
+  rateLimit{ cost remaining }
+  repository(owner:$owner,name:$name){
+    prs: pullRequests(states:OPEN, first:50, orderBy:{field:UPDATED_AT,direction:DESC}){
+      nodes{ ${PROBE_PR_FIELDS} }
+    }
+${aliases}
+  }
+}`;
+
+  const raw = execSync(`gh api graphql -F owner=${owner} -F name=${repo} -F query=@-`, {
+    encoding: 'utf-8',
+    input: query,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  const data = JSON.parse(raw).data;
+  const repoNode = data.repository;
+
+  const prs: PRProbe[] = (repoNode.prs?.nodes ?? []).map((n: any) => ({
+    ...toPRInfo(owner, repo, n),
+    status: n.state,
+    updatedAt: n.updatedAt,
+  }));
+
+  // alias 로 딸려온 스레드 상태를 해당 PR 에 붙인다
+  for (const n of threadsFor.slice(0, MAX_THREAD_ALIASES)) {
+    const node = repoNode[`t${n}`];
+    if (!node) continue;
+    const threads = (node.reviewThreads?.nodes ?? []).map((t: any) => ({
+      id: t.id,
+      isResolved: t.isResolved,
+    }));
+    const target = prs.find((p) => p.number === n);
+    if (target) target.threads = threads;
+  }
+
+  return {
+    prs,
+    cost: data.rateLimit?.cost ?? 1,
+    remaining: data.rateLimit?.remaining ?? -1,
+  };
 }
 
 let viewerLoginCache: string | null = null;

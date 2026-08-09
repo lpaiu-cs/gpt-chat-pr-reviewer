@@ -16,6 +16,7 @@ import {
   getViewerLogin,
   getPRInfo,
   type SyncThread,
+  type PRProbe,
 } from './github.js';
 import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
@@ -61,6 +62,12 @@ export function adoptThreads(
 
 // ── 동기화 (reconciliation) ─────────────────────────────────
 
+/** 상태 전이 판정에 필요한 GitHub 현황의 최소 집합. */
+export interface SyncSnapshot {
+  status: 'OPEN' | 'CLOSED' | 'MERGED';
+  headSha: string;
+}
+
 /**
  * GitHub 현황을 가져와 컨텍스트 상태를 전이시킨다.
  * 호출 후 컨텍스트는 저장된 상태다.
@@ -83,13 +90,23 @@ export function syncPR(cfg: AppConfig, ctx: PRContext): void {
     /* 오프라인 등 — 스레드 병합만 생략 */
   }
   adoptThreads(ctx, data.threads, viewer, ctx.round);
+  applySyncEvents(cfg, ctx, data);
+  saveContext(cfg, ctx);
+}
 
+/**
+ * 스냅샷을 근거로 상태 머신 이벤트를 발화한다. 저장은 호출부 책임.
+ *
+ * 이 함수는 GitHub API 를 호출하지 않는다 — 전체 동기화 경로와 배치 probe 경로가
+ * 동일한 판정 로직을 공유하게 하기 위해 분리했다. 상태 머신(TRANSITIONS)은
+ * 그대로이며, 여기서는 어떤 이벤트를 언제 발화할지만 정한다.
+ */
+export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapshot): void {
   // 1. PR 닫힘/머지
   if (data.status !== 'OPEN') {
     if (ctx.state !== 'CLOSED') {
       fire(ctx, 'PR_CLOSED', { note: data.status === 'MERGED' ? '머지됨' : '닫힘' });
     }
-    saveContext(cfg, ctx);
     return;
   }
 
@@ -136,8 +153,36 @@ export function syncPR(cfg: AppConfig, ctx: PRContext): void {
   ) {
     fire(ctx, 'NEW_COMMITS', { note: '수렴 후 새 커밋 — 리뷰 재개' });
   }
+}
 
+/**
+ * 배치 probe 결과로 컨텍스트를 동기화한다 (GitHub 추가 호출 없음).
+ *
+ * probe 는 스레드의 id·isResolved 만 담으므로 소유자·답글 판별을 할 수 없다.
+ * 따라서 **이미 추적 중인 스레드의 resolve 상태만 갱신**하고, 새 스레드가 보이면
+ * 전체 동기화가 필요하다고 알린다.
+ *
+ * @returns 전체 동기화(fetchPRSyncData)가 추가로 필요하면 true
+ */
+export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe): boolean {
+  let needsFull = false;
+
+  if (probe.threads) {
+    const known = new Map(ctx.threads.map((t) => [t.id, t]));
+    for (const t of probe.threads) {
+      const rec = known.get(t.id);
+      if (rec) {
+        rec.isResolved = t.isResolved;
+      } else {
+        // 우리가 모르는 스레드 — 우리 것인지, 누가 답글을 달았는지 probe 로는 알 수 없다
+        needsFull = true;
+      }
+    }
+  }
+
+  applySyncEvents(cfg, ctx, { status: probe.status, headSha: probe.headSha });
   saveContext(cfg, ctx);
+  return needsFull;
 }
 
 // ── 프롬프트 구성 ───────────────────────────────────────────
