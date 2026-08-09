@@ -81,7 +81,8 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
     "filters": {
       "authors": ["lpaiu-cs"],      // 이 작성자들의 PR만
       "labels": ["needs-review"],   // 이 라벨을 하나라도 가진 PR만
-      "draft": false                // 초안 제외 (기본값)
+      "draft": false,               // 초안 제외 (기본값)
+      "skip": ["myorg/api#12"]      // 이 PR만 콕 집어 제외
     },
     "discoveryIntervalMs": 300000   // 레포 재탐색 주기 (기본 5분)
   }
@@ -95,6 +96,8 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
 | `review-requested` | 현재 `gh` 계정에 **리뷰가 요청된 PR만** (레포 단위가 아니라 PR 단위) |
 
 필터는 AND로 적용되며, 걸린 PR은 추적을 시작하지도 않습니다. `filters`가 없으면 **초안(draft)은 제외**됩니다 — 작성 중인 PR까지 대화 한도를 쓰지 않기 위해서입니다. `"draft": true`로 되돌릴 수 있습니다.
+
+`skip`은 `authors`/`labels`/`draft`로 표현할 수 없는 **개별 제외**입니다. 오래돼서 지금은 리뷰받고 싶지 않은 PR을 감시 범위를 좁히지 않고 골라낼 때 씁니다. `'owner/repo#12'` 형식(대소문자 무시)이며, 다른 조건보다 **먼저** 판정되므로 `"draft": true` 같은 설정이 뒤집지 못합니다. 이미 추적 중이던 PR도 다음 스캔에서 큐에서 빠집니다. 형식이 틀린 항목은 아무것도 매치하지 않으므로 `watch` 시작 시 경고로 알립니다.
 
 > `review-requested`는 PR 번호까지 보존해 대상을 한정합니다. 레포 단위로 축약하면 리뷰 요청받은 PR 하나 때문에 그 레포의 열린 PR 전부가 리뷰 대상이 됩니다.
 >
@@ -207,7 +210,7 @@ npm run dev -- watch --ui
 | `init` | 설정 파일 + 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 리뷰 지침 파일 열기 |
 | `review <pr>` | 리뷰 라운드 실행 — `--dry-run` `--force` `--headless` `--timeout <분>` `--from-cache` `--instructions <file>` |
-| `watch` | 감시 범위 폴링 → 동기화 → 큐 순서대로 자동 리뷰 — `--once` `--headless` `--dry-run` `--ui` `--ui-port <port>` |
+| `watch` | 감시 범위 폴링 → 동기화 → 큐 순서대로 자동 리뷰 — `--once` `--headless` `--dry-run` `--observe` `--ui` `--ui-port <port>` |
 | `queue` | 리뷰 대기열 조회 — `--json` |
 | `status [pr]` | PR 상태 조회 — `--json` |
 | `graph [pr]` | 상태 머신 mermaid 다이어그램 출력 |
@@ -235,10 +238,23 @@ npm run dev -- review <pr-url> --from-cache
 
 `review`는 상태를 존중합니다. `AWAITING_AUTHOR`인 PR에 실행하면 대기 중임을 알리고 종료하며, `--force`로만 강제 실행됩니다.
 
+## 관측 모드
+
+```bash
+npm run dev -- watch --observe
+```
+
+감시·동기화·큐 계산까지 다 하되 **리뷰는 실행하지 않습니다.** 브라우저를 아예 띄우지 않으므로 ChatGPT 한도도, Chrome 창도, 로그인도 필요 없습니다. GitHub 폴링 비용(레포당 1 point)만 듭니다.
+
+무엇이 리뷰 대상인지 먼저 보고 싶을 때, 대시보드를 시험해 볼 때, 필터·`skip` 설정을 검증할 때 씁니다.
+
+> `--dry-run`은 이 용도로 쓸 수 없습니다. **게시만 건너뛸 뿐 ChatGPT는 그대로 호출**해서 대화 한도를 소비합니다. `--once`도 마찬가지로 "1회 스캔"이지 "1건만 리뷰"가 아니어서 그 스캔의 큐를 끝까지 소진합니다.
+
 ## 대시보드
 
 ```bash
-npm run dev -- watch --ui        # http://127.0.0.1:4478
+npm run dev -- watch --ui                  # http://127.0.0.1:4478
+npm run dev -- watch --ui --observe        # 리뷰 없이 화면만 (무비용)
 npm run dev -- watch --ui --ui-port 9000
 ```
 

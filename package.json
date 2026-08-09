@@ -1,6 +1,6 @@
 {
   "name": "gpt-chat-pr-reviewer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "ChatGPT 웹 대화창(chat)을 이용한 상태 머신 기반 GitHub PR 자동 리뷰",
   "license": "MIT",
   "repository": {

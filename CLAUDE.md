@@ -116,6 +116,15 @@ read-modify-write 를 붙잡으므로, 다른 읽기·쓰기 경로가 끼어들
 review-requested + 글롭 `include`/`exclude` + `filters`). 계정 모드는 GraphQL 검색으로
 "열린 PR 이 있는 레포" 를 발견한 뒤 그 목록을 레포 probe 에 넘긴다.
 
+`filters.skip` (`'owner/repo#12'`) 은 authors/labels/draft 로 표현할 수 없는 개별 제외다.
+`passesFilters` 에서 **가장 먼저** 판정한다 — 명시적으로 지목한 제외를 `draft: true` 같은
+다른 조건이 뒤집으면 안 된다. 형식이 틀리면 아무것도 매치하지 않아 조용히 무효가 되므로
+`invalidSkipEntries` 로 watch 시작 시 한 번 검사해 알린다.
+
+`--observe` 는 감시·동기화·큐 계산만 하고 리뷰를 실행하지 않는다. 브라우저를 아예 띄우지
+않아 완전히 무비용이다 (`driver` 가 null 로 남는다). `--dry-run` 은 게시만 건너뛸 뿐
+ChatGPT 를 호출하므로 이 용도로 쓸 수 없다.
+
 검색과 폴링의 역할을 나눈 이유: 검색 인덱스는 반영 지연이 있어 새 커밋 감지에 쓸 수
 없다. 발견은 `discoveryIntervalMs`(기본 5분) 주기로, 감지는 10초 주기 probe 가 맡는다.
 구버전 `watchRepos` 는 `watch.include` 가 비었을 때의 폴백으로 계속 동작한다.
@@ -144,7 +153,7 @@ npm install
 npm run smoke        # 상태 머신 테스트
 npm run dev -- init  # 설정 + instructions.md 생성
 npm run dev -- review <pr-url> [--dry-run|--force]
-npm run dev -- watch [--once|--headless|--ui|--ui-port <port>]
+npm run dev -- watch [--once|--headless|--observe|--ui|--ui-port <port>]
 npm run dev -- queue [--json]   # 리뷰 대기열
 npm run dev -- status [pr] [--json]
 npm run dev -- graph [pr]   # mermaid 다이어그램

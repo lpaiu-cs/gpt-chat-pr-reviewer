@@ -31,6 +31,7 @@ import {
   admitsNewPR,
   createRepoSource,
   describeScope,
+  invalidSkipEntries,
   matchesScope,
   passesFilters,
   resolveWatchScope,
@@ -199,7 +200,7 @@ function openInEditor(file: string): void {
 const program = new Command()
   .name('pr-review')
   .description('상태 머신 기반 ChatGPT PR 자동 리뷰')
-  .version('0.2.0');
+  .version('0.3.0');
 
 // ── setup ──
 
@@ -377,12 +378,14 @@ program
   .option('--headless', '헤드리스 모드로 실행', false)
   .option('--dry-run', '게시·상태 전이 없이 결과만 출력', false)
   .option('--once', '1회만 스캔 후 큐를 모두 소진하고 종료', false)
+  .option('--observe', '감시·동기화만 하고 리뷰는 실행하지 않는다 (브라우저·한도 소비 없음)', false)
   .option('--ui', '관측 대시보드를 localhost 에 띄운다 (읽기 전용)', false)
   .option('--ui-port <port>', `대시보드 포트 (기본 ${DEFAULT_UI_PORT})`)
   .action(async (opts: {
     headless: boolean;
     dryRun: boolean;
     once: boolean;
+    observe: boolean;
     ui: boolean;
     uiPort?: string;
   }) => {
@@ -409,6 +412,17 @@ program
       return;
     }
     console.log(chalk.dim(`  감시 범위: ${describeScope(scope)}`));
+
+    // 형식이 틀린 skip 항목은 아무것도 매치하지 않아 조용히 무효가 된다.
+    // 제외한 줄 알았던 PR 이 리뷰되면 되돌릴 수 없으므로 시작할 때 짚어준다.
+    const badSkip = invalidSkipEntries(scope.filters);
+    if (badSkip.length > 0) {
+      console.log(
+        chalk.yellow(`  ⚠ filters.skip 형식 오류 ${badSkip.length}건 — 제외되지 않습니다: ${badSkip.join(', ')}`),
+      );
+      console.log(chalk.dim("    'owner/repo#12' 형식이어야 합니다."));
+    }
+
     const repoSource = createRepoSource(scope);
 
     // ── 관측 대시보드 ──
@@ -437,19 +451,30 @@ program
       }
     }
 
-    const driver = new ChatGPTDriver(cfg);
-    await driver.launch();
-    await driver.navigateToChatGPT();
+    // ── 관측 모드 ──
+    // 리뷰를 실행하지 않으므로 브라우저를 아예 띄우지 않는다. ChatGPT 한도도,
+    // Chrome 창도, 로그인도 필요 없다 — GitHub 폴링만 도는 완전한 무비용 모드다.
+    let driver: ChatGPTDriver | null = null;
+    if (opts.observe) {
+      console.log(
+        chalk.cyan('  ◆ 관측 모드 — 리뷰를 실행하지 않습니다') +
+          chalk.dim(' (브라우저 미실행 · ChatGPT 한도 소비 없음)'),
+      );
+    } else {
+      driver = new ChatGPTDriver(cfg);
+      await driver.launch();
+      await driver.navigateToChatGPT();
 
-    const user = await driver.getSessionUser();
-    if (!user) {
-      console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
-      await driver.close();
-      await ui?.close();
-      return;
+      const user = await driver.getSessionUser();
+      if (!user) {
+        console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
+        await driver.close();
+        await ui?.close();
+        return;
+      }
+      console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
+      progress.patch({ account: user.email ?? user.name ?? null });
     }
-    console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
-    progress.patch({ account: user.email ?? user.name ?? null });
 
     // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
     // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
@@ -463,15 +488,19 @@ program
     // watch 를 재시작해도 컨텍스트에서 복원되도록 시작 시 한 번 읽어둔다.
     let quotaUntil = quotaGateUntil(listContexts(cfg)) ?? 0;
     let quotaNotified = 0;
+    let observeNotified = 0;
 
     const reportIfChanged = (ctx: PRContext): void => {
       const key = `${ctx.owner}/${ctx.repo}#${ctx.prNumber}`;
-      const sig = `${ctx.state}:${ctx.round}`;
+      // 제외 사유도 서명에 넣는다 — skip 을 넣거나 뺀 것도 상태 변화로 보고해야 한다.
+      const sig = `${ctx.state}:${ctx.round}:${ctx.excludedReason ?? ''}`;
       if (reported.get(key) === sig) return;
       reported.set(key, sig);
+      // REVIEW_DUE 인데 필터에 걸린 PR 을 상태만 찍으면 곧 리뷰될 것처럼 보인다.
+      const excluded = ctx.excludedReason ? chalk.dim(`  — 제외: ${ctx.excludedReason}`) : '';
       console.log(
         `    ${chalk.dim(`${ctx.owner}/${ctx.repo}`)}#${String(ctx.prNumber).padEnd(5)} ` +
-          `${stateBadge(ctx.state)} ${chalk.dim(ctx.title.slice(0, 45))}`,
+          `${stateBadge(ctx.state)} ${chalk.dim(ctx.title.slice(0, 45))}${excluded}`,
       );
     };
 
@@ -624,7 +653,7 @@ program
           .map(toCard),
         quotaUntil: quotaAt > Date.now() ? quotaAt : null,
       });
-      progress.cycle({ openCount });
+      progress.cycle({ openCount, watchedRepos });
     };
 
     const loop = async (drain: boolean): Promise<boolean> => {
@@ -640,6 +669,19 @@ program
       // dry-run 은 상태를 전이시키지 않으므로 메모리 값도 함께 본다.
       quotaUntil = Math.max(quotaUntil, quotaGateUntil(eligible) ?? 0);
       publish(seen, queue, openCount, quotaUntil);
+
+      // ── 관측 모드: 큐는 만들되 실행하지 않는다 ──
+      // 쿼터 게이트보다 앞선다 — 리뷰를 안 하니 한도는 애초에 무관하다.
+      if (opts.observe) {
+        tally();
+        if (queue.length > 0 && Date.now() - observeNotified > HEARTBEAT_MS) {
+          observeNotified = Date.now();
+          console.log(
+            chalk.cyan(`    관측 모드 — 대기열 ${queue.length}건을 표시만 하고 실행하지 않습니다.`),
+          );
+        }
+        return false;
+      }
 
       if (queue.length > 0 && Date.now() < quotaUntil) {
         tally(); // 실행은 건너뛰어도 스캔 비용은 이번 사이클 몫이다
@@ -749,7 +791,7 @@ program
     await loop(opts.once);
 
     if (opts.once) {
-      await driver.close();
+      await driver?.close();
       await ui?.close();
       return;
     }
@@ -790,7 +832,7 @@ program
     const cleanup = async () => {
       stopped = true;
       if (timer) clearTimeout(timer);
-      await driver.close();
+      await driver?.close();
       await ui?.close();
       process.exit(0);
     };

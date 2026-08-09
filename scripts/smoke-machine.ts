@@ -26,10 +26,12 @@ import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
   globToRegExp,
+  invalidSkipEntries,
   matchesScope,
   nextRepoCache,
   passesFilters,
   resolveWatchScope,
+  type FilterablePR,
 } from '../src/watch-scope.js';
 import {
   buildQueue,
@@ -606,7 +608,10 @@ const fakePR: PRInfo = {
 // ── 시나리오 17: 대상 필터 ─────────────────────────────────
 
 {
-  const pr = (over: Partial<{ author: string; isDraft: boolean; labels: string[] }> = {}) => ({
+  const pr = (over: Partial<FilterablePR> = {}): FilterablePR => ({
+    owner: 'lpaiu-cs',
+    repo: 'osk-system',
+    number: 12,
     author: 'lpaiu-cs',
     isDraft: false,
     labels: ['needs-review'],
@@ -633,6 +638,44 @@ const fakePR: PRInfo = {
 
   const verdict = passesFilters(pr({ isDraft: true }));
   assert(!!verdict.reason, '제외 사유가 붙는다');
+
+  // ── skip: 개별 PR 제외 ──
+  const skip = ['LPAIU-CS/OSK-System#12'];
+  assert(!passesFilters(pr(), { skip }).ok, 'skip 목록의 PR 은 제외 (대소문자 무시)');
+  assert(passesFilters(pr({ number: 13 }), { skip }).ok, '번호가 다르면 통과');
+  assert(passesFilters(pr({ repo: 'other' }), { skip }).ok, '레포가 다르면 통과');
+  assert(passesFilters(pr({ owner: 'other' }), { skip }).ok, '소유자가 다르면 통과');
+  assert(passesFilters(pr(), { skip: [] }).ok, '빈 skip 은 아무것도 막지 않는다');
+  assert(
+    passesFilters(pr({ number: 121 }), { skip: ['lpaiu-cs/osk-system#12'] }).ok,
+    '번호는 접두 일치가 아니라 완전 일치 (#12 가 #121 을 막지 않는다)',
+  );
+  assert(
+    passesFilters(pr(), { skip: [' lpaiu-cs/osk-system#12 '] }).ok === false,
+    'skip 항목의 앞뒤 여백은 무시',
+  );
+
+  // skip 은 가장 먼저 판정된다 — 다른 조건이 명시적 제외를 뒤집으면 안 된다.
+  assert(
+    !passesFilters(pr({ isDraft: true }), { skip, draft: true }).ok,
+    'draft: true 여도 skip 이 이긴다',
+  );
+  assert(
+    passesFilters(pr(), { skip }).reason === 'skip 목록',
+    'skip 제외 사유가 다른 조건에 가려지지 않는다',
+  );
+
+  // 형식이 틀리면 아무것도 매치하지 않아 조용히 무효가 된다 — 시작 시 잡아야 한다.
+  assert(invalidSkipEntries({ skip: ['owner/repo#12'] }).length === 0, '정상 형식은 통과');
+  assert(
+    invalidSkipEntries({ skip: ['owner/repo', '#12', 'owner/repo#', 'owner#12'] }).length === 4,
+    '번호·소유자가 빠진 항목은 형식 오류',
+  );
+  assert(invalidSkipEntries(undefined).length === 0, 'skip 이 없으면 오류도 없다');
+  assert(
+    invalidSkipEntries({ skip: [' owner/repo#12 '] }).length === 0,
+    '여백만 있는 차이는 오류가 아니다 (판정과 같은 기준)',
+  );
 }
 
 // ── 시나리오 18: 감시 범위 해석 (구버전 설정 호환) ─────────
