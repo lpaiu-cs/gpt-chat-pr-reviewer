@@ -113,6 +113,30 @@ export interface PRContext {
    * 매 tick "미지" 로 판정되어 전체 동기화를 무한히 유발한다.
    */
   knownThreadIds?: string[];
+  /**
+   * 이 PR 의 라운드를 이어가는 ChatGPT 대화 URL (https://chatgpt.com/c/<uuid>).
+   *
+   * 상태가 아니라 실행기 사정이다 — 상태 머신(TRANSITIONS)에는 관여하지 않는다.
+   * 미수렴 동안만 유지하고 CONVERGED·CLOSED 에서 해제한다.
+   */
+  conversationUrl?: string;
+  /**
+   * 위 대화를 만든 시점의 라운드 번호 (1-based).
+   * 대화 누적 라운드 수(= round - conversationStartRound)와,
+   * "어떤 스레드가 그 대화 안에 이미 있는지" 를 함께 판정하는 기준이다.
+   */
+  conversationStartRound?: number;
+  /**
+   * 위 대화에 **실제로 전송한 프롬프트 수**. 회전 판정의 기준이다.
+   *
+   * 완료된 라운드로 세면 안 된다 — 파싱·게시가 실패하면 ctx.round 는 늘지 않지만
+   * 프롬프트와 응답은 이미 대화에 쌓여 있다. 라운드 기준이면 자동 재시도가
+   * 컨텍스트 보호 상한을 그대로 우회한다.
+   *
+   * conversationUrl 과 짝을 이룰 때만 의미가 있다. URL 없이 남아 있는 값은 주소를
+   * 확보하지 못한 채 끝난 대화의 잔여물이며, 다음 전송에서 버려진다(countTurn).
+   */
+  conversationTurns?: number;
   retryCount: number;
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
@@ -160,6 +184,12 @@ export interface AppConfig {
   quotaCooldownMs: number;
   /** ERROR 상태 자동 재시도 최대 횟수 */
   maxAutoRetries: number;
+  /**
+   * 대화 1개에 전송할 최대 프롬프트 수. 초과하면 새 대화로 전환한다.
+   * 전송마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙일 수 없다.
+   * 실패해 다시 보낸 것도 대화에는 남으므로 함께 센다 (완료 라운드 수가 아니다).
+   */
+  maxTurnsPerConversation: number;
   /** watch 모드 폴링 간격 (ms) */
   watchIntervalMs: number;
   /** watch 대상 레포 목록 ('owner/repo') */
