@@ -73,7 +73,7 @@ const DEFAULT_CONFIG: AppConfig = {
   customInstructionsFile: './instructions.md',
   quotaCooldownMs: 3 * 60 * 60_000, // 3시간
   maxAutoRetries: 2,
-  watchIntervalMs: 300_000, // 5분
+  watchIntervalMs: 10_000, // 10초 — 스캔 1회 = 레포당 1 point 이므로 부담이 없다
   watchRepos: [],
   dataDir: './data',
 };

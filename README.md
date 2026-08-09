@@ -62,6 +62,10 @@ PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레�
 
 `watch` 루프는 매 사이클마다 GitHub 현황(스레드 resolve 상태, head SHA, PR 열림/닫힘)을 읽어 상태 머신 이벤트로 변환합니다. 프로세스가 죽어 `REVIEWING`에 멈춰 있어도 다음 사이클에서 자동 복구됩니다.
 
+스캔은 **레포당 GraphQL 1회**입니다. 열린 PR 목록과 리뷰 스레드의 resolve 상태를 한 쿼리에 담아 비용이 PR 개수와 무관한 상수(1 point)가 됩니다. 기본 폴링 주기는 10초이며, 리뷰를 실행한 사이클 직후에는 대기 없이 재스캔합니다.
+
+> 스레드 resolve는 `pullRequest.updatedAt`을 갱신하지 **않습니다**(실측 확인). 따라서 `updatedAt` 비교만으로는 resolve를 감지할 수 없고, `AWAITING_AUTHOR` 상태인 PR은 스레드 상태를 직접 조회합니다. 자세한 측정은 [#4](https://github.com/lpaiu-cs/gpt-chat-pr-reviewer/issues/4) 참고.
+
 2차 라운드부터는 프롬프트에 **이전 라운드 코멘트 현황**(해결됨 / 답변만 있음 / 미해결)이 포함되어, 이전 지적의 반영 여부와 새 변경사항 위주로 검토합니다.
 
 ---
@@ -160,7 +164,7 @@ npm run dev -- review <pr-url> --from-cache
 | 키 | 기본값 | 설명 |
 |---|---|---|
 | `watchRepos` | `[]` | 감시할 `owner/repo` 목록 |
-| `watchIntervalMs` | `300000` | 폴링 간격 (5분) |
+| `watchIntervalMs` | `10000` | 폴링 간격 (10초, 하한 5초) |
 | `quotaCooldownMs` | `10800000` | 쿼터 쿨다운 (3시간) |
 | `maxAutoRetries` | `2` | ERROR 자동 재시도 횟수 |
 | `headless` | `false` | 헤드리스 실행 |
