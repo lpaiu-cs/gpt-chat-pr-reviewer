@@ -86,11 +86,16 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 않는다. 받고도 실패했다는 뜻이라 같은 답을 다시 써도 결과가 같고, 재시도가
 무의미해진다.
 
-회수는 **head SHA 까지 맞아야** 한다(`judgeReclaimHead`). 대화 + 라운드 번호는
-"무엇을 보고 만든 답인가" 를 말해주지 않는다 — 죽어 있는 사이 작성자가 push 하면
-없는 코드를 지적하고, 게시 후 현재 head 가 검토 완료로 적혀 **한 번도 보지 않은
-커밋이 approve 하나로 CONVERGED** 가 된다. 그래서 질문을 보내기 전 head 를
-`pendingSend` 에 대화 URL 과 함께 남기고, 회수 전에 현재 head 와 대조한다.
+회수는 **리뷰 대상까지 맞아야** 한다(`judgeReclaim`). 대화 + 라운드 번호는 "무엇을
+보고 만든 답인가" 를 말해주지 않는다 — 죽어 있는 사이 작성자가 push 하면 없는 코드를
+지적하고, 게시 후 현재 head 가 검토 완료로 적혀 **한 번도 보지 않은 커밋이 approve
+하나로 CONVERGED** 가 된다. 그래서 질문을 보내기 전 대상을 `pendingSend` 에 대화 URL
+과 함께 남기고, 회수 전에 현재 값과 대조한다.
+
+대상은 head SHA **와 base ref** 다. 리뷰가 보는 건 커밋 하나가 아니라 `base...head`
+라서, base 를 main → release 로 바꾸면 head 가 그대로여도 완전히 다른 diff 다.
+base 브랜치가 앞으로 나가는 건 대상에 안 들어온다 — 3-dot 은 merge-base 기준이라
+그때 diff 가 바뀌지 않는다. 판별 불가(구버전 기록 포함)는 전부 "다시 묻기" 다.
 
 같은 이유로 `headShaAtLastReview` 에는 **검토한** head 를 적는다 (게시 후 조회값이
 아니다). 대기하는 2~15분 사이의 push 가 "검토함" 으로 삼켜지면 안 된다 — 검토한
@@ -99,8 +104,8 @@ head 를 적어두면 그 push 는 다음 sync 에서 새 커밋으로 잡혀 �
 내부 기록만으로는 부족하다. **게시하는 리뷰도 검토한 커밋에 고정한다**(`commit_id`).
 빼면 GitHub 이 게시 시점의 최신 커밋에 리뷰를 붙여, 본 적 없는 커밋에 APPROVE 가
 직접 달리고 branch protection 승인 조건까지 만족시킨다. 라인 검증에 쓰는 diff 도
-같은 커밋 기준이어야 한다 (`fetchDiffAt` — 3-dot 이라 PR diff 와 merge-base 가 같다).
-`gh pr diff` 는 언제나 현재 head 를 준다.
+**검토 시점의 `base...head`** 여야 한다 (`fetchDiffAt` — 3-dot 이라 PR diff 와
+merge-base 가 같다). `gh pr diff` 는 언제나 현재 head·현재 base 를 준다.
 
 ## 리뷰 큐
 

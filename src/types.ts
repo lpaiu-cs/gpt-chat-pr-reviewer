@@ -146,9 +146,13 @@ export interface PRContext {
    * 낡은 head 를 보고 만든 답을 회수하고, 게시 후에는 **현재** head 를
    * `headShaAtLastReview` 로 적어버려 검토한 적 없는 커밋이 CONVERGED 가 된다.
    *
-   * 응답을 확보하면 지운다. 없거나 head 가 달라졌으면 회수하지 않고 다시 묻는다.
+   * head 만으로는 부족하다. 리뷰 대상 diff 는 `base...head` 라서 **base 가 바뀌면
+   * head 가 같아도 다른 코드**다 (main → release 로 base 변경). 그래서 base ref 도
+   * 함께 남긴다.
+   *
+   * 응답을 확보하면 지운다. 없거나 대상이 달라졌으면 회수하지 않고 다시 묻는다.
    */
-  pendingSend?: { round: number; headSha: string | null };
+  pendingSend?: { round: number; headSha: string | null; baseRef?: string | null };
   /**
    * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).
    * 관측된 GitHub 현황을 캐시한 것일 뿐 상태가 아니다 — 필터를 통과하면 지워진다.

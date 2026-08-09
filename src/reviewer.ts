@@ -524,7 +524,7 @@ export interface RunRoundOptions {
  *  - 마커 없음         템플릿에 {{round}} 가 없어 라운드를 식별할 수 없다
  *  - 이미 응답을 받아봄  받고도 실패했다는 뜻이라 같은 답을 다시 써도 결과가 같다
  *  - 대기 중인 전송 기록 없음  언제·무엇을 보고 물었는지 모른다
- *  - **head 가 달라짐**  낡은 코드를 보고 만든 답이다 (아래)
+ *  - **리뷰 대상이 달라짐**  새 커밋 또는 base 변경 — 낡은 diff 를 보고 만든 답이다
  *  - 복귀 실패          대화가 삭제·이동됐다
  *  - 그 라운드가 마지막 질문이 아님  어느 응답이 그 라운드 것인지 단정할 수 없다
  */
@@ -534,7 +534,7 @@ async function reclaimRound(
   ctx: PRContext,
   round: number,
   opts: RunRoundOptions,
-): Promise<{ raw: string; headSha: string | null } | null> {
+): Promise<RawResult | null> {
   if (opts.dryRun) return null;
   const url = ctx.conversationUrl;
   if (!url) return null;
@@ -544,14 +544,18 @@ async function reclaimRound(
   if (hasResponseForRound(cfg, ctx, round)) return null;
 
   // 대화 + 라운드 번호는 "무엇을 보고 만든 답인가" 를 말해주지 않는다. 죽어 있는
-  // 동안 작성자가 push 했다면 그 답은 이미 없는 코드에 대한 지적이고, 게시 후에는
-  // 현재 head 가 검토 완료로 기록돼 CONVERGED 까지 갈 수 있다.
-  if (!ctx.pendingSend || ctx.pendingSend.round !== round) return null;
-  const sentHead = ctx.pendingSend.headSha;
+  // 동안 작성자가 push 하거나 base 를 바꿨다면 그 답은 이미 없는 diff 에 대한
+  // 지적이고, 게시 후에는 현재 상태가 검토 완료로 기록돼 CONVERGED 까지 갈 수 있다.
+  const sent: ReviewTarget = {
+    headSha: ctx.pendingSend?.headSha ?? null,
+    baseRef: ctx.pendingSend?.baseRef ?? null,
+  };
 
-  const verdict = judgeReclaimHead(ctx, round, currentHeadSha(ctx));
+  const verdict = judgeReclaim(ctx, round, currentTarget(ctx));
   if (verdict !== 'ok') {
-    console.log(chalk.yellow(`  ⚠ ${RECLAIM_REFUSAL[verdict]} — 회수하지 않고 다시 묻습니다.`));
+    if (verdict !== 'no-record') {
+      console.log(chalk.yellow(`  ⚠ ${RECLAIM_REFUSAL[verdict]} — 회수하지 않고 다시 묻습니다.`));
+    }
     return null;
   }
 
@@ -569,57 +573,81 @@ async function reclaimRound(
   const raw = await driver.collectFrom(baseline);
   const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl: url });
   console.log(chalk.dim(`  응답 저장: ${saved}`));
-  return { raw, headSha: sentHead };
+  return { raw, target: sent };
 }
 
 /**
- * 대기 중이던 응답을 회수해도 되는지 — head 기준 판정 (순수 함수).
+ * **리뷰 대상 diff 의 식별자.** 리뷰가 보는 건 커밋 하나가 아니라 `base...head` 다.
+ *
+ * head 만 보면 base 변경(main → release)을 놓친다 — head 는 그대로인데 diff 는
+ * 완전히 달라지고, 그 답을 회수해 approve 로 게시하면 바뀐 diff 를 한 번도 검토하지
+ * 않은 채 CONVERGED 로 남는다.
+ *
+ * base 브랜치가 앞으로 나가는 것(main 에 새 커밋)은 여기 안 들어온다 — 3-dot 은
+ * merge-base 기준이라 그때 diff 가 바뀌지 않는다. 이름이 같은데 히스토리가
+ * 재작성된 경우까지는 못 잡지만, 그건 회수 실패(= 다시 묻기) 쪽으로만 틀린다.
+ */
+export interface ReviewTarget {
+  headSha: string | null;
+  baseRef: string | null;
+}
+
+/**
+ * 대기 중이던 응답을 회수해도 되는지 (순수 함수).
  *
  * 회수는 "이미 만들어진 답" 을 쓰는 일이라, 그 답이 **지금 코드**에 대한 것인지
- * 확인하지 않으면 없는 코드를 지적하고 검토한 적 없는 커밋을 검토 완료로 적는다.
+ * 확인하지 않으면 없는 코드를 지적하고 검토한 적 없는 diff 를 검토 완료로 적는다.
  * 확신이 없으면 전부 거절한다 — 다시 묻는 비용은 대화 1회이고, 잘못 회수하면
  * 리뷰를 통째로 건너뛴다.
  */
-export type ReclaimVerdict = 'ok' | 'no-record' | 'unknown-sent' | 'unknown-current' | 'moved';
+export type ReclaimVerdict =
+  | 'ok'
+  | 'no-record'
+  | 'unknown-sent'
+  | 'unknown-current'
+  | 'moved'
+  | 'rebased';
 
 const RECLAIM_REFUSAL: Record<Exclude<ReclaimVerdict, 'ok'>, string> = {
   'no-record': '이 라운드의 전송 기록이 없습니다',
-  'unknown-sent': '질문 당시 head 를 모릅니다',
-  'unknown-current': '현재 head 를 확인하지 못했습니다',
+  'unknown-sent': '질문 당시 리뷰 대상을 모릅니다',
+  'unknown-current': '현재 리뷰 대상을 확인하지 못했습니다',
   moved: '대기 중이던 질문 이후 새 커밋이 있습니다',
+  rebased: '대기 중이던 질문 이후 base 브랜치가 바뀌었습니다',
 };
 
-export function judgeReclaimHead(
+export function judgeReclaim(
   ctx: PRContext,
   round: number,
-  currentHead: string | null,
+  current: ReviewTarget,
 ): ReclaimVerdict {
   const pending = ctx.pendingSend;
   if (!pending || pending.round !== round) return 'no-record';
-  if (!pending.headSha) return 'unknown-sent';
-  if (!currentHead) return 'unknown-current';
-  return currentHead === pending.headSha ? 'ok' : 'moved';
+  if (!pending.headSha || !pending.baseRef) return 'unknown-sent';
+  if (!current.headSha || !current.baseRef) return 'unknown-current';
+  if (current.headSha !== pending.headSha) return 'moved';
+  return current.baseRef === pending.baseRef ? 'ok' : 'rebased';
 }
 
 /**
- * 지금 이 PR 의 head SHA (조회 실패 시 null).
+ * 지금 이 PR 의 리뷰 대상 (조회 실패 시 전부 null).
  *
  * 라운드당 한 번이라 비용은 무시할 만하다 — 라운드 자체가 2~15분이고 대화 한도를
  * 소비한다. 실패를 null 로 떨어뜨려 "판별 불가 → 회수하지 않음" 으로 흐르게 한다.
  */
-function currentHeadSha(ctx: PRContext): string | null {
+function currentTarget(ctx: PRContext): ReviewTarget {
   try {
-    return getPRInfo(ctx.owner, ctx.repo, ctx.prNumber).headSha || null;
+    const info = getPRInfo(ctx.owner, ctx.repo, ctx.prNumber);
+    return { headSha: info.headSha || null, baseRef: info.baseBranch || null };
   } catch {
-    return null;
+    return { headSha: null, baseRef: null };
   }
 }
 
-/** 원본 응답과, 그 응답이 **어느 head 를 보고 만들어졌는지**. */
+/** 원본 응답과, 그 응답이 **무엇을 보고 만들어졌는지**. */
 interface RawResult {
   raw: string;
-  /** 이 응답이 검토한 head SHA (알 수 없으면 null) */
-  headSha: string | null;
+  target: ReviewTarget;
 }
 
 async function obtainRaw(
@@ -642,7 +670,7 @@ async function obtainRaw(
       );
       saveContext(cfg, ctx);
     }
-    return { raw: hit.raw, headSha: null };
+    return { raw: hit.raw, target: { headSha: null, baseRef: null } };
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
@@ -663,8 +691,10 @@ async function obtainRaw(
 
   // 무엇을 보고 물었는지는 **묻기 전에** 확정한다. 게시 후에 조회하면 대기하는
   // 2~15분 사이에 들어온 커밋까지 "검토함" 으로 기록돼, 한 번도 보지 않은 코드가
-  // CONVERGED 로 넘어간다.
-  const headSha = opts.dryRun ? null : currentHeadSha(ctx);
+  // CONVERGED 로 넘어간다. base 도 같이 잡는다 — 리뷰가 보는 건 `base...head` 다.
+  const target: ReviewTarget = opts.dryRun
+    ? { headSha: null, baseRef: null }
+    : currentTarget(ctx);
 
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
@@ -678,11 +708,11 @@ async function obtainRaw(
   const raw = await driver.sendAndCollect(prompt, (url) => {
     // **응답을 기다리기 전에** 저장한다. 여기가 이 변경의 핵심이다 — 대기 중에
     // 죽어도 다음 라운드가 그 대화로 복귀해 위의 중복 판별을 탈 수 있다.
-    // head 도 같이 남긴다. 회수 판정은 "그때 그 코드인가" 까지 봐야 한다.
+    // 리뷰 대상도 같이 남긴다. 회수 판정은 "그때 그 diff 인가" 까지 봐야 한다.
     conversationUrl = url ?? undefined;
     if (!opts.dryRun) {
       rememberConversation(ctx, conversationUrl, round);
-      ctx.pendingSend = { round, headSha };
+      ctx.pendingSend = { round, ...target };
       saveContext(cfg, ctx);
     }
   });
@@ -690,7 +720,7 @@ async function obtainRaw(
   const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl, dryRun: opts.dryRun });
   console.log(chalk.dim(`  응답 저장: ${saved}`));
   clearPendingSend(cfg, ctx, opts);
-  return { raw, headSha };
+  return { raw, target };
 }
 
 /** 응답을 확보했으면 대기 기록을 지운다 — 남겨두면 다음 라운드의 판정을 흐린다. */
@@ -748,14 +778,7 @@ export async function runRound(
   saveContext(cfg, ctx);
 
   try {
-    const { raw, headSha: reviewedHeadSha } = await obtainRaw(
-      cfg,
-      driver,
-      ctx,
-      round,
-      instructions,
-      opts,
-    );
+    const { raw, target: reviewed } = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
     progress.phase('parsing');
     const result = parseGPTResponse(raw);
 
@@ -772,7 +795,8 @@ export async function runRound(
     // 대기하는 2~15분 사이의 push 에 **본 적 없는 APPROVE** 가 직접 달린다.
     await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
       isSelfReview: resolveSelfReview(ctx),
-      commitId: reviewedHeadSha,
+      commitId: reviewed.headSha,
+      baseRef: reviewed.baseRef,
     });
 
     // 게시 직후 head SHA · 새 스레드 동기화
@@ -781,10 +805,10 @@ export async function runRound(
     // 작성자가 push 하면 그 커밋을 한 번도 안 봤는데 검토 완료로 기록되고,
     // approve 였다면 그대로 CONVERGED 가 된다. 검토한 head 를 적으면 그 push 는
     // 다음 sync 에서 새 커밋으로 잡혀 라운드가 한 번 더 돈다.
-    let headSha = reviewedHeadSha ?? ctx.headShaAtLastReview;
+    let headSha = reviewed.headSha ?? ctx.headShaAtLastReview;
     try {
       const sync = fetchPRSyncData(ctx.owner, ctx.repo, ctx.prNumber);
-      if (!reviewedHeadSha) headSha = sync.headSha;
+      if (!reviewed.headSha) headSha = sync.headSha;
       adoptThreads(ctx, sync.threads, getViewerLogin(), round);
     } catch {
       console.log(chalk.yellow('  ⚠ 게시 후 스레드 동기화 실패 — 다음 sync 에서 보정됩니다.'));

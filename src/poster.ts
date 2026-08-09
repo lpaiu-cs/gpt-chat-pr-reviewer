@@ -11,7 +11,6 @@ import type { ReviewResult, DiffHunk, ReviewComment } from './types.js';
 import {
   fetchDiff,
   fetchDiffAt,
-  getPRInfo,
   parseDiffHunks,
   postReview,
   postSimpleReview,
@@ -63,20 +62,26 @@ export interface PostOptions {
    * 코멘트를 달아 422 가 난다).
    */
   commitId?: string | null;
+  /**
+   * 검토 당시의 base ref. 리뷰가 본 diff 는 `base...head` 라 base 도 있어야
+   * 같은 기준을 재현할 수 있다 (대기 중 base 가 바뀌었을 수 있다).
+   */
+  baseRef?: string | null;
 }
 
-/** 게시 대상 커밋과 **같은 기준**의 diff 를 가져온다. */
+/** 검토한 대상과 **같은 기준**의 diff 를 가져온다. */
 function diffForPost(
   owner: string,
   repo: string,
   prNumber: number,
   commitId: string | null | undefined,
+  baseRef: string | null | undefined,
 ): string {
-  if (commitId) {
+  if (commitId && baseRef) {
     try {
-      return fetchDiffAt(owner, repo, getPRInfo(owner, repo, prNumber).baseBranch, commitId);
+      return fetchDiffAt(owner, repo, baseRef, commitId);
     } catch {
-      console.log(chalk.dim('  검토 커밋 기준 diff 를 가져오지 못해 현재 diff 로 검증합니다.'));
+      console.log(chalk.dim('  검토 시점 기준 diff 를 가져오지 못해 현재 diff 로 검증합니다.'));
     }
   }
   return fetchDiff(owner, repo, prNumber);
@@ -89,12 +94,12 @@ export async function postReviewToGitHub(
   review: ReviewResult,
   opts: PostOptions = {},
 ): Promise<void> {
-  const { dryRun = false, isSelfReview = false, commitId = null } = opts;
+  const { dryRun = false, isSelfReview = false, commitId = null, baseRef = null } = opts;
 
   // ── diff 로 유효 라인 확인 ──
   let hunks: DiffHunk[] = [];
   try {
-    hunks = parseDiffHunks(diffForPost(owner, repo, prNumber, commitId));
+    hunks = parseDiffHunks(diffForPost(owner, repo, prNumber, commitId, baseRef));
   } catch {
     console.log(chalk.yellow('  diff 를 가져올 수 없어 모든 코멘트를 본문에 포함합니다.'));
   }
@@ -130,7 +135,7 @@ export async function postReviewToGitHub(
   if (dryRun) {
     console.log(chalk.cyan('\n  [DRY RUN] 게시 예정 리뷰:'));
     console.log(chalk.dim(`  Event: ${event}${downgraded ? ' (셀프 리뷰로 하향)' : ''}`));
-    if (commitId) console.log(chalk.dim(`  대상 커밋: ${commitId}`));
+    if (commitId) console.log(chalk.dim(`  대상: ${baseRef ?? '?'}...${commitId}`));
     console.log(chalk.dim(`  인라인 코멘트: ${valid.length}개`));
     console.log(chalk.dim(`  본문 포함 코멘트: ${invalid.length}개`));
     console.log(chalk.dim(`  ---\n${body}\n  ---`));
