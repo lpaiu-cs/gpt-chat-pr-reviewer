@@ -35,6 +35,14 @@ export class LockHeldError extends Error {
   }
 }
 
+/**
+ * 잔여 잠금 인수 재시도 횟수.
+ *
+ * 잔여 잠금을 여럿이 동시에 발견하면 치우고 다시 경쟁하는데, 그 경쟁에서 진 쪽은
+ * 다음 회차에 살아 있는 주인을 보고 정상적으로 거부된다. 무한 루프를 막는 상한이다.
+ */
+const STALE_TAKEOVER_ATTEMPTS = 3;
+
 function lockFile(dataDir: string): string {
   return path.join(dataDir, 'watch.lock');
 }
@@ -79,17 +87,43 @@ export function readLock(dataDir: string): LockInfo | null {
  */
 export function acquireLock(dataDir: string, command: string): () => void {
   mkdirSync(dataDir, { recursive: true });
-  const held = readLock(dataDir);
-  if (held) throw new LockHeldError(held);
-
   const f = lockFile(dataDir);
-  const info: LockInfo = {
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-    command,
-  };
-  writeFileSync(f, JSON.stringify(info, null, 2), 'utf-8');
+  const payload = JSON.stringify(
+    { pid: process.pid, startedAt: new Date().toISOString(), command } satisfies LockInfo,
+    null,
+    2,
+  );
 
+  for (let attempt = 0; attempt < STALE_TAKEOVER_ATTEMPTS; attempt++) {
+    try {
+      // `wx` = 파일이 없을 때만 생성. **확인과 생성이 한 번의 원자적 연산**이다.
+      // 읽어보고 없으면 쓰는 방식이면, 거의 동시에 시작한 두 프로세스가 둘 다
+      // "없다" 를 보고 각자 써버린다 — 이 잠금이 막으려던 상황이 그대로 재현된다.
+      writeFileSync(f, payload, { encoding: 'utf-8', flag: 'wx' });
+      return makeRelease(f);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+
+    // 이미 있다. 주인이 살아 있으면 거부하고, 죽었으면 치운 뒤 **다시 경쟁**한다.
+    // 잔여 잠금을 여럿이 동시에 발견해도 재경쟁의 승자는 wx 가 하나로 정한다.
+    const held = readLock(dataDir);
+    if (held) throw new LockHeldError(held);
+    try {
+      unlinkSync(f);
+    } catch {
+      /* 다른 프로세스가 먼저 치웠다 — 그대로 재시도한다 */
+    }
+  }
+
+  // 여기까지 왔다 = 잔여 잠금 인수를 연달아 놓쳤다. 경쟁자가 있다는 뜻이므로 거부한다.
+  const held = readLock(dataDir);
+  throw held
+    ? new LockHeldError(held)
+    : new Error('잠금을 잡지 못했습니다 — 다른 프로세스와 경쟁 중입니다. 잠시 후 다시 시도하세요.');
+}
+
+function makeRelease(f: string): () => void {
   let released = false;
   return () => {
     if (released) return;

@@ -22,6 +22,7 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
+import { acquireLock, readLock, LockHeldError } from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
@@ -47,7 +48,7 @@ import {
   TIER_FIRST_ROUND,
   TIER_OTHER,
 } from '../src/queue.js';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
@@ -1281,6 +1282,56 @@ const fakePR: PRInfo = {
   assert(progress.state().snapshot.active === null, '진행 중 라운드가 없으면 단계 기록은 무시');
 
   progress.enabled = false;
+}
+
+// ── 시나리오 33: 단일 인스턴스 잠금 ────────────────────────
+
+{
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-review-lock-'));
+
+  const release = acquireLock(dir, 'watch');
+  assert(!!readLock(dir), '잠금을 잡으면 파일이 생긴다');
+
+  let blocked = false;
+  try {
+    acquireLock(dir, 'review');
+  } catch (e) {
+    blocked = e instanceof LockHeldError;
+  }
+  assert(blocked, '살아 있는 주인이 있으면 LockHeldError');
+
+  release();
+  assert(readLock(dir) === null, '해제하면 잠금이 사라진다');
+  release(); // 멱등
+  assert(readLock(dir) === null, '해제는 여러 번 불러도 안전하다');
+
+  // 주인이 죽은 잔여 잠금 — 자동 인수해야 한다.
+  // (그러지 않으면 kill -9 한 번에 사용자가 파일을 손으로 지워야 한다)
+  writeFileSync(
+    path.join(dir, 'watch.lock'),
+    JSON.stringify({ pid: 999_999, startedAt: new Date().toISOString(), command: 'watch' }),
+  );
+  assert(readLock(dir) === null, '죽은 pid 의 잠금은 없는 것으로 본다');
+  const r2 = acquireLock(dir, 'watch');
+  assert(readLock(dir)?.pid === process.pid, '잔여 잠금을 넘겨받는다');
+  r2();
+
+  // 깨진 파일도 잔여물로 본다 — 못 읽는 잠금 때문에 영영 못 뜨면 안 된다.
+  writeFileSync(path.join(dir, 'watch.lock'), 'not json');
+  assert(readLock(dir) === null, '깨진 잠금 파일은 없는 것으로 본다');
+  acquireLock(dir, 'watch')();
+
+  // 해제는 **내가 쓴 것일 때만** 지운다. 잔여 잠금을 남이 인수한 뒤라면 그쪽 것을
+  // 지워서는 안 된다 (지우면 세 번째 프로세스가 끼어든다).
+  const mine = acquireLock(dir, 'watch');
+  writeFileSync(
+    path.join(dir, 'watch.lock'),
+    JSON.stringify({ pid: 999_998, startedAt: new Date().toISOString(), command: 'watch' }),
+  );
+  mine();
+  assert(existsSync(path.join(dir, 'watch.lock')), '남의 잠금은 지우지 않는다');
+
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // ── 결과 ────────────────────────────────────────────────────
