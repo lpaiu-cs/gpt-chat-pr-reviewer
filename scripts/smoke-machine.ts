@@ -21,7 +21,14 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
-import { globToRegExp, matchesScope, passesFilters, resolveWatchScope } from '../src/watch-scope.js';
+import {
+  admitsNewPR,
+  globToRegExp,
+  matchesScope,
+  nextRepoCache,
+  passesFilters,
+  resolveWatchScope,
+} from '../src/watch-scope.js';
 import {
   buildQueue,
   isQueueable,
@@ -779,46 +786,91 @@ const fakePR: PRInfo = {
   assert(buildQueue([plain, excluded]).length === 2, '필터를 다시 통과하면 큐에 복귀');
 }
 
-// ── 시나리오 22: 감시 범위 부분 실패 시 캐시 보존 ──────────
-
-{
-  // 리뷰 지적 [P2]: owner 두 개 중 하나만 실패했을 때 성공한 쪽 결과로 캐시를
-  // 통째로 갈면 실패한 owner 의 레포가 조용히 감시에서 빠진다.
-  // discoverRepos 는 partial 로 알리고, createRepoSource 는 그때 병합한다.
-  const cached = ['a/one', 'b/two'];
-  const fresh = ['a/one']; // b 쿼리 실패로 b 의 레포가 빠진 결과
-
-  const merged = [...new Set([...cached, ...fresh])].sort();
-  assert(merged.includes('b/two'), '부분 실패 시 실패한 범위의 레포가 유지된다');
-
-  const replaced = fresh; // partial=false 였다면
-  assert(!replaced.includes('b/two'), '완전 성공 시에는 사라진 레포가 정상적으로 빠진다');
-}
-
-// ── 시나리오 23: review-requested 는 PR 단위로 제한 ────────
+// ── 시나리오 22: review-requested 는 PR 단위로 제한 ────────
 
 {
   // 리뷰 지적 [P1]: 검색 결과를 레포로 축약하면 "리뷰 요청받은 PR 1건" 때문에
   // 그 레포의 열린 PR 전부가 대상이 된다.
+  //
+  // 2차 리뷰 지적 [P1]: 판정을 테스트에서 복제하면 실제 경계를 놓친다.
+  // scan() 이 쓰는 admitsNewPR 을 그대로 부른다.
   const targets = new Map<string, Set<number>>([['o/r', new Set([7])]]);
-  const allowed = targets.get('o/r');
 
-  const admits = (num: number, existing: boolean): boolean =>
-    !(!existing && allowed && !allowed.has(num));
+  assert(admitsNewPR(targets, 'o/r', 7), '요청받은 PR 은 새로 추적한다');
+  assert(!admitsNewPR(targets, 'o/r', 9), '요청받지 않은 같은 레포의 PR 은 추적하지 않는다');
 
-  assert(admits(7, false), '요청받은 PR 은 새로 추적한다');
-  assert(!admits(9, false), '요청받지 않은 같은 레포의 PR 은 추적하지 않는다');
+  // 핵심 경계: Map 은 있지만 그 레포 키가 없는 경우.
+  // 리뷰를 게시하면 요청이 해제되어 레포가 targets 에서 통째로 빠지는데,
+  // 기존 컨텍스트 때문에 레포는 계속 스캔된다. 이때 무제한으로 넘기면
+  // 그 레포의 요청받지 않은 다른 PR 이 전부 자동 리뷰된다.
+  assert(
+    !admitsNewPR(targets, 'o/other', 1),
+    '제한 모드에서 목록에 없는 레포는 전부 거부 (빈 목록 ≠ 무제한)',
+  );
 
-  // 리뷰를 게시하면 GitHub 이 요청을 해제한다. 검색 결과만 믿으면 2차 라운드가
-  // 영영 오지 않으므로, 이미 추적 중인 PR 은 목록에 없어도 계속 간다.
-  assert(admits(9, true), '이미 추적 중이면 요청 목록에 없어도 계속 추적한다');
+  // account/repos 모드 (targets 자체가 없음) 는 제한이 없다
+  assert(admitsNewPR(undefined, 'o/r', 9), '제한이 없으면 모든 PR 이 대상');
 
-  // account/repos 모드는 제한이 없다
-  const unrestricted = undefined as Set<number> | undefined;
-  assert(!(!false && unrestricted && !unrestricted.has(9)), '제한이 없으면 모든 PR 이 대상');
+  // 이미 추적 중인 PR 은 이 판정과 무관하게 계속 간다 (scan 의 `!existing &&` 조건).
+  // 리뷰 게시로 요청이 해제되면 2차 라운드가 영영 오지 않기 때문이다.
+  const existing = true;
+  assert(!(!existing && !admitsNewPR(targets, 'o/r', 9)), '이미 추적 중이면 계속 추적한다');
 }
 
-// ── 시나리오 24: 열린 PR 이 없어진 레포도 계속 훑는다 ──────
+// ── 시나리오 23: 탐색 캐시 갱신 규칙 ───────────────────────
+
+{
+  // 부분 실패면 아무것도 빼지 않는다 (실패한 범위의 레포 보존)
+  assert(
+    nextRepoCache(['a/one', 'b/two'], { repos: ['a/one'], partial: true }).includes('b/two'),
+    '부분 실패 시 실패한 범위의 레포가 유지된다',
+  );
+
+  // 2차 리뷰 지적 [P2]: 완전히 성공한 빈 결과는 유효한 답이다.
+  // 과거 목록을 되살리면 이미 정리된 레포를 10초마다 계속 probe 한다.
+  assert(
+    nextRepoCache(['a/one', 'b/two'], { repos: [], partial: false }).length === 0,
+    '완전 성공한 빈 결과는 캐시를 비운다',
+  );
+  assert(
+    nextRepoCache(['a/one', 'b/two'], { repos: [], partial: true }).length === 2,
+    '부분 실패의 빈 결과는 캐시를 유지한다',
+  );
+
+  const shrunk = nextRepoCache(['a/one', 'b/two'], { repos: ['a/one'], partial: false });
+  assert(!shrunk.includes('b/two'), '완전 성공 시 사라진 레포는 정상적으로 빠진다');
+}
+
+// ── 시나리오 24: 라벨 목록이 잘리면 제외하지 않는다 ────────
+
+{
+  // 2차 리뷰 지적 [P2]: first:100 은 페이지 크기이지 완결 보장이 아니다.
+  // 잘린 목록으로 "라벨이 없다" 를 단정해 제외하면 그 PR 은 조용히 영영
+  // 리뷰되지 않는다. 불완전한 근거로는 제외하지 않는다.
+  const base = { author: 'a', isDraft: false };
+  const filters = { labels: ['needs-review'] };
+
+  assert(
+    !passesFilters({ ...base, labels: ['other'], labelsTruncated: false }, filters).ok,
+    '목록이 완전하면 라벨 없는 PR 은 제외한다',
+  );
+  assert(
+    passesFilters({ ...base, labels: ['other'], labelsTruncated: true }, filters).ok,
+    '목록이 잘렸으면 제외하지 않는다 (거짓 음성 방지)',
+  );
+  assert(
+    passesFilters({ ...base, labels: ['needs-review'], labelsTruncated: true }, filters).ok,
+    '잘렸어도 대상 라벨이 이미 보이면 그대로 통과',
+  );
+
+  // 잘림은 라벨 조건에만 영향을 준다 — draft 는 그대로 제외
+  assert(
+    !passesFilters({ ...base, isDraft: true, labels: [], labelsTruncated: true }, filters).ok,
+    '라벨 잘림이 draft 제외까지 무력화하지는 않는다',
+  );
+}
+
+// ── 시나리오 25: 열린 PR 이 없어진 레포도 계속 훑는다 ──────
 
 {
   // 리뷰 지적 [P2]: 검색은 열린 PR 이 있는 레포만 준다. 마지막 PR 이 닫히면

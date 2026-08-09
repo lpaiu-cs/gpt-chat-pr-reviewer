@@ -194,6 +194,43 @@ export interface RepoSource {
   lastAt: number;
 }
 
+/**
+ * 이 PR 의 **추적을 새로 시작해도 되는지** 판정한다.
+ *
+ * `targets` 가 있다 = PR 단위로 제한된 모드(review-requested)다. 이때 레포가
+ * 목록에 아예 없으면 "그 레포에 요청된 PR 이 없다" 는 뜻이므로 **전부 거부**해야
+ * 한다. 여기서 무제한으로 넘기면, 리뷰를 게시해 요청이 해제된 뒤에도 기존
+ * 컨텍스트 때문에 레포가 스캔에 남아 그 레포의 다른 열린 PR 이 전부 대상이 된다.
+ *
+ * cli 가 이 판정을 복제하지 않도록 여기서 한 번만 정의한다.
+ */
+export function admitsNewPR(
+  targets: Map<string, Set<number>> | undefined,
+  slug: string,
+  number: number,
+): boolean {
+  if (!targets) return true; // account/repos 모드 — 제한 없음
+  return (targets.get(slug) ?? new Set<number>()).has(number);
+}
+
+/**
+ * 이번 탐색 결과를 반영한 다음 캐시를 정한다.
+ *
+ * `partial` 이면 아무것도 빼지 않는다 — 성공한 범위의 결과로 캐시를 교체하면
+ * 실패한 범위의 레포가 조용히 감시에서 빠진다.
+ *
+ * 반대로 **완전히 성공한 빈 결과는 그대로 반영한다.** "열린 PR 이 하나도 없다" 는
+ * 유효한 답이고, 이때 과거 목록을 되살리면 이미 정리된 레포들을 10초마다 계속
+ * probe 한다. 종료 동기화가 필요한 레포는 scan() 의 lingering 합집합이 따로 챙긴다.
+ */
+export function nextRepoCache(
+  cached: string[],
+  result: { repos: string[]; partial: boolean },
+): string[] {
+  if (!result.partial) return result.repos;
+  return [...new Set([...cached, ...result.repos])].sort();
+}
+
 /** 두 허용 목록을 합친다 (둘 다 없으면 undefined = 제한 없음). */
 function mergeTargets(
   a: Map<string, Set<number>> | undefined,
@@ -233,14 +270,7 @@ export function createRepoSource(scope: WatchScope): RepoSource {
       // 실패한 범위의 허용 목록까지 지워지면 그 PR 들이 추적 대상에서 빠진다.
       source.targets = r.partial ? mergeTargets(source.targets, r.targets) : r.targets;
 
-      // 결과가 불완전하면 아무것도 빼지 않는다. 성공한 범위의 결과로 캐시를
-      // 교체하면 실패한 범위의 레포가 조용히 감시에서 빠진다.
-      // (전부 실패해 0건이 된 경우도 여기에 포함된다)
-      const next = r.partial ? [...new Set([...cached, ...r.repos])].sort() : r.repos;
-      if (next.length === 0 && cached.length > 0) {
-        console.log(chalk.yellow('  ⚠ 레포 탐색 결과가 비었습니다 — 직전 목록을 유지합니다.'));
-        return cached;
-      }
+      const next = nextRepoCache(cached, r);
       const added = next.filter((s) => !cached.includes(s));
       const removed = cached.filter((s) => !next.includes(s));
       cached = next;
@@ -270,6 +300,8 @@ export interface FilterablePR {
   author: string;
   isDraft: boolean;
   labels: string[];
+  /** 라벨 목록이 잘렸는지 — true 면 "라벨이 없다" 를 단정할 수 없다 */
+  labelsTruncated?: boolean;
 }
 
 /**
@@ -295,6 +327,10 @@ export function passesFilters(pr: FilterablePR, filters?: WatchFilters): FilterV
   if (labels && labels.length > 0) {
     const want = new Set(labels.map((l) => l.toLowerCase()));
     if (!pr.labels.some((l) => want.has(l.toLowerCase()))) {
+      // 잘린 목록으로는 "그 라벨이 없다" 를 단정할 수 없다. 대상 라벨이 못 읽은
+      // 구간에 있을 수 있으므로 불완전한 근거로 제외하지 않는다 — 잘못 제외하면
+      // 그 PR 은 조용히 영영 리뷰되지 않는다 (호출부가 경고를 찍는다).
+      if (pr.labelsTruncated) return { ok: true };
       return { ok: false, reason: `라벨 없음 (${labels.join(' | ')})` };
     }
   }

@@ -27,6 +27,7 @@ import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './sta
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile } from './instructions.js';
 import {
+  admitsNewPR,
   createRepoSource,
   describeScope,
   matchesScope,
@@ -456,10 +457,6 @@ program
           }
         }
 
-        // review-requested 모드에서 "이 레포의 어떤 PR 을 새로 추적해도 되는가".
-        // undefined 면 제한 없음 (account/repos 모드).
-        const allowed = repoSource.targets?.get(repoSlug);
-
         for (const pr of probe.prs) {
           const existing = loadContext(cfg, pr.owner, pr.repo, pr.number);
           const verdict = passesFilters(pr, scope.filters);
@@ -467,7 +464,7 @@ program
           if (pr.labelsTruncated && scope.filters?.labels?.length) {
             console.log(
               chalk.yellow(
-                `  ⚠ ${repoSlug}#${pr.number} 라벨이 조회 상한을 넘었습니다 — 라벨 필터 판정이 부정확할 수 있습니다.`,
+                `  ⚠ ${repoSlug}#${pr.number} 라벨 목록이 잘렸습니다 — 라벨 조건을 확정할 수 없어 제외하지 않고 통과시킵니다.`,
               ),
             );
           }
@@ -478,7 +475,8 @@ program
           // 반대로 **이미 추적 중이면 계속 간다** — 리뷰를 게시하면 GitHub 이 리뷰
           // 요청을 해제하므로, 검색 결과만 믿으면 1차 라운드 직후 대상에서 빠져
           // 2차 라운드가 영영 오지 않는다.
-          if (!existing && (!verdict.ok || (allowed && !allowed.has(pr.number)))) continue;
+          const admitted = verdict.ok && admitsNewPR(repoSource.targets, repoSlug, pr.number);
+          if (!existing && !admitted) continue;
 
           const ctx = existing ?? createContext(pr);
           ctx.title = pr.title;
@@ -684,10 +682,12 @@ program
     // watch 와 같은 범위·필터를 적용해야 "watch 가 처리할 대기열" 이라는 말이
     // 사실이 된다. 범위는 여기서 글롭으로 판정하고, draft/라벨 필터는 스캔이
     // 남겨둔 excludedReason 을 buildQueue 가 읽는다 (GitHub 재조회 없음).
+    // 범위 설정이 없으면 watch 자체가 돌지 않는다. 그런 상태에서 저장 컨텍스트를
+    // 실행 대기열로 보여주면 처리될 수 없는 PR 을 처리될 것처럼 광고하게 된다.
     const scope = resolveWatchScope(cfg);
     const all = listContexts(cfg);
     const inScope = (c: PRContext): boolean =>
-      !scope || matchesScope(`${c.owner}/${c.repo}`, scope.include, scope.exclude ?? []);
+      !!scope && matchesScope(`${c.owner}/${c.repo}`, scope.include, scope.exclude ?? []);
 
     const scoped = all.filter(inScope);
     const entries = buildQueue(scoped);
@@ -704,6 +704,9 @@ program
         JSON.stringify(
           {
             blockedUntil: blockedUntil ? new Date(blockedUntil).toISOString() : null,
+            // false 면 watch 가 돌 수 없는 상태다 — 소비자가 "대기열 0건" 을
+            // 정상으로 오해하지 않도록 설정 미완료를 명시한다.
+            scopeConfigured: !!scope,
             hidden: { outOfScope: hiddenOutOfScope, filtered: hiddenFiltered },
             entries: entries.map((e: QueueEntry) => ({
               owner: e.ctx.owner,
@@ -726,6 +729,15 @@ program
     }
 
     banner();
+    if (!scope) {
+      console.log(chalk.red('  ✗ 감시 범위가 설정되지 않았습니다 — watch 가 처리할 대기열이 없습니다.'));
+      console.log(chalk.dim('    pr-review.config.json 의 watch.include 를 채우세요.'));
+      if (hiddenOutOfScope > 0) {
+        console.log(chalk.dim(`    (추적 기록은 ${hiddenOutOfScope}건 있지만 범위 밖입니다 — status 로 확인하세요.)`));
+      }
+      console.log();
+      return;
+    }
     if (blockedUntil) {
       console.log(
         chalk.magenta(
