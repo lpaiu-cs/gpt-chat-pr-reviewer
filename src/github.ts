@@ -4,7 +4,7 @@
  * PR 정보 조회, diff 파싱, 리뷰 게시, GraphQL 스레드 동기화를 담당한다.
  */
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import chalk from 'chalk';
 import type { PRInfo, DiffHunk, ReviewComment } from './types.js';
 
@@ -14,6 +14,48 @@ import type { PRInfo, DiffHunk, ReviewComment } from './types.js';
  * 사용자 입력(URL / owner/repo#N / 단순 숫자)을 파싱하여
  * { owner, repo, number } 를 반환한다.
  */
+/**
+ * gh 실행 게이트웨이 — **모든** gh 호출은 여기를 지난다.
+ *
+ * `execSync` 를 쓰면 안 된다. execSync 는 명령을 **셸(cmd.exe)에 넘기는데**, cmd.exe 는
+ * 콘솔 서브시스템이라 Windows 가 호출마다 새 콘솔 창을 할당한다. 감시 레포마다 매
+ * 주기 gh 를 부르므로 화면에 빈 검은 창이 연속으로 깜빡인다 (실측: 25분에 conhost
+ * 198개 ≈ 분당 8개). `windowsHide` 는 execSync 에서 먹지 않는다 — 숨겨야 할 대상이
+ * gh 가 아니라 그 앞의 셸이기 때문이다.
+ *
+ * 그래서 셸을 아예 거치지 않고 execFileSync 로 직접 띄운다. 호출부마다 플래그를
+ * 붙이는 방식은 쓰지 않았다 — opt-in 이면 새 호출부가 생길 때마다 재발한다.
+ *
+ * **인자는 배열로 넘긴다.** 셸이 없으므로 인용부호를 우리가 쓰면 안 된다.
+ * 셸에서 `-q ".owner.login"` 이던 것은 `['-q', '.owner.login']` 이 되고, 따옴표를
+ * 그대로 남기면 gh 가 그 문자까지 값으로 받는다.
+ */
+function gh(
+  argv: string[],
+  opts: { input?: string; maxBuffer?: number; captureStderr?: boolean } = {},
+): string {
+  try {
+    return execFileSync('gh', argv, {
+      encoding: 'utf-8',
+      windowsHide: true,
+      input: opts.input,
+      maxBuffer: opts.maxBuffer,
+      // stderr 를 캡처할지. 기본은 부모로 흘려보내지만, 10초 주기로 도는 경로에서는
+      // 부분 실패 메시지가 그대로 쏟아져 로그를 못 쓰게 만든다.
+      stdio: opts.captureStderr ? ['pipe', 'pipe', 'pipe'] : undefined,
+    });
+  } catch (e) {
+    // 셸을 거치지 않으므로 PATH 에 gh 실행 파일이 그대로 있어야 한다.
+    // (.cmd/.bat 래퍼로 설치된 경우 Node 가 셸 없이 띄우지 못한다.)
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      throw new Error(
+        "gh 실행 파일을 찾지 못했습니다. GitHub CLI 가 설치되어 PATH 에 있는지 확인하세요 (`gh --version`).",
+      );
+    }
+    throw e;
+  }
+}
+
 export function parsePRInput(input: string): { owner: string; repo: string; number: number } {
   // https://github.com/owner/repo/pull/123
   const urlRe = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/;
@@ -27,9 +69,7 @@ export function parsePRInput(input: string): { owner: string; repo: string; numb
 
   // 단순 숫자 (현재 디렉터리가 gh repo 일 때)
   if (/^\d+$/.test(input.trim())) {
-    const info = execSync('gh repo view --json owner,name -q ".owner.login+\\"/\\"+.name"', {
-      encoding: 'utf-8',
-    }).trim();
+    const info = gh(['repo', 'view', '--json', 'owner,name', '-q', '.owner.login+"/"+.name']).trim();
     const [owner, repo] = info.split('/');
     return { owner, repo, number: +input.trim() };
   }
@@ -56,10 +96,7 @@ function toPRInfo(owner: string, repo: string, d: any): PRInfo {
 }
 
 export function getPRInfo(owner: string, repo: string, number: number): PRInfo {
-  const raw = execSync(
-    `gh pr view ${number} --repo ${owner}/${repo} --json ${PR_JSON_FIELDS}`,
-    { encoding: 'utf-8' },
-  );
+  const raw = gh(['pr', 'view', String(number), '--repo', `${owner}/${repo}`, '--json', PR_JSON_FIELDS]);
   return toPRInfo(owner, repo, JSON.parse(raw));
 }
 
@@ -99,7 +136,7 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
 export function fetchPRSyncData(owner: string, repo: string, number: number): PRSyncData {
   // -F (대문자) 만 @- stdin 확장을 지원한다. -f 는 "@-" 를 문자열 그대로 보낸다.
   const { data } = graphQLTolerant(
-    `-F owner=${owner} -F name=${repo} -F num=${number}`,
+    ['-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `num=${number}`],
     SYNC_QUERY,
   );
   const pr = data.repository.pullRequest;
@@ -120,7 +157,7 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
 }
 
 /**
- * execSync 로 실행한 gh 명령의 오류에서 읽을 수 있는 메시지를 뽑는다.
+ * gh 명령의 오류에서 읽을 수 있는 메시지를 뽑는다.
  * GitHub API 오류 본문(JSON)이 stdout 으로 오므로 그걸 우선 파싱한다.
  */
 export function ghErrorMessage(e: unknown): string {
@@ -216,15 +253,12 @@ export function takeGraphQLUsage(): { cost: number; remaining: number } {
  * 함께 반환하고 gh 는 비정상 종료한다. 그대로 두면 오래된 컨텍스트 하나가 그
  * 레포의 스캔 전체를 죽인다. data 가 있으면 경고만 남기고 진행한다.
  */
-function graphQLTolerant(args: string, query: string): { data: any; errors?: any[] } {
+function graphQLTolerant(args: string[], query: string): { data: any; errors?: any[] } {
   try {
-    const raw = execSync(`gh api graphql ${args} -F query=@-`, {
-      encoding: 'utf-8',
+    const raw = gh(['api', 'graphql', ...args, '-F', 'query=@-'], {
       input: query,
       maxBuffer: 10 * 1024 * 1024,
-      // stderr 를 캡처한다. 기본값은 부모로 흘려보내는데, 10초 주기에서는
-      // 부분 실패 메시지가 그대로 쏟아져 로그가 못 쓰게 된다.
-      stdio: ['pipe', 'pipe', 'pipe'],
+      captureStderr: true,
     });
     const parsed = JSON.parse(raw);
     recordUsage(parsed?.data?.rateLimit);
@@ -285,7 +319,7 @@ export function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []
 ${listPart}${aliases}
   }
 }`;
-    return graphQLTolerant(`-F owner=${owner} -F name=${repo}`, query);
+    return graphQLTolerant(['-F', `owner=${owner}`, '-F', `name=${repo}`], query);
   };
 
   let cost = 0;
@@ -380,9 +414,9 @@ export function searchPRRepos(searchQuery: string): RepoSearchResult {
   let truncated = false;
 
   for (let page = 0; page < SEARCH_MAX_PAGES; page++) {
-    const args = [`-f q=${JSON.stringify(searchQuery)}`, cursor ? `-f after=${cursor}` : '']
-      .filter(Boolean)
-      .join(' ');
+    // JSON.stringify 를 쓰면 안 된다. 셸이 있을 때는 그 따옴표를 셸이 벗겨줬지만
+    // 이제 셸이 없으므로 gh 가 따옴표까지 값으로 받는다 (검색이 통째로 어긋난다).
+    const args = ['-f', `q=${searchQuery}`, ...(cursor ? ['-f', `after=${cursor}`] : [])];
     const { data } = graphQLTolerant(args, REPO_SEARCH_QUERY);
     const search = data?.search;
     if (!search) break;
@@ -410,7 +444,7 @@ let viewerLoginCache: string | null = null;
 /** 현재 gh 인증 계정의 로그인 아이디 (캐시됨). */
 export function getViewerLogin(): string {
   if (!viewerLoginCache) {
-    viewerLoginCache = execSync('gh api user -q .login', { encoding: 'utf-8' }).trim();
+    viewerLoginCache = gh(['api', 'user', '-q', '.login']).trim();
   }
   return viewerLoginCache;
 }
@@ -418,8 +452,7 @@ export function getViewerLogin(): string {
 // ── Diff 파싱 ───────────────────────────────────────────────
 
 export function fetchDiff(owner: string, repo: string, number: number): string {
-  return execSync(`gh pr diff ${number} --repo ${owner}/${repo}`, {
-    encoding: 'utf-8',
+  return gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], {
     maxBuffer: 10 * 1024 * 1024,
   });
 }
@@ -481,10 +514,10 @@ export function postReview(
     event: event.toUpperCase(),
     comments: comments.map((c) => ({ path: c.path, line: c.line, body: c.body })),
   });
-  execSync(`gh api repos/${owner}/${repo}/pulls/${number}/reviews --method POST --input -`, {
-    encoding: 'utf-8',
-    input: payload,
-  });
+  gh(
+    ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
+    { input: payload },
+  );
 }
 
 /** 본문만 있는 단순 리뷰 게시. */
@@ -496,8 +529,8 @@ export function postSimpleReview(
   event: 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' = 'COMMENT',
 ): void {
   const payload = JSON.stringify({ body, event });
-  execSync(`gh api repos/${owner}/${repo}/pulls/${number}/reviews --method POST --input -`, {
-    encoding: 'utf-8',
-    input: payload,
-  });
+  gh(
+    ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
+    { input: payload },
+  );
 }
