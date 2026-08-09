@@ -19,7 +19,7 @@
     "pr-review": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-ui.mjs",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "setup": "tsx src/cli.ts setup",

@@ -9,6 +9,7 @@
  *   instructions      맞춤 지침 파일 열기/생성
  *   review <pr>       특정 PR 리뷰 라운드 실행
  *   watch             감시 범위 폴링 → 상태 머신 동기화 → 큐 순서대로 자동 리뷰
+ *                     (--ui 로 localhost 관측 대시보드 동반 실행)
  *   queue             리뷰 대기열 조회 (--json)
  *   status [pr]       추적 중인 PR 상태 조회 (--json)
  *   graph [pr]        상태 머신 mermaid 다이어그램 출력
@@ -41,6 +42,8 @@ import {
   QUEUE_REASON_LABELS,
   type QueueEntry,
 } from './queue.js';
+import { progress, type ContextCard, type QueueItem } from './progress.js';
+import { startUIServer, type UIServerHandle } from './ui/server.js';
 import type { AppConfig, PRContext, PREvent, PRState } from './types.js';
 
 // ── 배너 ────────────────────────────────────────────────────
@@ -132,6 +135,48 @@ function formatDuration(ms: number): string {
   if (ms < 60_000) return `${Math.round(ms / 1000)}초`;
   const min = ms / 60_000;
   return Number.isInteger(min) ? `${min}분` : `${min.toFixed(1)}분`;
+}
+
+/** `watch --ui` 대시보드 기본 포트. 쓰이고 있으면 서버가 다음 포트로 물러선다. */
+const DEFAULT_UI_PORT = 4478;
+
+/**
+ * PRContext · QueueEntry → 대시보드가 쓰는 납작한 뷰 모델.
+ *
+ * 여기서 변환하는 이유는 progress.ts 를 리프로 두기 위해서다 — 버스가
+ * 상태 머신 라벨을 알기 시작하면 reviewer 와 machine 이 UI 를 거쳐 얽힌다.
+ */
+function toCard(c: PRContext): ContextCard {
+  return {
+    key: `${c.owner}/${c.repo}#${c.prNumber}`,
+    title: c.title,
+    url: c.prUrl,
+    state: c.state,
+    stateLabel: STATE_LABELS[c.state],
+    nextAction: NEXT_ACTION_HINTS[c.state],
+    round: c.round,
+    requestedCount: c.requestedCount,
+    threadsTotal: c.threads.length,
+    threadsResolved: c.threads.filter((t) => t.isResolved).length,
+    excludedReason: c.excludedReason,
+    quotaRetryAt: c.quotaRetryAt,
+    lastError: c.lastError?.slice(0, 160),
+    conversationUrl: c.conversationUrl,
+    conversationTurns: c.conversationUrl ? c.conversationTurns : undefined,
+    updatedAt: c.updatedAt,
+  };
+}
+
+function toItem(e: QueueEntry): QueueItem {
+  return {
+    key: `${e.ctx.owner}/${e.ctx.repo}#${e.ctx.prNumber}`,
+    title: e.ctx.title,
+    url: e.ctx.prUrl,
+    round: e.ctx.round,
+    tier: e.tier,
+    reasonLabel: QUEUE_REASON_LABELS[e.reason],
+    waitingSince: e.waitingSince,
+  };
 }
 
 /** OS 기본 편집기로 파일 열기 (실패해도 무시). */
@@ -332,7 +377,15 @@ program
   .option('--headless', '헤드리스 모드로 실행', false)
   .option('--dry-run', '게시·상태 전이 없이 결과만 출력', false)
   .option('--once', '1회만 스캔 후 큐를 모두 소진하고 종료', false)
-  .action(async (opts: { headless: boolean; dryRun: boolean; once: boolean }) => {
+  .option('--ui', '관측 대시보드를 localhost 에 띄운다 (읽기 전용)', false)
+  .option('--ui-port <port>', `대시보드 포트 (기본 ${DEFAULT_UI_PORT})`)
+  .action(async (opts: {
+    headless: boolean;
+    dryRun: boolean;
+    once: boolean;
+    ui: boolean;
+    uiPort?: string;
+  }) => {
     banner();
     const cfg = loadConfig();
     if (opts.headless) cfg.headless = true;
@@ -358,6 +411,32 @@ program
     console.log(chalk.dim(`  감시 범위: ${describeScope(scope)}`));
     const repoSource = createRepoSource(scope);
 
+    // ── 관측 대시보드 ──
+    // 브라우저를 띄우기 **전에** 켠다. 로그인 안내나 launch 실패도 대시보드
+    // 로그에 남아야 터미널을 안 보고도 무슨 일인지 알 수 있다.
+    let ui: UIServerHandle | null = null;
+    if (opts.ui) {
+      const port = Number(opts.uiPort ?? DEFAULT_UI_PORT);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        console.log(chalk.red(`  ✗ 잘못된 포트: ${opts.uiPort}`));
+        return;
+      }
+      try {
+        ui = await startUIServer(port);
+        progress.patch({
+          startedAt: Date.now(),
+          scope: describeScope(scope),
+          dryRun: opts.dryRun,
+        });
+        console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (읽기 전용 · localhost 전용)'));
+      } catch (e) {
+        // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
+        console.log(
+          chalk.yellow(`  ⚠ 대시보드를 띄우지 못했습니다: ${e instanceof Error ? e.message : String(e)}`),
+        );
+      }
+    }
+
     const driver = new ChatGPTDriver(cfg);
     await driver.launch();
     await driver.navigateToChatGPT();
@@ -366,9 +445,11 @@ program
     if (!user) {
       console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
       await driver.close();
+      await ui?.close();
       return;
     }
     console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
+    progress.patch({ account: user.email ?? user.name ?? null });
 
     // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
     // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
@@ -398,7 +479,8 @@ program
      * 스캔 — 감시 범위의 모든 레포를 동기화하고, 리뷰 후보 컨텍스트를 모은다.
      * 여기서는 리뷰를 실행하지 않는다. 실행 순서는 큐가 정한다.
      */
-    const scan = (): { eligible: PRContext[]; openCount: number } => {
+    const scan = (): { eligible: PRContext[]; openCount: number; seen: PRContext[] } => {
+      progress.cycle({ scanning: true });
       const discovered = repoSource.list();
       const all = listContexts(cfg);
 
@@ -417,6 +499,10 @@ program
       const repos = [...discovered, ...lingering];
       watchedRepos = repos.length;
       const eligible: PRContext[] = [];
+      // 이번 스캔이 실제로 손댄 컨텍스트. 대시보드는 이걸 그대로 보여준다.
+      // listContexts 를 다시 읽지 않는 이유: 여기서 ctx.title·excludedReason 을
+      // 이벤트 없이 갱신하는 경로가 있어 디스크가 아직 최신이 아닐 수 있다.
+      const seen: PRContext[] = [];
       let openCount = 0;
 
       for (const repoSlug of repos) {
@@ -454,6 +540,7 @@ program
           if (!probe.prs.some((p) => p.number === c.prNumber)) {
             syncPR(cfg, c);
             reportIfChanged(c);
+            seen.push(c);
           }
         }
 
@@ -492,11 +579,13 @@ program
           if (needsFull) syncPR(cfg, ctx);
 
           reportIfChanged(ctx);
+          seen.push(ctx);
           if (verdict.ok) eligible.push(ctx);
         }
       }
 
-      return { eligible, openCount };
+      progress.cycle({ scanning: false, lastScanAt: Date.now() });
+      return { eligible, openCount, seen };
     };
 
     /**
@@ -515,7 +604,27 @@ program
       const usage = takeGraphQLUsage();
       lastCycleCost = usage.cost;
       lastRemaining = usage.remaining;
+      progress.cycle({ lastCost: usage.cost, remaining: usage.remaining });
       return usage.cost;
+    };
+
+    /** 대시보드에 이번 스캔 결과를 반영한다 (UI 가 꺼져 있으면 no-op). */
+    const publish = (
+      seen: PRContext[],
+      queue: QueueEntry[],
+      openCount: number,
+      quotaAt: number,
+    ): void => {
+      if (!progress.enabled) return;
+      progress.patch({
+        queue: queue.map(toItem),
+        contexts: seen
+          .filter((c) => c.state !== 'CLOSED')
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .map(toCard),
+        quotaUntil: quotaAt > Date.now() ? quotaAt : null,
+      });
+      progress.cycle({ openCount });
     };
 
     const loop = async (drain: boolean): Promise<boolean> => {
@@ -523,13 +632,15 @@ program
       // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
       takeGraphQLUsage();
 
-      const { eligible, openCount } = scan();
+      const { eligible, openCount, seen } = scan();
       const queue = buildQueue(eligible);
 
       // ── 쿼터 게이트: 큐는 보존하고 실행만 멈춘다 ──
       // 컨텍스트에서 다시 읽어 review 명령 등 다른 경로가 걸린 한도도 반영한다.
       // dry-run 은 상태를 전이시키지 않으므로 메모리 값도 함께 본다.
       quotaUntil = Math.max(quotaUntil, quotaGateUntil(eligible) ?? 0);
+      publish(seen, queue, openCount, quotaUntil);
+
       if (queue.length > 0 && Date.now() < quotaUntil) {
         tally(); // 실행은 건너뛰어도 스캔 비용은 이번 사이클 몫이다
         if (Date.now() - quotaNotified > HEARTBEAT_MS) {
@@ -551,14 +662,31 @@ program
             chalk.dim(`  [${QUEUE_REASON_LABELS[reason]}]`) +
             (queue.length > 1 ? chalk.dim(`  대기열 ${i + 1}/${queue.length}`) : ''),
         );
-        const outcome = await runRound(cfg, driver, ctx, { dryRun: opts.dryRun });
+        progress.beginReview({
+          key: `${ctx.owner}/${ctx.repo}#${ctx.prNumber}`,
+          title: ctx.title,
+          url: ctx.prUrl,
+          round: ctx.round + 1,
+          reasonLabel: QUEUE_REASON_LABELS[reason],
+          dryRun: opts.dryRun,
+        });
+        let outcome;
+        try {
+          outcome = await runRound(cfg, driver, ctx, { dryRun: opts.dryRun });
+        } finally {
+          // runRound 는 스스로 던지지 않도록 만들어져 있지만, 만약 새어 나오면
+          // 대시보드가 끝난 리뷰를 영원히 "진행 중" 으로 붙잡고 있게 된다.
+          progress.endReview();
+        }
         reported.set(`${ctx.owner}/${ctx.repo}#${ctx.prNumber}`, `${ctx.state}:${ctx.round}`);
         reviewRan = true;
+        publish(seen, buildQueue(eligible), openCount, quotaUntil);
 
         if (outcome === 'quota') {
           // 한도는 계정 단위라 남은 큐도 지금은 못 돈다. 버리지 않고 미룬다.
           quotaUntil = Date.now() + cfg.quotaCooldownMs;
           quotaNotified = Date.now();
+          progress.patch({ quotaUntil });
           const left = queue.length - i - 1;
           console.log(
             chalk.yellow(
@@ -622,6 +750,7 @@ program
 
     if (opts.once) {
       await driver.close();
+      await ui?.close();
       return;
     }
 
@@ -638,6 +767,7 @@ program
     // (이걸 안 하면 15분 라운드 뒤 다시 폴링 주기를 기다려 꼬리 지연이 붙는다)
     const scheduleNext = (delayMs: number): void => {
       if (stopped) return;
+      progress.cycle({ nextScanAt: Date.now() + delayMs });
       timer = setTimeout(async () => {
         if (stopped) return;
         let reviewRan = false;
@@ -661,6 +791,7 @@ program
       stopped = true;
       if (timer) clearTimeout(timer);
       await driver.close();
+      await ui?.close();
       process.exit(0);
     };
     process.on('SIGINT', cleanup);

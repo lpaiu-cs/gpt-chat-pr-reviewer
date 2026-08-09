@@ -28,9 +28,14 @@ src/
   poster.ts         — ReviewResult → GitHub 인라인 코멘트 게시
   instructions.ts   — 맞춤 지침 파일 (instructions.md → {{instructions}} 주입)
   config.ts         — 설정 로드/저장 (pr-review.config.json)
+  progress.ts       — 진행 상황 버스 (리프 — http·config·상태 머신을 모른다)
+  ui/
+    server.ts       — 관측 대시보드: node:http + SSE, 127.0.0.1 전용
+    app.html        — 대시보드 (단일 파일 · 빌드 스텝 없음)
   types.ts          — 공유 타입 (PRState/PREvent/PRContext 포함)
 scripts/
   smoke-machine.ts  — 상태 머신 스모크 테스트 (npm run smoke)
+  copy-ui.mjs       — app.html 을 dist 로 복사 (tsc 는 .html 을 안 옮긴다)
 ```
 
 ## 상태 머신
@@ -69,6 +74,30 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 `store.ts` 에 잠금이 없어 큐 파일을 따로 두면 watch 와 `queue` 명령이 같은 파일을
 다툰다. 큐 대기는 GitHub 에서 관측된 PR 상태가 아니므로 `QUEUED` 같은 상태를
 `TRANSITIONS` 에 추가하지 않는다.
+
+## 대시보드 (`watch --ui`)
+
+**watch 프로세스 안에서** 돈다. 별도 프로세스가 아니고 `data/state/*.json` 을 읽지도
+않는다 — `progress.ts` 버스에 모인 루프의 메모리만 본다. 이유는 큐를 파일로 저장하지
+않는 것과 정확히 같다: `store.ts` 에 잠금이 없고 라운드 하나가 2~15분 동안
+read-modify-write 를 붙잡으므로, 다른 읽기·쓰기 경로가 끼어들면 결과를 덮어쓰거나
+찢어진 JSON 을 읽는다.
+
+의존 방향은 `reviewer/chatgpt → progress ← ui/server` 로만 흐른다. `progress.ts` 는
+리프로 유지한다 — 여기가 상태 머신 라벨을 알기 시작하면 UI 를 거쳐 모듈이 얽힌다.
+그래서 `PRContext → ContextCard` 변환은 `cli.ts` 에 둔다.
+
+- 로그는 `console.log/error` 를 한 번 감싸 미러링한다 (호출부 60여 곳을 고치지 않는다).
+  심각도는 chalk 의 첫 SGR 코드로 추론하고, 색이 꺼진 환경에서는 마커(`✓ ⚠ ✗`)가 폴백.
+- 라운드 진행 단계는 `reviewer.ts` 와 `chatgpt.ts` 의 `progress.phase()` 로 보고한다.
+  `waiting` 이 압도적으로 길어(2~15분) 이 구간의 스트리밍 관측값(`progress.stream`)이
+  관측의 핵심이다. **이슈 #1(원인 미상 타임아웃)의 증상 기록 창구이기도 하다.**
+- 세션 id 는 프로세스마다 새로 만든다. 로그 `seq` 가 1부터 다시 시작하므로, 이게 없으면
+  watch 재시작 후 클라이언트가 새 로그를 전부 "이미 본 것" 으로 버린다.
+- `--ui` 없이 돌면 `progress.enabled === false` 라 모든 기록 호출이 no-op 이다.
+
+**읽기 전용이다.** 제어(지금 리뷰·일시정지·지침 편집)는 아직 없다. 넣을 때는 POST 가
+상태를 직접 건드리지 말고 의도 큐에 넣어 루프가 안전한 지점에서 소비해야 한다.
 
 ## 핵심 흐름
 
@@ -115,7 +144,7 @@ npm install
 npm run smoke        # 상태 머신 테스트
 npm run dev -- init  # 설정 + instructions.md 생성
 npm run dev -- review <pr-url> [--dry-run|--force]
-npm run dev -- watch [--once|--headless]
+npm run dev -- watch [--once|--headless|--ui|--ui-port <port>]
 npm run dev -- queue [--json]   # 리뷰 대기열
 npm run dev -- status [pr] [--json]
 npm run dev -- graph [pr]   # mermaid 다이어그램

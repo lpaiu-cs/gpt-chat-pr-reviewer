@@ -4,6 +4,7 @@
  * 대표 시나리오의 전이 경로와 불법 전이 차단을 검증한다.
  */
 
+import chalk from 'chalk';
 import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/machine.js';
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
@@ -21,6 +22,7 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
+import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
   globToRegExp,
@@ -892,6 +894,94 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 26: 대시보드 로그 심각도 추론 ─────────────────
+
+{
+  // 로깅 API 를 새로 만드는 대신 이미 있는 두 신호를 읽는다: chalk 의 SGR 코드와
+  // 출력문 마커. 색이 꺼진 환경(파이프)에서는 앞이 사라지므로 둘 다 성립해야 한다.
+  const prevLevel = chalk.level;
+  chalk.level = 3; // SGR 경로
+
+  assert(inferLevel(chalk.red('  ✗ 리뷰 실패:')) === 'error', 'SGR: red → error');
+  assert(inferLevel(chalk.yellow('  ⚠ 쿼터 한도')) === 'warn', 'SGR: yellow → warn');
+  assert(inferLevel(chalk.green('  ✓ 응답 수신 완료')) === 'ok', 'SGR: green → ok');
+  assert(inferLevel(chalk.dim('    …30초 경과')) === 'dim', 'SGR: dim → dim');
+  assert(
+    inferLevel(chalk.bold('  🔍 o/r#8') + chalk.dim(' [1차]')) === 'info',
+    'SGR: 첫 코드만 본다 (bold → info)',
+  );
+
+  chalk.level = 0; // 색 없음 — 마커 폴백 경로
+  assert(inferLevel(chalk.red('  ✗ 리뷰 실패:')) === 'error', '폴백: ✗ → error');
+  assert(inferLevel(chalk.yellow('  ⚠ 쿼터 한도')) === 'warn', '폴백: ⚠ → warn');
+  assert(inferLevel(chalk.green('  ✓ 응답 수신 완료')) === 'ok', '폴백: ✓ → ok');
+  assert(inferLevel('평문 로그') === 'info', '단서가 없으면 info');
+
+  chalk.level = prevLevel;
+  assert(stripAnsi('\x1b[31m✗ 실패\x1b[39m') === '✗ 실패', 'ANSI 제거');
+}
+
+// ── 시나리오 27: 대시보드 버스 — 세션·게이트·라운드 수명 ───
+
+{
+  // enabled 가 꺼져 있으면 아무것도 기록하지 않는다 (--ui 없이 도는 게 기본이다).
+  progress.enabled = false;
+  progress.log('버려질 로그');
+  progress.patch({ scope: '버려질 범위' });
+  assert(progress.state().logs.length === 0, 'UI 가 꺼져 있으면 로그를 쌓지 않는다');
+  assert(progress.state().snapshot.scope === '', 'UI 가 꺼져 있으면 스냅샷도 그대로');
+
+  progress.enabled = true;
+  const session = progress.state().snapshot.session;
+  assert(!!session, '세션 id 가 있다');
+
+  // 세션 id 는 호출자가 덮어쓸 수 없어야 한다. 이게 뚫리면 watch 재시작 판정이
+  // 무너져서 클라이언트가 새 로그를 전부 "이미 본 것" 으로 버린다.
+  progress.patch({ session: 'spoofed' } as never);
+  assert(progress.state().snapshot.session === session, '세션 id 는 patch 로 못 바꾼다');
+
+  progress.log(chalk.green('  ✓ 첫 줄'));
+  progress.log('');
+  progress.log('   \t  ');
+  const logs = progress.state().logs;
+  assert(logs.length === 1, '공백뿐인 줄은 UI 로그에 쌓지 않는다');
+  assert(logs[0].seq === 1 && logs[0].level === 'ok', 'seq 는 1부터, 레벨은 추론값');
+
+  // 라운드 수명: begin → phase → stream → end
+  progress.beginReview({
+    key: 'o/r#8', title: 't', url: 'u', round: 3, reasonLabel: '작성자 응답', dryRun: false,
+  });
+  assert(progress.state().snapshot.active?.phase === 'conversation', '시작 단계는 conversation');
+
+  progress.phase('waiting');
+  const waitingSince = progress.state().snapshot.active!.phaseSince;
+  progress.stream('생성 중', 1200);
+  assert(progress.state().snapshot.active?.stream?.chars === 1200, '스트리밍 관측값 기록');
+
+  progress.phase('waiting'); // 같은 단계 재진입
+  assert(
+    progress.state().snapshot.active!.phaseSince === waitingSince,
+    '같은 단계면 경과 타이머를 되감지 않는다',
+  );
+  assert(progress.state().snapshot.active?.stream?.chars === 1200, '같은 단계면 관측값도 유지');
+
+  progress.phase('parsing');
+  assert(
+    progress.state().snapshot.active?.stream === undefined,
+    '단계가 바뀌면 이전 스트리밍 값은 버린다 (다음 단계의 수치로 오해된다)',
+  );
+
+  progress.endReview();
+  assert(progress.state().snapshot.active === null, 'endReview 가 진행 중 표시를 걷는다');
+
+  // phase/stream 은 active 가 없으면 조용히 무시돼야 한다 — 스캔 중 호출될 수 있다.
+  progress.phase('posting');
+  progress.stream('생성 중', 5);
+  assert(progress.state().snapshot.active === null, '진행 중 라운드가 없으면 단계 기록은 무시');
+
+  progress.enabled = false;
 }
 
 // ── 결과 ────────────────────────────────────────────────────

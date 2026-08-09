@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR Reviewer</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2129; --line:#272e38;
+    --fg:#e6edf3; --dim:#8b949e; --faint:#6e7681;
+    --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mag:#bc8cff; --cyan:#39c5cf;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#ffffff; --panel:#f6f8fa; --panel2:#eef1f4; --line:#d0d7de;
+      --fg:#1f2328; --dim:#59636e; --faint:#818b98;
+      --accent:#0969da; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e;
+      --mag:#8250df; --cyan:#1b7c83;
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif;
+    display:flex; flex-direction:column; min-height:100vh;
+  }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  code, .mono { font-family:var(--mono); }
+
+  /* ── 헤더 ── */
+  header {
+    position:sticky; top:0; z-index:10; background:var(--panel);
+    border-bottom:1px solid var(--line); padding:.7rem 1rem;
+    display:flex; align-items:center; gap:.75rem; flex-wrap:wrap;
+  }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--err); flex:none; }
+  .dot.live { background:var(--ok); box-shadow:0 0 0 0 rgba(63,185,80,.6); animation:pulse 2.4s infinite; }
+  @keyframes pulse { 70%{box-shadow:0 0 0 7px rgba(63,185,80,0)} 100%{box-shadow:0 0 0 0 rgba(63,185,80,0)} }
+  h1 { font-size:.95rem; margin:0; font-weight:600; letter-spacing:-.01em; }
+  .meta { color:var(--dim); font-size:.78rem; display:flex; gap:.6rem; flex-wrap:wrap; margin-left:auto; }
+  .meta b { color:var(--fg); font-weight:500; }
+
+  main { flex:1; padding:1rem; display:flex; flex-direction:column; gap:1rem; max-width:1400px; width:100%; margin:0 auto; }
+
+  /* ── 진행 중 패널 ── */
+  #active { border:1px solid var(--accent); border-radius:10px; background:var(--panel);
+            padding:1rem; box-shadow:0 0 0 1px rgba(88,166,255,.12) inset; }
+  #active.idle { display:none; }
+  .act-top { display:flex; align-items:baseline; gap:.6rem; flex-wrap:wrap; margin-bottom:.9rem; }
+  .act-key { font-family:var(--mono); font-weight:600; font-size:1rem; }
+  .act-round { color:var(--accent); font-size:.8rem; font-weight:600; }
+  .act-title { color:var(--dim); font-size:.82rem; flex:1; min-width:200px;
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  .steps { display:flex; gap:0; align-items:flex-start; margin-bottom:.85rem; overflow-x:auto; }
+  .step { flex:1; min-width:74px; text-align:center; position:relative; padding-top:14px; }
+  .step::before { content:""; position:absolute; top:4px; left:50%; right:-50%; height:2px; background:var(--line); }
+  .step:last-child::before { display:none; }
+  .step i { position:absolute; top:0; left:50%; transform:translateX(-50%);
+            width:10px; height:10px; border-radius:50%; background:var(--line); }
+  .step.done i { background:var(--ok); }
+  .step.done::before { background:var(--ok); }
+  .step.now i { background:var(--accent); box-shadow:0 0 0 4px rgba(88,166,255,.22); }
+  .step span { font-size:.7rem; color:var(--faint); }
+  .step.now span { color:var(--accent); font-weight:600; }
+  .step.done span { color:var(--dim); }
+
+  .act-live { display:flex; align-items:baseline; gap:.7rem; flex-wrap:wrap;
+              background:var(--panel2); border-radius:7px; padding:.6rem .8rem; }
+  .elapsed { font-family:var(--mono); font-size:1.6rem; font-weight:600; letter-spacing:-.02em; line-height:1.1; }
+  .act-live .lbl { color:var(--dim); font-size:.82rem; }
+  .act-live .stream { margin-left:auto; color:var(--dim); font-size:.78rem; font-family:var(--mono); }
+  .act-live .stream b { color:var(--fg); font-weight:500; }
+
+  /* ── 카드 그리드 ── */
+  .cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.25fr); gap:1rem; }
+  @media (max-width:900px) { .cols { grid-template-columns:1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  section > h2 {
+    margin:0; padding:.55rem .85rem; font-size:.78rem; font-weight:600; letter-spacing:.02em;
+    color:var(--dim); background:var(--panel2); border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:.45rem;
+  }
+  section > h2 .n { color:var(--fg); }
+  section > h2 .hint { margin-left:auto; font-weight:400; color:var(--faint); font-size:.72rem; }
+  .rows { max-height:min(46vh,520px); overflow-y:auto; }
+  .empty { padding:1.2rem .85rem; color:var(--faint); font-size:.82rem; text-align:center; }
+
+  .row { padding:.6rem .85rem; border-bottom:1px solid var(--line); display:flex; gap:.6rem; align-items:flex-start; }
+  .row:last-child { border-bottom:none; }
+  .row .ord { color:var(--faint); font-family:var(--mono); font-size:.78rem; min-width:1.3em; text-align:right; padding-top:1px; }
+  .row .body { flex:1; min-width:0; }
+  .row .l1 { display:flex; align-items:center; gap:.45rem; flex-wrap:wrap; }
+  .row .key { font-family:var(--mono); font-size:.83rem; font-weight:600; }
+  .row .l2 { color:var(--dim); font-size:.78rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:.1rem; }
+  .row .l3 { color:var(--faint); font-size:.73rem; margin-top:.22rem; display:flex; gap:.55rem; flex-wrap:wrap; align-items:center; }
+
+  .badge { font-size:.68rem; font-weight:600; padding:.1rem .42rem; border-radius:4px;
+           border:1px solid currentColor; white-space:nowrap; }
+  .b-REVIEW_DUE{color:var(--cyan)} .b-REVIEWING{color:var(--accent)} .b-AWAITING_AUTHOR{color:var(--warn)}
+  .b-CONVERGED{color:var(--ok)} .b-QUOTA_BLOCKED{color:var(--mag)} .b-ERROR{color:var(--err)}
+  .b-CLOSED{color:var(--faint)}
+  .tag { font-size:.68rem; color:var(--accent); background:rgba(88,166,255,.12);
+         padding:.1rem .42rem; border-radius:4px; white-space:nowrap; }
+  .tag.mute { color:var(--faint); background:var(--panel2); }
+
+  .bar { height:3px; border-radius:2px; background:var(--line); width:70px; overflow:hidden; flex:none; }
+  .bar i { display:block; height:100%; background:var(--ok); }
+  .err-line { color:var(--err); font-size:.73rem; margin-top:.22rem;
+              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* ── 로그 ── */
+  #logwrap { max-height:min(38vh,420px); overflow-y:auto; padding:.5rem 0; }
+  .log { display:flex; gap:.6rem; padding:.06rem .85rem; font-family:var(--mono); font-size:.755rem; line-height:1.55; }
+  .log time { color:var(--faint); flex:none; }
+  .log span { white-space:pre-wrap; word-break:break-word; }
+  .lv-error span{color:var(--err)} .lv-warn span{color:var(--warn)} .lv-ok span{color:var(--ok)}
+  .lv-dim span{color:var(--dim)} .lv-info span{color:var(--fg)}
+  .log.restart span { color:var(--warn); }
+
+  /* ── 푸터 ── */
+  footer {
+    position:sticky; bottom:0; background:var(--panel); border-top:1px solid var(--line);
+    padding:.5rem 1rem; font-size:.76rem; color:var(--dim);
+    display:flex; gap:1rem; flex-wrap:wrap; align-items:center;
+  }
+  footer b { color:var(--fg); font-weight:500; font-family:var(--mono); }
+  .quota { color:var(--mag); }
+  .toggle { margin-left:auto; color:var(--faint); cursor:pointer; user-select:none; font-size:.74rem; }
+  .toggle:hover { color:var(--fg); }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="conn"></span>
+  <h1>PR Reviewer</h1>
+  <div class="meta">
+    <span id="m-scope"></span>
+    <span id="m-account"></span>
+    <span id="m-uptime"></span>
+  </div>
+</header>
+
+<main>
+  <div id="active" class="idle"></div>
+
+  <div class="cols">
+    <section>
+      <h2>대기열 <span class="n" id="q-n">0</span><span class="hint">위에서부터 처리</span></h2>
+      <div class="rows" id="queue"></div>
+    </section>
+    <section>
+      <h2>추적 중 <span class="n" id="c-n">0</span><span class="hint">최근 변경 순</span></h2>
+      <div class="rows" id="contexts"></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>로그 <span class="toggle" id="follow">⏬ 자동 스크롤 켜짐</span></h2>
+    <div id="logwrap"></div>
+  </section>
+</main>
+
+<footer>
+  <span id="f-scan">—</span>
+  <span>레포 <b id="f-repos">0</b></span>
+  <span>열린 PR <b id="f-open">0</b></span>
+  <span>사이클 <b id="f-cost">0</b> point</span>
+  <span id="f-remain"></span>
+  <span id="f-quota" class="quota"></span>
+</footer>
+
+<script>
+'use strict';
+
+const PHASES = [
+  ['conversation', '대화 준비'],
+  ['prompt',       '프롬프트 전송'],
+  ['waiting',      '응답 대기'],
+  ['parsing',      '응답 파싱'],
+  ['posting',      '리뷰 게시'],
+  ['syncing',      '스레드 동기화'],
+];
+
+let snap = null;
+let following = true;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+
+/** 경과 시간 — 초 단위까지 보여야 "멈춘 게 아니다" 가 전달된다. */
+function dur(ms) {
+  if (ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + '초';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + '분 ' + (s % 60) + '초';
+  const h = Math.floor(m / 60);
+  return h + '시간 ' + (m % 60) + '분';
+}
+function shortDur(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + '초';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + '분';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + '시간';
+  return Math.floor(h / 24) + '일';
+}
+const clock = (ts) => new Date(ts).toLocaleTimeString('ko-KR', { hour12: false });
+
+// ── 진행 중 패널 ────────────────────────────────────────────
+
+function renderActive() {
+  const el = $('active');
+  const a = snap && snap.active;
+  if (!a) { el.className = 'idle'; el.innerHTML = ''; return; }
+  el.className = '';
+
+  const at = PHASES.findIndex((p) => p[0] === a.phase);
+  const steps = PHASES.map(([k, label], i) =>
+    '<div class="step ' + (i < at ? 'done' : i === at ? 'now' : '') + '">' +
+      '<i></i><span>' + label + '</span></div>').join('');
+
+  el.innerHTML =
+    '<div class="act-top">' +
+      '<a class="act-key" href="' + esc(a.url) + '" target="_blank" rel="noopener">' + esc(a.key) + '</a>' +
+      '<span class="act-round">' + a.round + '차 리뷰</span>' +
+      (a.dryRun ? '<span class="tag mute">dry-run</span>' : '') +
+      '<span class="tag">' + esc(a.reasonLabel) + '</span>' +
+      '<span class="act-title">' + esc(a.title) + '</span>' +
+    '</div>' +
+    '<div class="steps">' + steps + '</div>' +
+    '<div class="act-live">' +
+      '<span class="elapsed" id="a-elapsed">—</span>' +
+      '<span class="lbl">' + esc(PHASES[at] ? PHASES[at][1] : a.phase) + '</span>' +
+      '<span class="lbl" id="a-total"></span>' +
+      '<span class="stream" id="a-stream"></span>' +
+    '</div>';
+  tick();
+}
+
+/** 1초마다 타이머 문자열만 갈아끼운다 — 전체 재렌더는 스크롤을 튀게 한다. */
+function tick() {
+  const now = Date.now();
+  if (snap && snap.active) {
+    const a = snap.active;
+    const e = $('a-elapsed');
+    if (e) e.textContent = dur(now - a.phaseSince);
+    const t = $('a-total');
+    if (t) t.textContent = '(라운드 전체 ' + dur(now - a.startedAt) + ')';
+    const s = $('a-stream');
+    if (s) {
+      s.innerHTML = a.stream
+        ? '<b>' + esc(a.stream.state) + '</b> · ' + a.stream.chars.toLocaleString() + '자 수신'
+        : '';
+    }
+  }
+  if (snap) {
+    const n = snap.cycle.nextScanAt;
+    $('f-scan').textContent = snap.active
+      ? '리뷰 진행 중 — 완료 후 즉시 재스캔'
+      : snap.cycle.scanning
+        ? '스캔 중…'
+        : n ? '다음 스캔 ' + dur(n - now) : '—';
+    $('m-uptime').innerHTML = '가동 <b>' + shortDur(now - snap.startedAt) + '</b>';
+    const q = snap.quotaUntil;
+    $('f-quota').textContent = q && q > now
+      ? '⏸ 쿼터 대기 ' + dur(q - now) + ' 남음 (대기열 보존)' : '';
+  }
+  // 대기 시간은 분 단위라 1초마다 다시 그릴 필요가 없다 (10초마다).
+  if (now - tick.lastRows > 10_000) { tick.lastRows = now; renderQueue(); }
+}
+tick.lastRows = 0;
+
+// ── 대기열 · 추적 목록 ──────────────────────────────────────
+
+function renderQueue() {
+  if (!snap) return;
+  const q = snap.queue;
+  $('q-n').textContent = q.length;
+  $('queue').innerHTML = q.length === 0
+    ? '<div class="empty">대기열이 비어 있습니다.</div>'
+    : q.map((e, i) =>
+        '<div class="row">' +
+          '<span class="ord">' + (i + 1) + '</span>' +
+          '<div class="body">' +
+            '<div class="l1">' +
+              '<a class="key" href="' + esc(e.url) + '" target="_blank" rel="noopener">' + esc(e.key) + '</a>' +
+              '<span class="tag">' + esc(e.reasonLabel) + '</span>' +
+            '</div>' +
+            '<div class="l2">' + esc(e.title) + '</div>' +
+            '<div class="l3"><span>대기 ' + shortDur(Date.now() - Date.parse(e.waitingSince)) + '</span>' +
+              (e.round > 0 ? '<span>' + e.round + '라운드 완료</span>' : '') + '</div>' +
+          '</div>' +
+        '</div>').join('');
+}
+
+function renderContexts() {
+  if (!snap) return;
+  const cs = snap.contexts;
+  $('c-n').textContent = cs.length;
+  $('contexts').innerHTML = cs.length === 0
+    ? '<div class="empty">추적 중인 PR 이 없습니다. 첫 스캔을 기다리는 중입니다.</div>'
+    : cs.map((c) => {
+        const pct = c.threadsTotal ? Math.round((c.threadsResolved / c.threadsTotal) * 100) : 0;
+        return '<div class="row">' +
+          '<div class="body">' +
+            '<div class="l1">' +
+              '<a class="key" href="' + esc(c.url) + '" target="_blank" rel="noopener">' + esc(c.key) + '</a>' +
+              '<span class="badge b-' + esc(c.state) + '">' + esc(c.stateLabel) + '</span>' +
+              (c.excludedReason ? '<span class="tag mute">제외: ' + esc(c.excludedReason) + '</span>' : '') +
+            '</div>' +
+            '<div class="l2">' + esc(c.title) + '</div>' +
+            '<div class="l3">' +
+              '<span>' + c.round + '라운드</span>' +
+              '<span>요청 ' + c.requestedCount + '개</span>' +
+              (c.threadsTotal
+                ? '<span>스레드 ' + c.threadsResolved + '/' + c.threadsTotal + '</span>' +
+                  '<span class="bar"><i style="width:' + pct + '%"></i></span>'
+                : '') +
+              (c.conversationTurns ? '<span>대화 ' + c.conversationTurns + '회</span>' : '') +
+              '<span style="color:var(--faint)">' + esc(c.nextAction) + '</span>' +
+            '</div>' +
+            (c.lastError ? '<div class="err-line">✗ ' + esc(c.lastError) + '</div>' : '') +
+          '</div>' +
+        '</div>';
+      }).join('');
+}
+
+function renderMeta() {
+  if (!snap) return;
+  $('m-scope').textContent = snap.scope;
+  $('m-account').innerHTML = snap.account
+    ? '계정 <b>' + esc(snap.account) + '</b>' + (snap.dryRun ? ' · <b>dry-run</b>' : '') : '';
+  $('f-repos').textContent = snap.cycle.watchedRepos;
+  $('f-open').textContent = snap.cycle.openCount;
+  $('f-cost').textContent = snap.cycle.lastCost;
+  $('f-remain').innerHTML = snap.cycle.remaining >= 0
+    ? 'GraphQL 잔여 <b>' + snap.cycle.remaining.toLocaleString() + '</b>' : '';
+}
+
+function renderAll() {
+  renderMeta(); renderActive(); renderQueue(); renderContexts(); tick();
+}
+
+// ── 로그 ────────────────────────────────────────────────────
+
+const logwrap = $('logwrap');
+let lastSeq = 0;
+let session = null;
+
+/**
+ * watch 프로세스가 바뀌었는지 확인한다.
+ *
+ * 단순 재연결(EventSource 의 자동 복구)이면 서버가 링 버퍼를 다시 흘려보내므로
+ * seq 로 걸러야 한다. 하지만 watch 를 재시작하면 seq 가 1부터 다시 시작해서,
+ * 초기화하지 않으면 새 로그가 전부 "이미 본 것" 으로 버려진다.
+ */
+function checkSession(id) {
+  if (id === session) return;
+  if (session !== null) {
+    const hr = document.createElement('div');
+    hr.className = 'log lv-dim restart';
+    hr.innerHTML = '<time>' + clock(Date.now()) + '</time><span>── watch 재시작 ──</span>';
+    logwrap.appendChild(hr);
+  }
+  session = id;
+  lastSeq = 0;
+}
+
+function addLog(l) {
+  if (l.seq <= lastSeq) return; // 같은 세션의 재전송분은 건너뛴다
+  lastSeq = l.seq;
+  const div = document.createElement('div');
+  div.className = 'log lv-' + l.level;
+  div.innerHTML = '<time>' + clock(l.at) + '</time><span>' + esc(l.text) + '</span>';
+  logwrap.appendChild(div);
+  while (logwrap.childElementCount > 600) logwrap.removeChild(logwrap.firstChild);
+  if (following) logwrap.scrollTop = logwrap.scrollHeight;
+}
+
+logwrap.addEventListener('scroll', () => {
+  const atEnd = logwrap.scrollHeight - logwrap.scrollTop - logwrap.clientHeight < 40;
+  if (atEnd !== following) { following = atEnd; paintFollow(); }
+});
+$('follow').addEventListener('click', () => {
+  following = !following; paintFollow();
+  if (following) logwrap.scrollTop = logwrap.scrollHeight;
+});
+function paintFollow() {
+  $('follow').textContent = following ? '⏬ 자동 스크롤 켜짐' : '⏸ 자동 스크롤 꺼짐';
+}
+
+// ── 연결 ────────────────────────────────────────────────────
+
+function connect() {
+  const es = new EventSource('/events');
+  es.onopen = () => { $('conn').className = 'dot live'; };
+  es.onerror = () => { $('conn').className = 'dot'; }; // EventSource 가 알아서 재연결한다
+  es.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    // 스냅샷이 로그보다 먼저 온다 (server.ts 의 전송 순서) — 세션 판정이 항상 앞선다.
+    if (m.type === 'snapshot') { checkSession(m.data.session); snap = m.data; renderAll(); }
+    else if (m.type === 'log') { addLog(m.data); }
+  };
+}
+
+paintFollow();
+connect();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

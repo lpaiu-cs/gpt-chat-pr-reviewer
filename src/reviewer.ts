@@ -23,6 +23,7 @@ import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub } from './poster.js';
 import { loadInstructions } from './instructions.js';
 import { saveResponse, loadLatestResponse, type ResponseMeta } from './cache.js';
+import { progress } from './progress.js';
 
 // ── 스레드 동기화 ───────────────────────────────────────────
 
@@ -525,6 +526,7 @@ async function obtainRaw(
     saveContext(cfg, ctx);
   }
 
+  progress.phase('prompt'); // collectResponse 가 곧 'waiting' 으로 넘긴다
   const raw = await driver.sendAndCollect(prompt);
   const conversationUrl = driver.currentConversationUrl() ?? undefined;
 
@@ -560,9 +562,11 @@ export async function runRound(
   if (opts.dryRun) {
     try {
       const raw = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
+      progress.phase('parsing');
       const result = parseGPTResponse(raw);
       if (!assertReviewable(result)) return 'failed';
       console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
+      progress.phase('posting');
       await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
         dryRun: true,
         isSelfReview: resolveSelfReview(ctx),
@@ -586,6 +590,7 @@ export async function runRound(
 
   try {
     const raw = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
+    progress.phase('parsing');
     const result = parseGPTResponse(raw);
 
     // 리뷰가 아닌 응답을 PR 에 게시하지 않는다.
@@ -596,11 +601,13 @@ export async function runRound(
     }
     console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
 
+    progress.phase('posting');
     await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
       isSelfReview: resolveSelfReview(ctx),
     });
 
     // 게시 직후 head SHA · 새 스레드 동기화
+    progress.phase('syncing');
     let headSha = ctx.headShaAtLastReview;
     try {
       const sync = fetchPRSyncData(ctx.owner, ctx.repo, ctx.prNumber);
