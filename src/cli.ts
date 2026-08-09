@@ -20,7 +20,7 @@ import chalk from 'chalk';
 
 import { loadConfig, initConfig, ensureDataDir } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
-import { parsePRInput, getPRInfo, fetchRepoProbe } from './github.js';
+import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage } from './github.js';
 import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
@@ -370,7 +370,10 @@ program
       let quotaHit = false;
       let reviewRan = false;
       let scanned = 0;
-      let cycleCost = 0;
+
+      // 사이클 시작 시점에 카운터를 비운다. probe 뿐 아니라 폴백 전체 동기화·
+      // 닫힘 확인까지 모든 GraphQL 경로가 여기에 집계된다.
+      takeGraphQLUsage();
 
       for (const repoSlug of cfg.watchRepos) {
         if (quotaHit) break;
@@ -394,8 +397,6 @@ program
           continue;
         }
         scanned += probe.prs.length;
-        lastRemaining = probe.remaining;
-        cycleCost += probe.cost; // alias 청크가 늘면 레포당 1 을 넘는다
 
         // 추적 중이지만 열린 목록에 없는 PR → 닫힘 확인 (여기서만 개별 조회)
         for (const c of tracked) {
@@ -433,15 +434,21 @@ program
         console.log(chalk.yellow('\n  ⚠ 쿼터 한도 도달 — 이번 사이클을 중단하고 쿨다운 후 재개합니다.'));
       }
 
+      // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.
+      const usage = takeGraphQLUsage();
+      lastCycleCost = usage.cost;
+      lastRemaining = usage.remaining;
+
       // 아무 변화 없이 조용한 구간에서도 살아있음을 알린다
       if (!reviewRan && Date.now() - lastHeartbeat > HEARTBEAT_MS) {
         lastHeartbeat = Date.now();
         const at = new Date().toLocaleTimeString('ko-KR');
         const budget = lastRemaining >= 0 ? ` · 잔여 한도 ${lastRemaining.toLocaleString()}` : '';
-        console.log(chalk.dim(`    ${at} · 감시 중 (열린 PR ${scanned}건)${budget}`));
+        console.log(
+          chalk.dim(`    ${at} · 감시 중 (열린 PR ${scanned}건, ${usage.cost} point)${budget}`),
+        );
       }
 
-      lastCycleCost = cycleCost;
       return reviewRan;
     };
 

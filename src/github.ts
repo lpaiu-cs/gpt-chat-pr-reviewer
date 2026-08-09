@@ -80,6 +80,7 @@ export interface PRSyncData {
 }
 
 const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
+  rateLimit{ cost remaining }
   repository(owner:$owner,name:$name){
     pullRequest(number:$num){
       state
@@ -97,11 +98,11 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
 /** PR 의 현재 상태 + 리뷰 스레드를 한 번의 GraphQL 호출로 가져온다. */
 export function fetchPRSyncData(owner: string, repo: string, number: number): PRSyncData {
   // -F (대문자) 만 @- stdin 확장을 지원한다. -f 는 "@-" 를 문자열 그대로 보낸다.
-  const raw = execSync(
-    `gh api graphql -F owner=${owner} -F name=${repo} -F num=${number} -F query=@-`,
-    { encoding: 'utf-8', input: SYNC_QUERY, maxBuffer: 10 * 1024 * 1024 },
+  const { data } = graphQLTolerant(
+    `-F owner=${owner} -F name=${repo} -F num=${number}`,
+    SYNC_QUERY,
   );
-  const pr = JSON.parse(raw).data.repository.pullRequest;
+  const pr = data.repository.pullRequest;
   return {
     status: pr.state,
     headSha: pr.headRefOid,
@@ -169,6 +170,27 @@ export const THREAD_ALIAS_CHUNK = 20;
 
 const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName headRefName author{ login }`;
 
+// ── GraphQL 사용량 집계 ─────────────────────────────────────
+//
+// 폴링 주기를 실제 소모량에 맞추려면 probe 뿐 아니라 전체 동기화·닫힘 확인 등
+// 모든 GraphQL 경로의 비용을 세야 한다. 호출부가 일일이 합산하면 경로가 하나만
+// 늘어도 과소평가가 생기므로, 여기서 중앙 집계한다.
+
+let graphqlSpent = 0;
+let graphqlRemaining = -1;
+
+function recordUsage(rateLimit: { cost?: number; remaining?: number } | undefined): void {
+  graphqlSpent += rateLimit?.cost ?? 1; // rateLimit 미조회 쿼리도 최소 1 로 센다
+  if (typeof rateLimit?.remaining === 'number') graphqlRemaining = rateLimit.remaining;
+}
+
+/** 마지막 집계 이후의 GraphQL 소모량을 가져오고 카운터를 리셋한다. */
+export function takeGraphQLUsage(): { cost: number; remaining: number } {
+  const usage = { cost: graphqlSpent, remaining: graphqlRemaining };
+  graphqlSpent = 0;
+  return usage;
+}
+
 /**
  * GraphQL 쿼리를 실행하되 **부분 응답을 살린다.**
  *
@@ -186,13 +208,18 @@ function graphQLTolerant(args: string, query: string): { data: any; errors?: any
       // 부분 실패 메시지가 그대로 쏟아져 로그가 못 쓰게 된다.
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    recordUsage(parsed?.data?.rateLimit);
+    return parsed;
   } catch (e) {
     const out = (e as { stdout?: unknown })?.stdout;
     if (typeof out === 'string') {
       try {
         const parsed = JSON.parse(out);
-        if (parsed?.data) return parsed; // 부분 응답 — 사용 가능
+        if (parsed?.data) {
+          recordUsage(parsed.data.rateLimit); // 부분 응답도 비용은 발생했다
+          return parsed;
+        }
       } catch {
         /* JSON 아님 — 원래 오류를 던진다 */
       }

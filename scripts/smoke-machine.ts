@@ -260,13 +260,14 @@ const fakePR: PRInfo = {
   const second = syncPRFromProbe(cfg, c7, probeOf(c7, { threads: probeThreads }));
   assert(!second, 'probe: 두 번째 tick 부터 남의 스레드는 전체 동기화를 유발하지 않는다');
 
-  // 임시 저장소 정리 — 실제 dataDir 이 오염되지 않았는지도 함께 확인
-  rmSync(cfg.dataDir, { recursive: true, force: true });
-  const realDir = path.join(loadConfig().dataDir, 'state');
+  // 쓰기가 임시 dataDir 로 갔음을 확인한다.
+  // 실제 dataDir 에 파일이 "없는지" 를 보면, 과거 구현이 남긴 잔여 파일 때문에
+  // 올바른 구현이 실패한다. 이 실행이 어디에 썼는지만 보면 충분하다.
   assert(
-    !existsSync(path.join(realDir, 'o__r__1.json')),
-    '스모크 테스트가 실제 상태 저장소를 오염시키지 않는다',
+    existsSync(path.join(cfg.dataDir, 'state', 'o__r__1.json')),
+    '테스트 쓰기가 임시 dataDir 로 격리된다',
   );
+  rmSync(cfg.dataDir, { recursive: true, force: true });
 }
 
 // ── 시나리오 10: alias 청크 분할 (조용한 누락 방지) ────────
