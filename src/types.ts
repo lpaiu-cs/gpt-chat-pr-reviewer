@@ -255,6 +255,15 @@ export interface AppConfig {
   /** watch 모드 폴링 간격 (ms) */
   watchIntervalMs: number;
   /**
+   * 스레드 resolve 를 기다리지 않는 레포의 probe 주기 (ms).
+   *
+   * probe 는 **레포당** 1 point 라 비용이 레포 수에 선형 비례한다 (실측: PR 개수·
+   * 스레드 alias 와 무관하게 항상 1). 그런데 10초라는 촘촘한 주기가 필요한 건
+   * `AWAITING_AUTHOR` PR 하나뿐이다 — 작성자가 방금 응답했고 사람이 결과를
+   * 기다리는 상태다. 나머지 레포는 이 주기로 늦춘다.
+   */
+  probeIdleIntervalMs: number;
+  /**
    * watch 대상 레포 목록 ('owner/repo') — 구버전 설정.
    * `watch.include` 가 비어 있을 때의 폴백으로만 쓰인다.
    */
