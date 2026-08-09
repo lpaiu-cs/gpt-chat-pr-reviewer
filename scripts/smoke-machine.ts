@@ -11,7 +11,10 @@ import { resolveEvent } from '../src/poster.js';
 import { ghErrorMessage, THREAD_ALIAS_CHUNK, type PRProbe } from '../src/github.js';
 import { syncPRFromProbe, adoptThreads } from '../src/reviewer.js';
 import { loadConfig } from '../src/config.js';
-import type { PRInfo, PRState, PRContext } from '../src/types.js';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { PRInfo, PRState, PRContext, AppConfig } from '../src/types.js';
 
 let passed = 0;
 let failed = 0;
@@ -172,7 +175,12 @@ const fakePR: PRInfo = {
 // ── 시나리오 9: probe 기반 동기화 ──────────────────────────
 
 {
-  const cfg = loadConfig();
+  // syncPRFromProbe 는 항상 saveContext 를 호출한다. 실제 dataDir 을 쓰면
+  // npm run smoke 가 가짜 PR(o/r#1)을 사용자 상태 저장소에 남기고 status 에 노출된다.
+  const cfg: AppConfig = {
+    ...loadConfig(),
+    dataDir: mkdtempSync(path.join(tmpdir(), 'pr-review-smoke-')),
+  };
 
   const awaiting = (): PRContext => {
     const c = createContext(fakePR);
@@ -251,6 +259,14 @@ const fakePR: PRInfo = {
 
   const second = syncPRFromProbe(cfg, c7, probeOf(c7, { threads: probeThreads }));
   assert(!second, 'probe: 두 번째 tick 부터 남의 스레드는 전체 동기화를 유발하지 않는다');
+
+  // 임시 저장소 정리 — 실제 dataDir 이 오염되지 않았는지도 함께 확인
+  rmSync(cfg.dataDir, { recursive: true, force: true });
+  const realDir = path.join(loadConfig().dataDir, 'state');
+  assert(
+    !existsSync(path.join(realDir, 'o__r__1.json')),
+    '스모크 테스트가 실제 상태 저장소를 오염시키지 않는다',
+  );
 }
 
 // ── 시나리오 10: alias 청크 분할 (조용한 누락 방지) ────────

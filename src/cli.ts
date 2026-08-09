@@ -353,6 +353,7 @@ program
     const reported = new Map<string, string>();
     let lastHeartbeat = 0;
     let lastRemaining = -1; // 마지막 probe 가 보고한 GraphQL 잔여 한도
+    let lastCycleCost = 0; // 직전 사이클이 실제로 쓴 GraphQL point 합계
 
     const reportIfChanged = (ctx: PRContext): void => {
       const key = `${ctx.owner}/${ctx.repo}#${ctx.prNumber}`;
@@ -369,6 +370,7 @@ program
       let quotaHit = false;
       let reviewRan = false;
       let scanned = 0;
+      let cycleCost = 0;
 
       for (const repoSlug of cfg.watchRepos) {
         if (quotaHit) break;
@@ -393,6 +395,7 @@ program
         }
         scanned += probe.prs.length;
         lastRemaining = probe.remaining;
+        cycleCost += probe.cost; // alias 청크가 늘면 레포당 1 을 넘는다
 
         // 추적 중이지만 열린 목록에 없는 PR → 닫힘 확인 (여기서만 개별 조회)
         for (const c of tracked) {
@@ -438,19 +441,22 @@ program
         console.log(chalk.dim(`    ${at} · 감시 중 (열린 PR ${scanned}건)${budget}`));
       }
 
+      lastCycleCost = cycleCost;
       return reviewRan;
     };
 
     /**
      * 남은 GraphQL 한도에 맞춰 다음 대기 시간을 정한다.
-     * 스캔 1회 = 레포당 1 point 이므로 보통은 설정값 그대로지만,
-     * 다른 도구와 한도를 공유하거나 레포가 많아지면 자동으로 늘린다.
+     *
+     * 비용은 레포 수가 아니라 **직전 사이클이 실제로 쓴 point 합계**로 계산한다.
+     * awaiting PR 이 많으면 alias 가 청크로 나뉘어 레포당 1 을 넘기 때문에,
+     * 레포 수로 추정하면 실제 소모를 과소평가한다.
      */
     const nextDelay = (): number => {
       const base = cfg.watchIntervalMs;
       if (lastRemaining < 0) return base;
 
-      const perScan = Math.max(1, cfg.watchRepos.length);
+      const perScan = Math.max(1, lastCycleCost || cfg.watchRepos.length);
       const scansPerHour = 3_600_000 / base;
       const needed = perScan * scansPerHour;
       const budget = lastRemaining * RATE_BUDGET_RATIO;
