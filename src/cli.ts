@@ -212,7 +212,8 @@ function openInEditor(file: string): void {
         : process.platform === 'darwin'
           ? ['open', [file]]
           : ['xdg-open', [file]];
-    spawn(cmd, args, { detached: true, stdio: 'ignore' }).unref();
+    // windowsHide: 'cmd /c start' 도 콘솔 창을 띄운다 (github.ts 의 gh 게이트웨이 참고).
+    spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   } catch {
     /* 편집기 실행 실패 — 경로만 안내 */
   }

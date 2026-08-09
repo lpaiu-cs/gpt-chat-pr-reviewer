@@ -24,6 +24,7 @@ src/
   reviewer.ts       — 오케스트레이션: syncPR(동기화→이벤트 발화) + runRound(리뷰 실행)
   chatgpt.ts        — ChatGPT Playwright 드라이버 + QuotaLimitError 감지
   github.ts         — gh CLI 래퍼 (PR 정보·diff·게시·GraphQL reviewThreads)
+                      gh 실행은 `gh()` 게이트웨이 하나로만 — execSync 금지 (아래)
   parser.ts         — GPT 응답 → ReviewResult 파서
   poster.ts         — ReviewResult → GitHub 인라인 코멘트 게시
   instructions.ts   — 맞춤 지침 파일 (instructions.md → {{instructions}} 주입)
@@ -212,6 +213,24 @@ npm run notify       # 대시보드 이벤트 알림 (watch --ui 가 떠 있어�
 - `pr-review.config.json` — `init` 으로 생성. ChatGPT DOM 변경 시 `selectors` 오버라이드.
   `watch.include` 에 감시 범위를 적는다 (비면 `watchRepos` 폴백).
 - `instructions.md` — 맞춤 리뷰 지침. 매 프롬프트의 `{{instructions}}` 에 주입됨.
+
+## gh 실행 (Windows 콘솔 깜빡임)
+
+`execSync` 를 쓰면 안 된다. execSync 는 명령을 **셸(cmd.exe)에 넘기는데** cmd.exe 는
+콘솔 서브시스템이라 Windows 가 호출마다 새 콘솔 창을 할당한다. 감시 레포마다 매 주기
+gh 를 부르므로 빈 검은 창이 연속으로 깜빡인다 (실측 25분에 conhost 198개 ≈ 분당 8개).
+`windowsHide` 는 execSync 에서 안 먹는다 — 숨겨야 할 대상이 gh 가 아니라 그 앞의 셸이다.
+
+그래서 **모든 gh 호출은 `github.ts` 의 `gh()` 게이트웨이 하나만 지난다.**
+`execFileSync('gh', argv, { windowsHide: true })` 로 셸을 아예 거치지 않는다.
+호출부마다 플래그를 붙이는 방식은 쓰지 않았다 — opt-in 이면 새 호출부마다 재발한다.
+
+**인자는 배열로 넘긴다.** 셸이 없으므로 인용부호를 우리가 쓰면 안 된다.
+`-q ".owner.login"` → `['-q', '.owner.login']`. 특히 검색 인자에 `JSON.stringify` 를
+쓰면 안 된다 — 셸이 있을 때는 그 따옴표를 셸이 벗겨줬지만 이제 gh 가 값으로 받는다.
+
+실측: A/B 로 gh 12회 호출 시 execSync 는 cmd.exe 6개 포착(25ms 샘플러라 하한),
+execFileSync 는 0개. 수정 후 watch 70초 폴링에서도 0개.
 
 ## 주의사항
 
