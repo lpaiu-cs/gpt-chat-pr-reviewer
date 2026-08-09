@@ -13,8 +13,27 @@ import chalk from 'chalk';
 import { searchPRRepos } from './github.js';
 import type { AppConfig, WatchFilters, WatchScope } from './types.js';
 
-/** 레포 재탐색 기본 주기 — 새 레포가 5분 안에 감시 범위에 들어온다. */
-export const DEFAULT_DISCOVERY_INTERVAL_MS = 5 * 60_000;
+/**
+ * 레포 재탐색 기본 주기.
+ *
+ * 5분이었는데 30초로 낮췄다. 원래 값은 "탐색이 비싸다" 는 잘못된 전제에서 나온
+ * 보수적인 숫자였고, 실측이 그걸 뒤집었다:
+ *
+ *   탐색  = 계정 전체 검색 1회 = **1 point** (레포 50개든 500개든 동일)
+ *   probe = **레포당** 1 point × 스캔마다
+ *
+ * 즉 비용이 레포 수에 비례하는 쪽은 probe 이지 탐색이 아니다. 시간당으로 보면
+ * 탐색 30초 = 120 point 인데 레포 4개 probe 10초 = 1,440 point 다.
+ *
+ * 5분이 만든 실제 피해: 머지 직후 같은 레포에 새 PR 을 열면 최대 5분 동안
+ * 보이지 않는다. 닫힌 컨텍스트는 lingering 에서 빠지므로(scan 참고) 그 레포가
+ * 스캔 대상에서 통째로 사라지고, 검색이 다시 잡아줄 때까지 기다려야 한다.
+ * 도그푸딩의 정상 사이클이 그대로 이 구멍을 밟는다.
+ *
+ * 더 낮춰도 되지만 이 값 아래로는 의미가 적다 — 탐색은 scan() 안에서만 돌므로
+ * `watchIntervalMs`(기본 10초)보다 촘촘해질 수 없다.
+ */
+export const DEFAULT_DISCOVERY_INTERVAL_MS = 30_000;
 
 // ── 글롭 ────────────────────────────────────────────────────
 
@@ -251,7 +270,7 @@ function mergeTargets(
  * 레포 목록을 주기적으로만 재탐색한다.
  *
  * 폴링은 10초 주기지만 새 레포가 생기는 빈도는 그보다 훨씬 낮다. 매 tick
- * 검색하면 point 만 낭비하므로 discoveryIntervalMs(기본 5분)로 늦춘다.
+ * 매 스캔마다 검색할 필요는 없으므로 discoveryIntervalMs(기본 30초)로 늦춘다.
  * 탐색이 실패하면 직전 목록을 그대로 쓴다 — 일시적 오류로 감시가 멈추면 안 된다.
  */
 export function createRepoSource(scope: WatchScope): RepoSource {
