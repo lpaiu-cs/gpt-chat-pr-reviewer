@@ -22,7 +22,12 @@ import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub } from './poster.js';
 import { loadInstructions } from './instructions.js';
-import { saveResponse, loadLatestResponse, type ResponseMeta } from './cache.js';
+import {
+  saveResponse,
+  loadLatestResponse,
+  hasResponseForRound,
+  type ResponseMeta,
+} from './cache.js';
 import { progress } from './progress.js';
 
 // ── 스레드 동기화 ───────────────────────────────────────────
@@ -320,6 +325,20 @@ async function enterConversation(
 }
 
 /**
+ * 프롬프트에서 라운드를 식별할 수 있는 한 줄.
+ *
+ * 기본 템플릿의 `리뷰 라운드: {{round}}차` 를 그대로 쓴다. 사용자가 템플릿에서
+ * `{{round}}` 를 없앴다면 판별할 수 없으므로 null 을 돌려주고, 호출부는 종전대로
+ * 다시 묻는다 (판별 실패는 항상 "다시 묻기" 로 떨어져야 안전하다).
+ */
+export function roundMarker(cfg: AppConfig, round: number): string | null {
+  const line = cfg.promptTemplate.split(/\r?\n/).find((l) => l.includes('{{round}}'));
+  if (!line) return null;
+  const marker = line.replace(/\{\{round\}\}/g, String(round)).trim();
+  return marker.length > 0 ? marker : null;
+}
+
+/**
  * 방금 만들어진 대화의 URL 을 컨텍스트에 기록한다.
  * ChatGPT 는 첫 메시지를 보낸 뒤에야 주소를 /c/<uuid> 로 바꾸므로 전송 후에 부른다.
  */
@@ -519,6 +538,42 @@ async function obtainRaw(
   const continued = await enterConversation(cfg, driver, ctx, round, opts);
   const prompt = buildPrompt(cfg, ctx, round, instructions, continued);
 
+  // ── 이미 물어본 라운드인가 ──
+  //
+  // 응답 대기는 2~15분이다. 그 사이에 프로세스가 죽으면 질문은 대화에 남아 있는데
+  // 우리 쪽 기록은 없다. 그대로 다시 보내면 **같은 질문이 한 번 더** 들어가고 대화
+  // 한도를 그냥 버린다 (실제로 여러 번 발생했다).
+  //
+  // 이어가는 대화일 때만 본다. 새 대화에는 애초에 있을 수 없다.
+  const marker = continued ? roundMarker(cfg, round) : null;
+  if (marker) {
+    const found = await driver.inspectRound(marker);
+    // 이 라운드의 응답을 이미 받아본 적이 있으면 대화에 남은 답을 재사용하지 않는다.
+    // 받고도 실패했다는 뜻이라(파싱 실패·ACCESS_FAILED 등) 같은 답을 다시 써도
+    // 같은 결과다 — 그때는 다시 묻는 게 맞다. 안 그러면 재시도가 무의미해진다.
+    const seenBefore = hasResponseForRound(cfg, ctx, round);
+    if (found.state === 'answered' && found.text && !seenBefore) {
+      console.log(chalk.dim(`  이 라운드 질문의 응답이 대화에 이미 있습니다 — 재질문하지 않습니다.`));
+      const saved = saveResponse(cfg, ctx, round, found.text, {
+        conversationUrl: ctx.conversationUrl,
+        dryRun: opts.dryRun,
+      });
+      console.log(chalk.dim(`  응답 저장: ${saved}`));
+      return found.text;
+    }
+    if (found.state === 'pending') {
+      console.log(chalk.dim('  이 라운드 질문은 이미 전송돼 있습니다 — 응답만 기다립니다.'));
+      progress.phase('prompt');
+      const raw = await driver.collectPending();
+      const saved = saveResponse(cfg, ctx, round, raw, {
+        conversationUrl: ctx.conversationUrl,
+        dryRun: opts.dryRun,
+      });
+      console.log(chalk.dim(`  응답 저장: ${saved}`));
+      return raw;
+    }
+  }
+
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
   if (!opts.dryRun) {
@@ -527,14 +582,16 @@ async function obtainRaw(
   }
 
   progress.phase('prompt'); // collectResponse 가 곧 'waiting' 으로 넘긴다
-  const raw = await driver.sendAndCollect(prompt);
-  const conversationUrl = driver.currentConversationUrl() ?? undefined;
-
-  // dry-run 의 일회성 대화는 기록하지 않는다 — 다음 라운드가 물려받으면 안 된다.
-  if (!opts.dryRun) {
-    rememberConversation(ctx, conversationUrl, round);
-    saveContext(cfg, ctx); // 게시 도중 죽더라도 대화를 잃지 않게 확보 즉시 저장
-  }
+  let conversationUrl: string | undefined;
+  const raw = await driver.sendAndCollect(prompt, (url) => {
+    // **응답을 기다리기 전에** 저장한다. 여기가 이 변경의 핵심이다 — 대기 중에
+    // 죽어도 다음 라운드가 그 대화로 복귀해 위의 중복 판별을 탈 수 있다.
+    conversationUrl = url ?? undefined;
+    if (!opts.dryRun) {
+      rememberConversation(ctx, conversationUrl, round);
+      saveContext(cfg, ctx);
+    }
+  });
 
   const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl, dryRun: opts.dryRun });
   console.log(chalk.dim(`  응답 저장: ${saved}`));

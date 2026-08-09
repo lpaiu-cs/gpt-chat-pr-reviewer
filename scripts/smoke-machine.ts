@@ -11,6 +11,7 @@ import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
 import { ghErrorMessage, THREAD_ALIAS_CHUNK, type PRProbe } from '../src/github.js';
 import {
+  roundMarker,
   syncPRFromProbe,
   adoptThreads,
   applySyncEvents,
@@ -20,7 +21,7 @@ import {
   countTurn,
   buildPreviousBlock,
 } from '../src/reviewer.js';
-import { parseConversationUrl } from '../src/chatgpt.js';
+import { parseConversationUrl, classifyRound } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
@@ -1016,6 +1017,84 @@ const fakePR: PRInfo = {
   assert(!lingering.includes('o/done'), 'CLOSED 만 남은 레포는 다시 훑지 않는다');
   assert(!lingering.includes('o/alive'), '이미 발견된 레포는 중복되지 않는다');
   assert(!lingering.includes('x/other'), '감시 범위 밖 레포는 되살리지 않는다');
+}
+
+// ── 시나리오 34: 대화에서 라운드 상태 판정 ────────────────
+
+{
+  const M = '리뷰 라운드: 3차';
+  const u = (t: string) => ({ role: 'user', text: t });
+  const a = (t: string) => ({ role: 'assistant', text: t });
+
+  assert(classifyRound([], M).state === 'absent', '빈 대화는 absent');
+  assert(
+    classifyRound([u('리뷰 라운드: 2차'), a('...')], M).state === 'absent',
+    '다른 라운드만 있으면 absent (새로 물어야 한다)',
+  );
+
+  // 응답 대기 중에 죽은 경우 — 질문만 있고 답이 없다
+  assert(
+    classifyRound([u('리뷰 라운드: 2차'), a('r2'), u(M)], M).state === 'pending',
+    '질문만 있으면 pending (재질문 없이 기다린다)',
+  );
+
+  // 답까지 나온 경우
+  const done = classifyRound([u(M), a('r3 응답')], M);
+  assert(done.state === 'answered' && done.text === 'r3 응답', '답이 있으면 answered + 본문');
+
+  // **뒤에 다음 라운드가 이어지는 경우** — 그 라운드 답만 집어야 한다.
+  // (픽스처 검증에서 잡힌 버그: 마지막 답을 집으면 3차 응답이 2차 것으로 나온다)
+  const M2 = '리뷰 라운드: 2차';
+  const chain = [u(M2), a('2차 답'), u(M), a('3차 답')];
+  assert(
+    classifyRound(chain, M2).text === '2차 답',
+    '뒤에 다음 라운드가 있어도 그 질문 바로 다음 답을 쓴다',
+  );
+  assert(classifyRound(chain, M).text === '3차 답', '마지막 라운드도 정확히 집는다');
+
+  // 이 버그가 만들어낸 상태 — 같은 라운드를 두 번 물어본 대화
+  const dup = classifyRound([u(M), a('낡은 답'), u(M), a('최신 답')], M);
+  assert(dup.state === 'answered' && dup.text === '최신 답', '중복 질문 대화에서는 나중 질문의 답을 쓴다');
+  assert(
+    classifyRound([u(M), a('낡은 답'), u(M)], M).state === 'pending',
+    '중복 질문 후 답이 아직이면 pending (앞의 낡은 답을 쓰면 안 된다)',
+  );
+
+  // 빈 어시스턴트 메시지(렌더 직후 껍데기)는 답으로 세지 않는다
+  assert(
+    classifyRound([u(M), a('   ')], M).state === 'pending',
+    '공백뿐인 응답은 아직 답이 아니다',
+  );
+  // 질문 앞의 답은 그 라운드 것이 아니다
+  assert(
+    classifyRound([a('이전 라운드 답'), u(M)], M).state === 'pending',
+    '질문보다 앞선 답은 세지 않는다',
+  );
+}
+
+// ── 시나리오 33: 라운드 마커 (중복 질문 방지) ─────────────
+
+{
+  // 응답 대기(2~15분) 중에 죽으면 질문은 대화에 남고 우리 기록은 없다. 그대로 다시
+  // 보내면 같은 질문이 한 번 더 들어가 대화 한도를 버린다. 대화에서 그 라운드를
+  // 식별하는 기준이 이 마커다.
+  const base = loadConfig();
+  assert(roundMarker(base, 3) === '리뷰 라운드: 3차', '기본 템플릿에서 마커 추출');
+  assert(roundMarker(base, 12) === '리뷰 라운드: 12차', '두 자리 라운드');
+
+  // 부분 일치로 오판하면 안 된다 — 1차 마커가 12차 메시지에 걸리면 재질문을
+  // 건너뛰고 엉뚱한 라운드의 응답을 쓰게 된다.
+  const m1 = roundMarker(base, 1) as string;
+  assert(!'리뷰 라운드: 12차'.includes(m1), '1차 마커가 12차 메시지에 걸리지 않는다');
+  assert(!'리뷰 라운드: 21차'.includes(m1), '1차 마커가 21차 메시지에 걸리지 않는다');
+  assert('리뷰 라운드: 1차 리뷰 요청'.includes(m1), '같은 라운드 메시지에는 걸린다');
+
+  // 판별 불가는 항상 "다시 묻기" 로 떨어져야 한다 (null → 호출부가 종전대로 전송).
+  assert(
+    roundMarker({ ...base, promptTemplate: ['PR: {{url}}', '리뷰해줘'].join('\n') }, 3) === null,
+    '{{round}} 가 없는 템플릿이면 판별하지 않는다',
+  );
+  assert(roundMarker({ ...base, promptTemplate: '' }, 3) === null, '빈 템플릿도 null');
 }
 
 // ── 시나리오 32: probe 를 건너뛴 주기의 제외 판정 ──────────

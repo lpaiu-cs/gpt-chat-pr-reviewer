@@ -18,6 +18,47 @@ export class QuotaLimitError extends Error {
   }
 }
 
+/** 대화에서 읽어온 메시지 하나 (역할 + 본문). */
+export interface ConversationMessage {
+  role: string;
+  text: string;
+}
+
+export type RoundState = 'answered' | 'pending' | 'absent';
+
+/**
+ * 대화 메시지 목록에서 그 라운드의 상태를 판정한다 (순수 함수).
+ *
+ * DOM 읽기와 분리한 이유는 `applySyncEvents` 와 같다 — 판정이 브라우저 없이
+ * 검증 가능해야 한다.
+ *
+ * **마지막 질문 + 그 바로 다음 답**을 본다.
+ *
+ * 질문 쪽이 마지막인 이유: 같은 라운드를 두 번 물어본 대화(이 버그가 만들어낸
+ * 상태)에서는 나중 질문에 달린 답이 최신이다.
+ *
+ * 답 쪽이 **첫 번째**인 이유: 그 뒤로 다음 라운드 질문과 답이 이어질 수 있는데,
+ * 마지막 답을 집으면 **다른 라운드의 응답을 그 라운드 것으로 오인**한다.
+ * (픽스처 검증에서 2차를 물었더니 3차 응답이 나와서 잡혔다.)
+ */
+export function classifyRound(
+  msgs: ConversationMessage[],
+  marker: string,
+): { state: RoundState; text?: string } {
+  let asked = -1;
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role === 'user' && msgs[i].text.includes(marker)) asked = i;
+  }
+  if (asked < 0) return { state: 'absent' };
+
+  const answers = msgs.slice(asked + 1).filter((m) => m.role === 'assistant' && m.text.trim());
+  if (answers.length === 0) return { state: 'pending' };
+  return { state: 'answered', text: answers[0].text };
+}
+
+/** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
+const CONVERSATION_URL_TIMEOUT_MS = 15_000;
+
 /** 스트림이 끊겼을 때 ChatGPT 가 표시하는 안내 문구. */
 const INTERRUPT_PATTERNS: RegExp[] = [
   /connection interrupted/i,
@@ -285,9 +326,11 @@ export class ChatGPTDriver {
    * 2. 전송 버튼 클릭
    * 3. 어시스턴트 메시지가 안정될 때까지 폴링
    */
-  async sendAndCollect(prompt: string): Promise<string> {
+  async sendAndCollect(
+    prompt: string,
+    onSent?: (conversationUrl: string | null) => void,
+  ): Promise<string> {
     const p = this.requirePage();
-    const sel = this.cfg.selectors;
 
     // ── 기존 어시스턴트 메시지 수 기록 ──
     // 이어가는 대화에서는 지난 응답들이 순차적으로 렌더링되므로, 개수가 멎기 전에
@@ -301,8 +344,73 @@ export class ChatGPTDriver {
     // ── 전송 ──
     await this.clickSend(p);
 
+    // ── 대화 주소 확보 ──
+    // **응답을 기다리기 전에** 알린다. 대기 구간이 2~15분이라 그 사이에 프로세스가
+    // 죽으면, 여기서 안 남겨둔 URL 은 영영 잃는다. 그러면 다음 라운드가 대화가 없는
+    // 줄 알고 새 창을 열어 **같은 질문을 다시 보낸다** (대화 한도를 그냥 버린다).
+    if (onSent) onSent(await this.waitForConversationUrl(p));
+
     // ── 응답 수집 ──
     return this.collectResponse(p, before);
+  }
+
+  /**
+   * 이미 보낸 프롬프트의 응답을 기다린다 (재전송 없이).
+   *
+   * 복귀했더니 그 라운드 질문은 이미 가 있고 답만 없는 경우에 쓴다.
+   */
+  async collectPending(): Promise<string> {
+    const p = this.requirePage();
+    return this.collectResponse(p, await this.countSettledMessages(p));
+  }
+
+  /**
+   * 이 대화에 그 라운드 질문이 이미 있는지, 답까지 나왔는지 본다.
+   *
+   *   answered — 답이 있다. 다시 묻지 말고 그대로 쓴다.
+   *   pending  — 질문만 있고 답이 없다. 다시 묻지 말고 기다린다.
+   *   absent   — 그 라운드 질문이 없다. 새로 보내야 한다.
+   *
+   * 판별 실패는 전부 absent 로 떨어뜨린다 — 잘못 answered 로 보면 낡은 응답을
+   * 게시하게 되고, 그건 다시 묻는 것보다 훨씬 나쁘다.
+   */
+  async inspectRound(
+    marker: string,
+  ): Promise<{ state: 'answered' | 'pending' | 'absent'; text?: string }> {
+    const p = this.requirePage();
+    await this.countSettledMessages(p); // 렌더가 멎을 때까지 기다린다
+
+    // selectors.assistantMessage 를 일반화한 형태다 — 역할별로 나눠 읽어야
+    // "그 질문 뒤에 답이 왔는가" 를 판정할 수 있다.
+    let msgs: { role: string; text: string }[];
+    try {
+      msgs = await p.evaluate((contentSel) => {
+        return [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
+          role: el.getAttribute('data-message-author-role') ?? '',
+          text: (el.querySelector(contentSel) ?? el).textContent ?? '',
+        }));
+      }, this.cfg.selectors.messageContent);
+    } catch {
+      return { state: 'absent' };
+    }
+
+    return classifyRound(msgs, marker);
+  }
+
+  /**
+   * 전송 직후 대화 주소가 확정될 때까지 짧게 기다린다.
+   *
+   * 새 대화는 첫 메시지를 보낸 뒤에야 /c/<uuid> 로 바뀐다. 이어가는 대화면 이미
+   * 그 주소이므로 즉시 돌아온다.
+   */
+  private async waitForConversationUrl(page: Page): Promise<string | null> {
+    const deadline = Date.now() + CONVERSATION_URL_TIMEOUT_MS;
+    for (;;) {
+      const url = parseConversationUrl(page.url());
+      if (url) return url;
+      if (Date.now() >= deadline) return null;
+      await page.waitForTimeout(500);
+    }
   }
 
   // ── 내부 헬퍼 ─────────────────────────────────────────────
