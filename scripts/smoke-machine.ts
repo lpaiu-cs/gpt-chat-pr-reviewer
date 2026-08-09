@@ -8,8 +8,8 @@ import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/m
 import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
-import { ghErrorMessage, type PRProbe } from '../src/github.js';
-import { syncPRFromProbe } from '../src/reviewer.js';
+import { ghErrorMessage, THREAD_ALIAS_CHUNK, type PRProbe } from '../src/github.js';
+import { syncPRFromProbe, adoptThreads } from '../src/reviewer.js';
 import { loadConfig } from '../src/config.js';
 import type { PRInfo, PRState, PRContext } from '../src/types.js';
 
@@ -231,6 +231,41 @@ const fakePR: PRInfo = {
     threads: [{ id: 'T1', isResolved: false }, { id: 'T2', isResolved: false }],
   }));
   assert(!noFull, 'probe: 알던 스레드만 있으면 전체 동기화 불필요');
+
+  // 리뷰 지적 [P1]: 남의 스레드가 매 tick 전체 동기화를 유발하면 안 된다.
+  // adoptThreads 가 소유자와 무관하게 id 를 기록하므로 두 번째 tick 부터는 조용해야 한다.
+  const c7 = awaiting();
+  const foreign = [
+    { id: 'T1', isResolved: false, path: 'a.ts', line: 1, comments: [{ author: 'me', body: 'x' }] },
+    { id: 'T2', isResolved: false, path: 'b.ts', line: 2, comments: [{ author: 'me', body: 'y' }] },
+    { id: 'TX', isResolved: false, path: 'c.ts', line: 3, comments: [{ author: 'someone-else', body: 'z' }] },
+  ];
+  const probeThreads = foreign.map((t) => ({ id: t.id, isResolved: t.isResolved }));
+
+  const first = syncPRFromProbe(cfg, c7, probeOf(c7, { threads: probeThreads }));
+  assert(first, 'probe: 남의 스레드 최초 발견 시 전체 동기화 요구');
+
+  adoptThreads(c7, foreign, 'me', 1); // 전체 동기화가 일어난 것과 동일한 효과
+  assert(!c7.threads.some((t) => t.id === 'TX'), '남의 스레드는 ctx.threads 에 담기지 않는다');
+  assert((c7.knownThreadIds ?? []).includes('TX'), '남의 스레드도 knownThreadIds 에는 기록된다');
+
+  const second = syncPRFromProbe(cfg, c7, probeOf(c7, { threads: probeThreads }));
+  assert(!second, 'probe: 두 번째 tick 부터 남의 스레드는 전체 동기화를 유발하지 않는다');
+}
+
+// ── 시나리오 10: alias 청크 분할 (조용한 누락 방지) ────────
+
+{
+  // 리뷰 지적 [P2]: 20건을 넘는 awaiting PR 이 조용히 버려지면 그 PR 들은
+  // resolve 를 영영 감지하지 못한다. 상한이 아니라 청크로 나눠야 한다.
+  const ids = Array.from({ length: 45 }, (_, i) => i + 1);
+  const chunks: number[][] = [];
+  for (let i = 0; i < ids.length; i += THREAD_ALIAS_CHUNK) {
+    chunks.push(ids.slice(i, i + THREAD_ALIAS_CHUNK));
+  }
+  assert(chunks.length === 3, `45건은 ${THREAD_ALIAS_CHUNK}개씩 3청크 (실제 ${chunks.length})`);
+  assert(chunks.flat().length === 45, '청크 분할에서 누락 없음');
+  assert(chunks.every((c) => c.length <= THREAD_ALIAS_CHUNK), '각 청크가 상한 이하');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

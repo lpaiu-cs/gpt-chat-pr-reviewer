@@ -5,6 +5,7 @@
  */
 
 import { execSync } from 'node:child_process';
+import chalk from 'chalk';
 import type { PRInfo, DiffHunk, ReviewComment } from './types.js';
 
 // ── PR 식별 ─────────────────────────────────────────────────
@@ -159,10 +160,46 @@ export interface RepoProbe {
   remaining: number;
 }
 
-/** 한 쿼리에 붙일 스레드 alias 최대 개수 — 쿼리가 과도하게 커지지 않게 제한. */
-export const MAX_THREAD_ALIASES = 20;
+/**
+ * 한 쿼리에 붙일 스레드 alias 개수. 상한이 아니라 **청크 크기**다.
+ * 초과분은 버리지 않고 추가 쿼리로 나눠 조회한다 (조용히 누락되면
+ * 그 PR 의 resolve 를 영영 감지하지 못한다).
+ */
+export const THREAD_ALIAS_CHUNK = 20;
 
 const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName headRefName author{ login }`;
+
+/**
+ * GraphQL 쿼리를 실행하되 **부분 응답을 살린다.**
+ *
+ * alias 로 지정한 PR 번호 중 하나라도 존재하지 않으면 GitHub 은 data 와 errors 를
+ * 함께 반환하고 gh 는 비정상 종료한다. 그대로 두면 오래된 컨텍스트 하나가 그
+ * 레포의 스캔 전체를 죽인다. data 가 있으면 경고만 남기고 진행한다.
+ */
+function graphQLTolerant(args: string, query: string): { data: any; errors?: any[] } {
+  try {
+    const raw = execSync(`gh api graphql ${args} -F query=@-`, {
+      encoding: 'utf-8',
+      input: query,
+      maxBuffer: 10 * 1024 * 1024,
+      // stderr 를 캡처한다. 기본값은 부모로 흘려보내는데, 10초 주기에서는
+      // 부분 실패 메시지가 그대로 쏟아져 로그가 못 쓰게 된다.
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return JSON.parse(raw);
+  } catch (e) {
+    const out = (e as { stdout?: unknown })?.stdout;
+    if (typeof out === 'string') {
+      try {
+        const parsed = JSON.parse(out);
+        if (parsed?.data) return parsed; // 부분 응답 — 사용 가능
+      } catch {
+        /* JSON 아님 — 원래 오류를 던진다 */
+      }
+    }
+    throw e;
+  }
+}
 
 /**
  * 레포 1개의 감시 스냅샷을 **GraphQL 1회**로 가져온다.
@@ -176,54 +213,73 @@ const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName
  */
 export function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []): RepoProbe {
   const [owner, repo] = ownerSlashRepo.split('/');
-  const aliases = threadsFor
-    .slice(0, MAX_THREAD_ALIASES)
-    .map(
-      (n) => `    t${n}: pullRequest(number:${n}){ reviewThreads(first:100){ nodes{ id isResolved } } }`,
-    )
-    .join('\n');
 
-  const query = `query($owner:String!,$name:String!){
+  // alias 를 청크로 나눈다. 첫 쿼리에만 PR 목록을 싣고, 나머지 청크는 스레드만.
+  const chunks: number[][] = [];
+  for (let i = 0; i < threadsFor.length; i += THREAD_ALIAS_CHUNK) {
+    chunks.push(threadsFor.slice(i, i + THREAD_ALIAS_CHUNK));
+  }
+  if (chunks.length === 0) chunks.push([]);
+
+  const runQuery = (ids: number[], withList: boolean): any => {
+    const aliases = ids
+      .map(
+        (n) =>
+          `    t${n}: pullRequest(number:${n}){ reviewThreads(first:100){ nodes{ id isResolved } } }`,
+      )
+      .join('\n');
+    const listPart = withList
+      ? `    prs: pullRequests(states:OPEN, first:50, orderBy:{field:UPDATED_AT,direction:DESC}){
+      nodes{ ${PROBE_PR_FIELDS} }
+    }\n`
+      : '';
+    const query = `query($owner:String!,$name:String!){
   rateLimit{ cost remaining }
   repository(owner:$owner,name:$name){
-    prs: pullRequests(states:OPEN, first:50, orderBy:{field:UPDATED_AT,direction:DESC}){
-      nodes{ ${PROBE_PR_FIELDS} }
-    }
-${aliases}
+${listPart}${aliases}
   }
 }`;
-
-  const raw = execSync(`gh api graphql -F owner=${owner} -F name=${repo} -F query=@-`, {
-    encoding: 'utf-8',
-    input: query,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  const data = JSON.parse(raw).data;
-  const repoNode = data.repository;
-
-  const prs: PRProbe[] = (repoNode.prs?.nodes ?? []).map((n: any) => ({
-    ...toPRInfo(owner, repo, n),
-    status: n.state,
-    updatedAt: n.updatedAt,
-  }));
-
-  // alias 로 딸려온 스레드 상태를 해당 PR 에 붙인다
-  for (const n of threadsFor.slice(0, MAX_THREAD_ALIASES)) {
-    const node = repoNode[`t${n}`];
-    if (!node) continue;
-    const threads = (node.reviewThreads?.nodes ?? []).map((t: any) => ({
-      id: t.id,
-      isResolved: t.isResolved,
-    }));
-    const target = prs.find((p) => p.number === n);
-    if (target) target.threads = threads;
-  }
-
-  return {
-    prs,
-    cost: data.rateLimit?.cost ?? 1,
-    remaining: data.rateLimit?.remaining ?? -1,
+    return graphQLTolerant(`-F owner=${owner} -F name=${repo}`, query);
   };
+
+  let cost = 0;
+  let remaining = -1;
+  let prs: PRProbe[] = [];
+
+  chunks.forEach((ids, i) => {
+    const { data, errors } = runQuery(ids, i === 0);
+    if (errors?.length) {
+      // 보통 추적 중이던 PR 이 사라진 경우. 나머지 결과는 그대로 쓴다.
+      console.log(
+        chalk.yellow(`  ⚠ ${ownerSlashRepo} probe 일부 실패 (${errors.length}건) — 나머지로 진행`),
+      );
+    }
+    const repoNode = data.repository;
+    cost += data.rateLimit?.cost ?? 1;
+    remaining = data.rateLimit?.remaining ?? remaining;
+
+    if (i === 0) {
+      prs = (repoNode.prs?.nodes ?? []).map((n: any) => ({
+        ...toPRInfo(owner, repo, n),
+        status: n.state,
+        updatedAt: n.updatedAt,
+      }));
+    }
+
+    // alias 로 딸려온 스레드 상태를 해당 PR 에 붙인다
+    for (const n of ids) {
+      const node = repoNode[`t${n}`];
+      if (!node) continue;
+      const target = prs.find((p) => p.number === n);
+      if (!target) continue;
+      target.threads = (node.reviewThreads?.nodes ?? []).map((t: any) => ({
+        id: t.id,
+        isResolved: t.isResolved,
+      }));
+    }
+  });
+
+  return { prs, cost, remaining };
 }
 
 let viewerLoginCache: string | null = null;

@@ -107,6 +107,12 @@ export interface PRContext {
   /** 마지막 리뷰 시점의 head SHA — 새 커밋 감지 기준 */
   headShaAtLastReview: string | null;
   threads: ThreadRecord[];
+  /**
+   * 이 PR 에서 관측한 **모든** 리뷰 스레드 id (남이 만든 것 포함).
+   * probe 는 스레드 소유자를 알 수 없으므로, 이 목록이 없으면 남의 스레드가
+   * 매 tick "미지" 로 판정되어 전체 동기화를 무한히 유발한다.
+   */
+  knownThreadIds?: string[];
   retryCount: number;
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */

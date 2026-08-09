@@ -29,6 +29,9 @@ import { saveResponse, loadLatestResponse } from './cache.js';
 /**
  * GraphQL 스레드 목록에서 우리(뷰어)가 시작한 스레드를 컨텍스트에 병합한다.
  * 새로 발견된 스레드는 roundForNew 라운드 소속으로 기록된다.
+ *
+ * 우리 것이 아닌 스레드도 id 만은 knownThreadIds 에 기록한다. 그렇게 하지 않으면
+ * probe 가 매번 "미지의 스레드" 로 보고 전체 동기화를 무한 반복한다.
  */
 export function adoptThreads(
   ctx: PRContext,
@@ -37,6 +40,12 @@ export function adoptThreads(
   roundForNew: number,
 ): void {
   if (!viewer) return;
+
+  // 관측한 모든 스레드 id 를 기록 (소유자 무관)
+  const seen = new Set(ctx.knownThreadIds ?? []);
+  for (const t of threads) seen.add(t.id);
+  ctx.knownThreadIds = [...seen];
+
   for (const t of threads) {
     const first = t.comments[0];
     if (!first || first.author !== viewer) continue; // 우리가 시작한 스레드만
@@ -168,13 +177,16 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
   let needsFull = false;
 
   if (probe.threads) {
-    const known = new Map(ctx.threads.map((t) => [t.id, t]));
+    const ours = new Map(ctx.threads.map((t) => [t.id, t]));
+    const seen = new Set(ctx.knownThreadIds ?? []);
     for (const t of probe.threads) {
-      const rec = known.get(t.id);
+      const rec = ours.get(t.id);
       if (rec) {
         rec.isResolved = t.isResolved;
-      } else {
-        // 우리가 모르는 스레드 — 우리 것인지, 누가 답글을 달았는지 probe 로는 알 수 없다
+      } else if (!seen.has(t.id)) {
+        // 처음 보는 스레드 — 우리 것인지, 누가 답글을 달았는지 probe 로는 알 수 없다.
+        // 전체 동기화가 이 id 를 knownThreadIds 에 기록하므로 다음 tick 부터는
+        // 남의 스레드라도 다시 전체 동기화를 유발하지 않는다.
         needsFull = true;
       }
     }
