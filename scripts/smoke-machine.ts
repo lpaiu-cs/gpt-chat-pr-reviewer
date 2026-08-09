@@ -29,6 +29,14 @@ import {
 } from '../src/reviewer.js';
 import { parseConversationUrl, findRoundBaseline } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
+import {
+  acquireLock,
+  readLock,
+  readLockPort,
+  lockPort,
+  LockHeldError,
+  LockPortBusyError,
+} from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import {
   admitsNewPR,
@@ -55,7 +63,8 @@ import {
   TIER_OTHER,
 } from '../src/queue.js';
 import { saveResponse, hasResponseForRound, hasResponseSince } from '../src/cache.js';
-import { mkdtempSync, rmSync, existsSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, utimesSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
@@ -1493,6 +1502,90 @@ const fakePR: PRInfo = {
   assert(progress.state().snapshot.active === null, '진행 중 라운드가 없으면 단계 기록은 무시');
 
   progress.enabled = false;
+}
+
+// ── 시나리오 33: 단일 인스턴스 잠금 ────────────────────────
+
+{
+  // 잠금은 **루프백 포트**로 잡는다. 파일이 아니라 커널이 "정확히 하나" 를
+  // 보장하고, 프로세스가 어떻게 죽든 커널이 회수하므로 잔여 상태 자체가 없다.
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-review-lock-'));
+  const other = mkdtempSync(path.join(tmpdir(), 'pr-review-lock2-'));
+
+  const release = await acquireLock(dir, 'watch');
+  assert(readLock(dir)?.pid === process.pid, '잠금을 잡으면 정보 파일에 주인이 적힌다');
+
+  let blocked = false;
+  try {
+    await acquireLock(dir, 'review');
+  } catch (e) {
+    blocked = e instanceof LockHeldError;
+  }
+  assert(blocked, '같은 dataDir 은 LockHeldError');
+
+  // dataDir 이 다르면 상태를 공유하지 않으므로 동시에 돌아도 된다.
+  const r2 = await acquireLock(other, 'watch');
+  assert(readLock(dir)?.port !== readLock(other)?.port, 'dataDir 이 다르면 다른 포트를 잡는다');
+  r2();
+
+  release();
+  const again = await acquireLock(dir, 'watch');
+  assert(!!again, '해제 후 다시 잡을 수 있다');
+  again();
+  again(); // 멱등
+
+  // 정보 파일은 안내용일 뿐 잠금 판정에 쓰이지 않는다 — 남아 있어도 획득을 막지 않는다.
+  // (파일 기반이었다면 이런 잔여물이 인수 경쟁을 만들었다)
+  writeFileSync(
+    path.join(dir, 'watch.lock.json'),
+    JSON.stringify({ pid: 999_999, startedAt: new Date().toISOString(), command: 'watch' }),
+  );
+  const stale = await acquireLock(dir, 'watch');
+  assert(readLock(dir)?.pid === process.pid, '잔여 정보 파일은 획득을 막지 않는다');
+  stale();
+
+  // 포트 선정은 `lock.port` 가 없을 때 한 번만 걷는다. 시작 후보가 막혀 있으면
+  // 다음 후보로 넘어간다 — 고정 포트였다면 45000 대역이 통째로 예약된 머신에서
+  // 도구가 아예 안 뜬다 (실제로 그런 머신이 있었다).
+  const fresh = mkdtempSync(path.join(tmpdir(), 'pr-review-lock3-'));
+  const squatter = createServer((s) => s.end('nope'));
+  await new Promise<void>((r) => squatter.listen(lockPort(fresh, 0), '127.0.0.1', r));
+  const walked = await acquireLock(fresh, 'watch');
+  assert(readLockPort(fresh) === lockPort(fresh, 1), '막힌 시작 후보는 건너뛰고 다음을 정한다');
+  walked();
+  await new Promise<void>((r) => squatter.close(() => r()));
+
+  // 한 번 정해진 포트는 못 박힌다. 획득 경로가 매번 다시 걸으면 경쟁 중에
+  // "해제되는 중" 을 "예약" 으로 오인해 옆 포트로 새고, 잠금이 N 개로 분열한다.
+  const pinned = readLockPort(fresh);
+  const again2 = await acquireLock(fresh, 'watch');
+  assert(readLock(fresh)?.port === pinned, '정해진 포트는 다음 실행에서도 그대로다');
+  again2();
+  rmSync(fresh, { recursive: true, force: true });
+
+  // 리뷰 지적 [P2]: `wx` 는 **생성**만 배타적이다. 진 쪽이 EEXIST 를 받고 읽었을 때
+  // 파일이 아직 비어 있을 수 있는데, 거기서 자기 후보로 진행하면 둘이 서로 다른
+  // 포트를 잡아 잠금이 분열한다. 빈 파일은 자기 후보로 대체하지 않고 거절해야 한다.
+  const broken = mkdtempSync(path.join(tmpdir(), 'pr-review-lock4-'));
+  writeFileSync(path.join(broken, 'lock.port'), '');
+  let refused = false;
+  try {
+    await acquireLock(broken, 'watch');
+  } catch (e) {
+    refused = e instanceof LockPortBusyError;
+  }
+  assert(refused, '빈 lock.port 는 자기 후보로 대체하지 않고 거절한다');
+
+  // 유효한 값이 있으면 후보 계산을 건너뛰고 **그 값**을 따른다 (승자 추종).
+  const followed = lockPort(broken, 7);
+  writeFileSync(path.join(broken, 'lock.port'), String(followed));
+  const follower = await acquireLock(broken, 'watch');
+  assert(readLock(broken)?.port === followed, '기록된 포트를 그대로 따른다');
+  follower();
+  rmSync(broken, { recursive: true, force: true });
+
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
 }
 
 // ── 결과 ────────────────────────────────────────────────────
