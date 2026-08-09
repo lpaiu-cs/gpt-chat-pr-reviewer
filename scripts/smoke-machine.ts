@@ -48,7 +48,7 @@ import {
   TIER_FIRST_ROUND,
   TIER_OTHER,
 } from '../src/queue.js';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AppConfig, PRInfo, PRState, PRContext } from '../src/types.js';
@@ -1307,8 +1307,9 @@ const fakePR: PRInfo = {
 
   // 주인이 죽은 잔여 잠금 — 자동 인수해야 한다.
   // (그러지 않으면 kill -9 한 번에 사용자가 파일을 손으로 지워야 한다)
+  mkdirSync(path.join(dir, 'watch.lock'), { recursive: true });
   writeFileSync(
-    path.join(dir, 'watch.lock'),
+    path.join(dir, 'watch.lock', 'owner.json'),
     JSON.stringify({ pid: 999_999, startedAt: new Date().toISOString(), command: 'watch' }),
   );
   assert(readLock(dir) === null, '죽은 pid 의 잠금은 없는 것으로 본다');
@@ -1316,20 +1317,35 @@ const fakePR: PRInfo = {
   assert(readLock(dir)?.pid === process.pid, '잔여 잠금을 넘겨받는다');
   r2();
 
-  // 깨진 파일도 잔여물로 본다 — 못 읽는 잠금 때문에 영영 못 뜨면 안 된다.
-  writeFileSync(path.join(dir, 'watch.lock'), 'not json');
-  assert(readLock(dir) === null, '깨진 잠금 파일은 없는 것으로 본다');
-  acquireLock(dir, 'watch')();
+  // 깨진 owner.json 도 (유예 시간이 지나면) 잔여물로 본다 — 못 읽는 잠금 때문에
+  // 영영 못 뜨면 안 된다. 유예 안이면 '방금 잡은 것' 으로 보고 건드리지 않는다.
+  mkdirSync(path.join(dir, 'watch.lock'), { recursive: true });
+  writeFileSync(path.join(dir, 'watch.lock', 'owner.json'), 'not json');
+  assert(readLock(dir) === null, '깨진 owner.json 은 주인이 없는 것으로 본다');
+  rmSync(path.join(dir, 'watch.lock'), { recursive: true, force: true });
 
   // 해제는 **내가 쓴 것일 때만** 지운다. 잔여 잠금을 남이 인수한 뒤라면 그쪽 것을
   // 지워서는 안 된다 (지우면 세 번째 프로세스가 끼어든다).
   const mine = acquireLock(dir, 'watch');
   writeFileSync(
-    path.join(dir, 'watch.lock'),
+    path.join(dir, 'watch.lock', 'owner.json'),
     JSON.stringify({ pid: 999_998, startedAt: new Date().toISOString(), command: 'watch' }),
   );
   mine();
   assert(existsSync(path.join(dir, 'watch.lock')), '남의 잠금은 지우지 않는다');
+  rmSync(path.join(dir, 'watch.lock'), { recursive: true, force: true });
+
+  // 방금 만들어져 owner.json 이 아직 없는 잠금 — 뺏으면 안 된다.
+  // (mkdir 과 owner.json 쓰기 사이의 틈에서 읽힌 경우다)
+  mkdirSync(path.join(dir, 'watch.lock'), { recursive: true });
+  let settling = false;
+  try {
+    acquireLock(dir, 'review');
+  } catch {
+    settling = true;
+  }
+  assert(settling, 'owner.json 이 아직 없는 잠금은 인수하지 않는다 (막 획득한 것일 수 있다)');
+  rmSync(path.join(dir, 'watch.lock'), { recursive: true, force: true });
 
   rmSync(dir, { recursive: true, force: true });
 }
