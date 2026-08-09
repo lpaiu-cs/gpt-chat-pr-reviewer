@@ -437,13 +437,19 @@ export const ONLY_REASON = 'only 목록 밖';
  * 의도를 적용하는 시점에는 캐시가 아니라 이쪽으로 물어야 한다.
  */
 export function passesRefFilters(key: string, filters?: WatchFilters): FilterVerdict {
+  // **넘어온 키도 정규화한다.** 목록(refSet)만 정규화하고 조회 키는 그대로 두면,
+  // 대소문자가 섞인 실제 레포 이름에서 조용히 어긋난다 — 'lpaiu-cs/ImageToEditablePPT#6'
+  // 는 소문자로 저장된 skip 항목과 매치되지 않아 제외가 통째로 무시된다.
+  // 호출부가 "정규화해서 넣어야 한다" 를 알아야 하는 설계는 함정이다 (실제로 걸렸다).
+  const k = parsePRRef(key) ?? key.trim().toLowerCase();
+
   // skip 이 only 를 이긴다: "확실히 하지 말 것" 이 "이것만 할 것" 보다 강하다.
   const skip = filters?.skip;
-  if (skip && skip.length > 0 && refSet(skip).has(key)) {
+  if (skip && skip.length > 0 && refSet(skip).has(k)) {
     return { ok: false, reason: SKIP_REASON };
   }
   const only = filters?.only;
-  if (only && only.length > 0 && !refSet(only).has(key)) {
+  if (only && only.length > 0 && !refSet(only).has(k)) {
     return { ok: false, reason: ONLY_REASON };
   }
   return { ok: true };

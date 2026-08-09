@@ -1072,6 +1072,25 @@ const fakePR: PRInfo = {
   assert(!isRefFilterReason('작성자 bot 는 대상 아님'), 'authors 도 재계산 불가');
   assert(!isRefFilterReason(undefined), '사유가 없으면 ref 사유가 아니다');
 
+  // ── 대소문자 (2차 리뷰 [P2]) ──
+  // ctxKey 는 원래 casing 을 보존하고 skip 목록은 소문자로 저장된다. 조회 키를
+  // 정규화하지 않으면 대문자가 든 실제 레포에서 제외가 통째로 무시된다.
+  const MIXED = 'lpaiu-cs/ImageToEditablePPT#6';
+  assert(
+    !passesRefFilters(MIXED, { skip: ['lpaiu-cs/imagetoeditableppt#6'] }).ok,
+    'ctxKey 형태(대문자 포함)를 넘겨도 소문자 skip 항목과 매치된다',
+  );
+  assert(
+    !passesRefFilters('lpaiu-cs/imagetoeditableppt#6', { skip: [MIXED] }).ok,
+    '반대 방향도 (목록이 대문자, 키가 소문자)',
+  );
+  assert(
+    !passesRefFilters(MIXED, { only: ['lpaiu-cs/other#1'] }).ok,
+    'only 도 대소문자를 넘어 판정한다',
+  );
+  assert(passesRefFilters(MIXED, { only: ['LPAIU-CS/imagetoeditableppt#006'] }).ok,
+    'only: 대소문자 + 선행 0 이 섞여도 같은 PR 로 본다');
+
   // only 도 같은 규칙
   assert(!passesRefFilters(KEY, { only: ['other/repo#1'] }).ok, 'only 목록 밖이면 막힌다');
   assert(passesRefFilters(KEY, { only: [KEY] }).ok, 'only 목록 안이면 통과');
