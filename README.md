@@ -148,9 +148,10 @@ npm run dev -- review <pr-url> --from-cache
 한 PR의 리뷰 라운드는 **같은 ChatGPT 대화**에서 이어집니다. 1차 라운드가 만든 대화 URL을 상태 파일에 기록해 두고, 다음 라운드에서 그 대화로 돌아가 이어서 질문합니다. GPT가 이전 라운드에 무엇을 왜 지적했는지 그대로 기억하므로, 반복 패턴이나 이미 합의한 판단 기준이 매 라운드 초기화되지 않습니다. `status <pr>`에서 현재 대화 URL을 볼 수 있습니다.
 
 - 대화가 삭제됐거나 다른 계정으로 바뀌어 열 수 없으면 새 대화로 폴백하고 그 사실을 로그로 알립니다.
-- `maxRoundsPerConversation`(기본 5)을 넘기면 컨텍스트 한도를 피해 새 대화로 전환하고, 프롬프트가 이전 지적을 요약해 이월합니다.
+- `maxTurnsPerConversation`(기본 5)회를 전송하면 컨텍스트 한도를 피해 새 대화로 전환하고, 프롬프트가 이전 지적을 요약해 이월합니다. 완료된 라운드가 아니라 **실제 전송 횟수**를 셉니다 — 게시에 실패해 다시 보낸 것도 대화에는 그대로 쌓이기 때문입니다.
 - 리뷰가 수렴(`CONVERGED`)하거나 PR이 닫히면 대화 참조를 놓습니다. 새 커밋으로 재개될 때는 새 대화에서 시작합니다.
 - `--dry-run`은 저장된 대화를 건드리지 않고 일회성 새 대화에서 실행합니다. 그러지 않으면 dry-run 응답이 섞인 대화를 다음 실제 라운드가 물려받습니다.
+- 캐시된 응답에는 어느 대화에서 나왔는지가 함께 저장됩니다. `--from-cache`로 게시할 때 출처가 현재 대화와 다르면(예: dry-run 응답) 대화 참조를 놓습니다 — 그 코멘트는 대화에 없으므로, 다음 라운드가 있다고 오판하면 안 됩니다.
 
 `review`는 상태를 존중합니다. `AWAITING_AUTHOR`인 PR에 실행하면 대기 중임을 알리고 종료하며, `--force`로만 강제 실행됩니다.
 
@@ -176,7 +177,7 @@ npm run dev -- review <pr-url> --from-cache
 | `watchIntervalMs` | `10000` | 폴링 간격 (10초, 하한 5초) |
 | `quotaCooldownMs` | `10800000` | 쿼터 쿨다운 (3시간) |
 | `maxAutoRetries` | `2` | ERROR 자동 재시도 횟수 |
-| `maxRoundsPerConversation` | `5` | 대화 1개에서 진행할 최대 라운드 수 (초과 시 새 대화) |
+| `maxTurnsPerConversation` | `5` | 대화 1개에 전송할 최대 프롬프트 수 (도달 시 새 대화) |
 | `headless` | `false` | 헤드리스 실행 |
 | `browserChannel` | `chrome` | Playwright 채널 |
 | `selectors` | — | ChatGPT DOM 셀렉터 오버라이드 |

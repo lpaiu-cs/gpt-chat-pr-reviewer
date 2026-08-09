@@ -126,6 +126,14 @@ export interface PRContext {
    * "어떤 스레드가 그 대화 안에 이미 있는지" 를 함께 판정하는 기준이다.
    */
   conversationStartRound?: number;
+  /**
+   * 위 대화에 **실제로 전송한 프롬프트 수**. 회전 판정의 기준이다.
+   *
+   * 완료된 라운드로 세면 안 된다 — 파싱·게시가 실패하면 ctx.round 는 늘지 않지만
+   * 프롬프트와 응답은 이미 대화에 쌓여 있다. 라운드 기준이면 자동 재시도가
+   * 컨텍스트 보호 상한을 그대로 우회한다.
+   */
+  conversationTurns?: number;
   retryCount: number;
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
@@ -174,10 +182,11 @@ export interface AppConfig {
   /** ERROR 상태 자동 재시도 최대 횟수 */
   maxAutoRetries: number;
   /**
-   * 대화 1개에서 진행할 최대 라운드 수. 초과하면 새 대화로 전환한다.
-   * 라운드마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙일 수 없다.
+   * 대화 1개에 전송할 최대 프롬프트 수. 초과하면 새 대화로 전환한다.
+   * 전송마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙일 수 없다.
+   * 실패해 다시 보낸 것도 대화에는 남으므로 함께 센다 (완료 라운드 수가 아니다).
    */
-  maxRoundsPerConversation: number;
+  maxTurnsPerConversation: number;
   /** watch 모드 폴링 간격 (ms) */
   watchIntervalMs: number;
   /** watch 대상 레포 목록 ('owner/repo') */

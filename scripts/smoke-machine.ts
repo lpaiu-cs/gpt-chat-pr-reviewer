@@ -15,6 +15,7 @@ import {
   applySyncEvents,
   planConversation,
   releaseConversation,
+  reconcileCachedOrigin,
   buildPreviousBlock,
 } from '../src/reviewer.js';
 import { parseConversationUrl } from '../src/chatgpt.js';
@@ -304,7 +305,7 @@ const fakePR: PRInfo = {
 // ── 시나리오 12: 대화 세션 유지·회전·해제 ──────────────────
 
 {
-  const cfg = { ...loadConfig(), maxRoundsPerConversation: 3 };
+  const cfg = { ...loadConfig(), maxTurnsPerConversation: 3 };
   const CONV = 'https://chatgpt.com/c/68c1f0aa-1111-2222-3333-444455556666';
 
   // 1차는 대화가 없으니 새로 연다
@@ -316,15 +317,31 @@ const fakePR: PRInfo = {
   const tracked = createContext(fakePR);
   tracked.conversationUrl = CONV;
   tracked.conversationStartRound = 1;
+  tracked.conversationTurns = 1;
   const p2 = planConversation(cfg, tracked, 2);
   assert(p2.action === 'resume' && p2.url === CONV, '2차 라운드는 저장된 대화로 복귀');
-  assert(p2.action === 'resume' && p2.roundsUsed === 1, '누적 라운드 수 계산');
+  assert(p2.action === 'resume' && p2.turnsUsed === 1, '누적 전송 횟수 계산');
 
   // 상한(3)에 닿으면 새 대화로 회전한다 — 대화 1개에 diff 가 무한히 쌓이면 안 된다
-  const p4 = planConversation(cfg, tracked, 4);
-  assert(p4.action === 'new' && p4.reason === 'rotate', '상한 초과 시 새 대화로 회전');
-  const p3 = planConversation(cfg, tracked, 3);
-  assert(p3.action === 'resume', '상한 직전 라운드까지는 이어서 진행');
+  tracked.conversationTurns = 2;
+  assert(planConversation(cfg, tracked, 3).action === 'resume', '상한 직전까지는 이어서 진행');
+  tracked.conversationTurns = 3;
+  const rot = planConversation(cfg, tracked, 4);
+  assert(rot.action === 'new' && rot.reason === 'rotate', '상한 도달 시 새 대화로 회전');
+
+  // 리뷰 지적 [P2]: 파싱·게시가 실패하면 ctx.round 는 늘지 않지만 프롬프트와 응답은
+  // 이미 대화에 쌓인다. 라운드로 세면 자동 재시도가 상한을 그대로 우회한다.
+  const retried = createContext(fakePR);
+  retried.conversationUrl = CONV;
+  retried.conversationStartRound = 1;
+  retried.round = 0; // 한 라운드도 완료하지 못했다
+  retried.conversationTurns = 3; // 그러나 3회 전송했다 (최초 + 자동 재시도 2회)
+  const pr2 = planConversation(cfg, retried, 1);
+  assert(
+    pr2.action === 'new' && pr2.reason === 'rotate',
+    '실패한 재시도도 전송으로 세어 회전시킨다 (라운드 기준이면 우회됨)',
+  );
+  tracked.conversationTurns = 1;
 
   // 리뷰 지적 [P1]: dry-run 이 저장된 대화에 프롬프트를 끼워 넣으면, 라운드도 상태도
   // 남지 않은 채 다음 실제 라운드가 같은 회차의 dry-run 응답이 섞인 대화를 물려받는다.
@@ -339,16 +356,18 @@ const fakePR: PRInfo = {
     'dry-run 이후에도 실제 라운드는 그대로 복귀한다',
   );
 
-  // conversationStartRound 가 없는 구버전 컨텍스트도 안전하게 이어 쓴다
+  // conversationStartRound·conversationTurns 가 없는 구버전 컨텍스트도 안전하게 이어 쓴다
   const legacy = createContext(fakePR);
   legacy.conversationUrl = CONV;
   const pl = planConversation(cfg, legacy, 7);
-  assert(pl.action === 'resume' && pl.roundsUsed === 0, '구버전 컨텍스트는 이번 라운드가 첫 사용');
+  assert(pl.action === 'resume' && pl.turnsUsed === 0, '구버전 컨텍스트는 이번 라운드가 첫 사용');
 
   // 해제
   releaseConversation(tracked);
   assert(
-    tracked.conversationUrl === undefined && tracked.conversationStartRound === undefined,
+    tracked.conversationUrl === undefined &&
+      tracked.conversationStartRound === undefined &&
+      tracked.conversationTurns === undefined,
     'releaseConversation 이 대화 참조를 지운다',
   );
   assert(
@@ -444,6 +463,73 @@ const fakePR: PRInfo = {
   const capped = buildPreviousBlock(many, 2, false);
   assert(capped.shown === 30 && capped.total === 42, '이전 현황은 30건까지만 싣는다');
   assert(capped.text.includes('그 외 12건 생략'), '생략 건수를 프롬프트에 명시');
+}
+
+// ── 시나리오 15: 캐시 응답의 대화 출처 대조 ────────────────
+
+{
+  // 리뷰 지적 [P1]: --from-cache 는 아무것도 전송하지 않는다. 캐시가 다른 대화
+  // (특히 dry-run 의 일회성 대화)에서 나온 것이면 그 코멘트는 저장된 대화에 없다.
+  // 그대로 두면 다음 라운드가 "이 대화에 본문이 있다" 고 오판해 스니펫을 생략한다.
+  const CONV = 'https://chatgpt.com/c/68c1f0aa-1111-2222-3333-444455556666';
+  const OTHER = 'https://chatgpt.com/c/99999999-0000-0000-0000-000000000000';
+
+  const bound = (): PRContext => {
+    const c = createContext(fakePR);
+    c.conversationUrl = CONV;
+    c.conversationStartRound = 1;
+    c.conversationTurns = 1;
+    return c;
+  };
+
+  // 같은 대화에서 나온 응답 — 유지 (게시 실패 후 --from-cache 재시도의 정상 경로)
+  const same = bound();
+  assert(
+    !reconcileCachedOrigin(same, { round: 2, conversationUrl: CONV }) &&
+      same.conversationUrl === CONV,
+    '같은 대화에서 나온 캐시는 대화를 유지한다',
+  );
+
+  // dry-run 의 일회성 대화에서 나온 응답 — 해제
+  const fromDry = bound();
+  assert(
+    reconcileCachedOrigin(fromDry, { round: 2, conversationUrl: OTHER, dryRun: true }) &&
+      !fromDry.conversationUrl,
+    'dry-run 대화에서 나온 캐시는 대화를 해제한다',
+  );
+
+  // URL 이 같더라도 dry-run 표식이 있으면 믿지 않는다
+  const dryButSame = bound();
+  assert(
+    reconcileCachedOrigin(dryButSame, { round: 2, conversationUrl: CONV, dryRun: true }),
+    'dry-run 표식이 있으면 URL 이 같아도 해제한다',
+  );
+
+  // 출처를 모르는 구버전 캐시 — 증명할 수 없으므로 해제 (보수적)
+  const noMeta = bound();
+  assert(
+    reconcileCachedOrigin(noMeta, null) && !noMeta.conversationUrl,
+    '출처 없는 구버전 캐시는 해제한다',
+  );
+
+  // 묶인 대화가 없으면 할 일이 없다
+  assert(
+    !reconcileCachedOrigin(createContext(fakePR), { round: 1, conversationUrl: OTHER }),
+    '대화가 없으면 아무것도 하지 않는다',
+  );
+
+  // 해제 후 다음 라운드는 새 대화 + 스니펫까지 실은 프롬프트로 복구된다
+  const recovered = bound();
+  recovered.round = 2;
+  recovered.threads = [
+    { id: 'T1', path: 'a.ts', line: 1, isResolved: false, authorReplied: false, round: 2, snippet: '널 체크 누락' },
+  ];
+  reconcileCachedOrigin(recovered, { round: 2, conversationUrl: OTHER, dryRun: true });
+  assert(planConversation(loadConfig(), recovered, 3).action === 'new', '해제 후 새 대화로 시작');
+  assert(
+    buildPreviousBlock(recovered, 3, false).text.includes('널 체크 누락'),
+    '해제 후 프롬프트는 스니펫을 다시 실어 맥락을 이월한다',
+  );
 }
 
 // ── 결과 ────────────────────────────────────────────────────

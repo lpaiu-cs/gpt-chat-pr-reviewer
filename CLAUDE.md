@@ -55,7 +55,9 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 실행기 사정**이므로 `TRANSITIONS` 에 관여하지 않고 `PRContext.conversationUrl` /
 `conversationStartRound` 로만 관리한다 (`reviewer.ts` 의 `planConversation` ·
 `releaseConversation`). 복귀 실패 시 새 대화로 폴백하고,
-`maxRoundsPerConversation` 초과 시 회전한다. CONVERGED · CLOSED 에서 해제.
+`maxTurnsPerConversation` 도달 시 회전한다 (완료 라운드가 아니라 `conversationTurns`
+= 실제 전송 횟수 기준 — 실패·재시도도 대화에는 쌓이므로). CONVERGED · CLOSED ·
+캐시 출처 불일치(`reconcileCachedOrigin`)에서 해제.
 
 ## 핵심 흐름
 

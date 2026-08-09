@@ -73,7 +73,7 @@ const DEFAULT_CONFIG: AppConfig = {
   customInstructionsFile: './instructions.md',
   quotaCooldownMs: 3 * 60 * 60_000, // 3시간
   maxAutoRetries: 2,
-  maxRoundsPerConversation: 5, // 라운드마다 diff 가 대화에 쌓이므로 무한 연장은 불가
+  maxTurnsPerConversation: 5, // 전송마다 diff 가 대화에 쌓이므로 무한 연장은 불가
   watchIntervalMs: 10_000, // 10초 — 스캔 1회 = 레포당 1 point 이므로 부담이 없다
   watchRepos: [],
   dataDir: './data',
@@ -110,7 +110,7 @@ export function initConfig(configPath?: string): string {
     browserChannel: 'chrome',
     customInstructionsFile: DEFAULT_CONFIG.customInstructionsFile,
     quotaCooldownMs: DEFAULT_CONFIG.quotaCooldownMs,
-    maxRoundsPerConversation: DEFAULT_CONFIG.maxRoundsPerConversation,
+    maxTurnsPerConversation: DEFAULT_CONFIG.maxTurnsPerConversation,
     watchRepos: [],
     watchIntervalMs: DEFAULT_CONFIG.watchIntervalMs,
   };

@@ -22,7 +22,7 @@ import { ChatGPTDriver, QuotaLimitError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub } from './poster.js';
 import { loadInstructions } from './instructions.js';
-import { saveResponse, loadLatestResponse } from './cache.js';
+import { saveResponse, loadLatestResponse, type ResponseMeta } from './cache.js';
 
 // ── 스레드 동기화 ───────────────────────────────────────────
 
@@ -205,14 +205,14 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
  * 상태 머신(TRANSITIONS)이 아니라 여기서만 다룬다.
  */
 export type ConversationPlan =
-  | { action: 'resume'; url: string; roundsUsed: number }
-  | { action: 'new'; reason: 'first' | 'rotate' | 'dry-run'; roundsUsed: number };
+  | { action: 'resume'; url: string; turnsUsed: number }
+  | { action: 'new'; reason: 'first' | 'rotate' | 'dry-run'; turnsUsed: number };
 
 /**
  * 저장된 대화를 이어 쓸지, 새로 열지 결정한다 (순수 함수).
  *
- * 라운드마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙이면 모델의 컨텍스트
- * 한도에 걸린다. maxRoundsPerConversation 을 넘기면 대화를 회전시키고,
+ * 전송마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙이면 모델의 컨텍스트
+ * 한도에 걸린다. maxTurnsPerConversation 을 넘기면 대화를 회전시키고,
  * 그때는 프롬프트가 스니펫까지 실어 맥락을 이월한다(buildPreviousBlock 참고).
  */
 export function planConversation(
@@ -225,23 +225,44 @@ export function planConversation(
   // 않은 채 그 대화에 프롬프트만 끼워 넣게 되고, 다음 실제 라운드는 같은 회차의
   // dry-run 응답이 이미 섞인 대화를 이어받는다. watch --dry-run 이면 사이클마다
   // 쌓이는데 라운드 번호는 그대로라 회전 조건에도 걸리지 않는다.
-  if (opts.dryRun) return { action: 'new', reason: 'dry-run', roundsUsed: 0 };
+  if (opts.dryRun) return { action: 'new', reason: 'dry-run', turnsUsed: 0 };
 
   const url = ctx.conversationUrl;
-  if (!url) return { action: 'new', reason: 'first', roundsUsed: 0 };
+  if (!url) return { action: 'new', reason: 'first', turnsUsed: 0 };
 
-  // conversationStartRound 가 없는 구버전 컨텍스트는 이번 라운드가 첫 사용인 셈
-  const roundsUsed = Math.max(0, round - (ctx.conversationStartRound ?? round));
-  if (roundsUsed >= cfg.maxRoundsPerConversation) {
-    return { action: 'new', reason: 'rotate', roundsUsed };
+  // 회전 판정은 완료된 라운드가 아니라 실제 전송 횟수로 한다. 파싱·게시가 실패해
+  // ctx.round 가 늘지 않아도 프롬프트와 응답은 이미 대화에 쌓였기 때문이다.
+  // 라운드로 세면 자동 재시도가 상한을 그대로 우회한다.
+  // conversationTurns 가 없는 구버전 컨텍스트는 라운드 차이로 근사한다.
+  const turnsUsed =
+    ctx.conversationTurns ?? Math.max(0, round - (ctx.conversationStartRound ?? round));
+  if (turnsUsed >= cfg.maxTurnsPerConversation) {
+    return { action: 'new', reason: 'rotate', turnsUsed };
   }
-  return { action: 'resume', url, roundsUsed };
+  return { action: 'resume', url, turnsUsed };
 }
 
-/** 대화 참조를 놓는다 (수렴·PR 종료·복귀 실패 시). */
+/** 대화 참조를 놓는다 (수렴·PR 종료·복귀 실패·캐시 출처 불일치 시). */
 export function releaseConversation(ctx: PRContext): void {
   ctx.conversationUrl = undefined;
   ctx.conversationStartRound = undefined;
+  ctx.conversationTurns = undefined;
+}
+
+/**
+ * 캐시된 응답의 출처가 지금 묶여 있는 대화와 다르면 대화 참조를 놓는다.
+ * @returns 해제했으면 true
+ *
+ * --from-cache 는 아무것도 전송하지 않는다. 그러니 캐시가 다른 대화(특히 dry-run 의
+ * 일회성 대화)에서 나온 것이면, 그 응답으로 게시된 코멘트는 저장된 대화 어디에도
+ * 없다. 그대로 두면 다음 라운드가 "그 코멘트는 이 대화에 있다" 고 오판해 스니펫을
+ * 생략하고, GPT 는 자기가 한 적 없는 지적의 처리 현황만 받아 들게 된다.
+ */
+export function reconcileCachedOrigin(ctx: PRContext, meta: ResponseMeta | null): boolean {
+  if (!ctx.conversationUrl) return false;
+  if (meta && !meta.dryRun && meta.conversationUrl === ctx.conversationUrl) return false;
+  releaseConversation(ctx);
+  return true;
 }
 
 /**
@@ -259,7 +280,7 @@ async function enterConversation(
 
   if (plan.action === 'resume') {
     if (await driver.resumeChat(plan.url)) {
-      console.log(chalk.dim(`  이전 대화 이어서 진행 (누적 ${plan.roundsUsed}라운드) — ${plan.url}`));
+      console.log(chalk.dim(`  이전 대화 이어서 진행 (누적 ${plan.turnsUsed}회 전송) — ${plan.url}`));
       return true;
     }
     // 대화 삭제·계정 변경 등 — 조용히 새 대화로 넘어가면 맥락이 사라진 걸 모른다
@@ -269,7 +290,7 @@ async function enterConversation(
     releaseConversation(ctx);
   } else if (plan.reason === 'rotate') {
     console.log(
-      chalk.dim(`  대화 누적 ${plan.roundsUsed}라운드 — 컨텍스트 한도를 피해 새 대화로 전환합니다.`),
+      chalk.dim(`  대화 누적 ${plan.turnsUsed}회 전송 — 컨텍스트 한도를 피해 새 대화로 전환합니다.`),
     );
     releaseConversation(ctx);
   } else if (plan.reason === 'dry-run') {
@@ -285,10 +306,9 @@ async function enterConversation(
  * 방금 만들어진 대화의 URL 을 컨텍스트에 기록한다.
  * ChatGPT 는 첫 메시지를 보낸 뒤에야 주소를 /c/<uuid> 로 바꾸므로 전송 후에 부른다.
  */
-function rememberConversation(driver: ChatGPTDriver, ctx: PRContext, round: number): void {
+function rememberConversation(ctx: PRContext, url: string | undefined, round: number): void {
   if (ctx.conversationUrl) return; // 이어가던 대화 — 그대로 둔다
 
-  const url = driver.currentConversationUrl();
   if (!url) {
     console.log(
       chalk.yellow('  ⚠ 대화 URL 을 확보하지 못했습니다 — 다음 라운드는 새 대화로 시작합니다.'),
@@ -469,20 +489,37 @@ async function obtainRaw(
       throw new Error('캐시된 응답이 없습니다. --from-cache 없이 먼저 리뷰를 실행하세요.');
     }
     console.log(chalk.dim(`  캐시 사용: ${hit.path}`));
+    if (!opts.dryRun && reconcileCachedOrigin(ctx, hit.meta)) {
+      console.log(
+        chalk.yellow('  ⚠ 캐시 응답이 현재 대화에서 나온 것이 아닙니다 — 대화 참조를 해제합니다.'),
+      );
+      saveContext(cfg, ctx);
+    }
     return hit.raw;
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
   const continued = await enterConversation(cfg, driver, ctx, round, opts);
-  const raw = await driver.sendAndCollect(buildPrompt(cfg, ctx, round, instructions, continued));
+  const prompt = buildPrompt(cfg, ctx, round, instructions, continued);
+
+  // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
+  // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
+  if (!opts.dryRun) {
+    ctx.conversationTurns = (ctx.conversationTurns ?? 0) + 1;
+    saveContext(cfg, ctx);
+  }
+
+  const raw = await driver.sendAndCollect(prompt);
+  const conversationUrl = driver.currentConversationUrl() ?? undefined;
 
   // dry-run 의 일회성 대화는 기록하지 않는다 — 다음 라운드가 물려받으면 안 된다.
   if (!opts.dryRun) {
-    rememberConversation(driver, ctx, round);
+    rememberConversation(ctx, conversationUrl, round);
     saveContext(cfg, ctx); // 게시 도중 죽더라도 대화를 잃지 않게 확보 즉시 저장
   }
 
-  console.log(chalk.dim(`  응답 저장: ${saveResponse(cfg, ctx, round, raw)}`));
+  const saved = saveResponse(cfg, ctx, round, raw, { conversationUrl, dryRun: opts.dryRun });
+  console.log(chalk.dim(`  응답 저장: ${saved}`));
   return raw;
 }
 
