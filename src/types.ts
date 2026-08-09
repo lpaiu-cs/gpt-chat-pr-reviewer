@@ -113,6 +113,19 @@ export interface PRContext {
    * 매 tick "미지" 로 판정되어 전체 동기화를 무한히 유발한다.
    */
   knownThreadIds?: string[];
+  /**
+   * 이 PR 의 라운드를 이어가는 ChatGPT 대화 URL (https://chatgpt.com/c/<uuid>).
+   *
+   * 상태가 아니라 실행기 사정이다 — 상태 머신(TRANSITIONS)에는 관여하지 않는다.
+   * 미수렴 동안만 유지하고 CONVERGED·CLOSED 에서 해제한다.
+   */
+  conversationUrl?: string;
+  /**
+   * 위 대화를 만든 시점의 라운드 번호 (1-based).
+   * 대화 누적 라운드 수(= round - conversationStartRound)와,
+   * "어떤 스레드가 그 대화 안에 이미 있는지" 를 함께 판정하는 기준이다.
+   */
+  conversationStartRound?: number;
   retryCount: number;
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
@@ -160,6 +173,11 @@ export interface AppConfig {
   quotaCooldownMs: number;
   /** ERROR 상태 자동 재시도 최대 횟수 */
   maxAutoRetries: number;
+  /**
+   * 대화 1개에서 진행할 최대 라운드 수. 초과하면 새 대화로 전환한다.
+   * 라운드마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙일 수 없다.
+   */
+  maxRoundsPerConversation: number;
   /** watch 모드 폴링 간격 (ms) */
   watchIntervalMs: number;
   /** watch 대상 레포 목록 ('owner/repo') */

@@ -28,6 +28,34 @@ const INTERRUPT_PATTERNS: RegExp[] = [
 /** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
 const MAX_RELOAD_RECOVERIES = 3;
 
+/** 대화를 열 수 없을 때 ChatGPT 가 본문에 표시하는 문구 (삭제·타 계정 등). */
+const CONVERSATION_GONE_PATTERNS: RegExp[] = [
+  /unable to load (?:the )?conversation/i,
+  /conversation not found/i,
+  /대화를 불러올 수 없/,
+  /대화를 찾을 수 없/,
+];
+
+/**
+ * 대화 URL 여부를 판별해 정규화한다 (아니면 null).
+ *
+ * ChatGPT 는 첫 메시지를 보낸 뒤에야 주소를 /c/<uuid> 로 바꾼다.
+ * 프로젝트·GPTs 안에서 열린 대화는 /g/<id>/c/<uuid> 형태이므로 둘 다 받는다.
+ */
+export function parseConversationUrl(raw: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  const host = u.hostname;
+  const onChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host.endsWith('.openai.com');
+  if (!onChatGPT) return null;
+  if (!/^(?:\/g\/[^/]+)?\/c\/[0-9a-zA-Z-]+$/.test(u.pathname)) return null;
+  return `${u.origin}${u.pathname}`; // 쿼리·프래그먼트는 버린다
+}
+
 /** 화면 텍스트에서 쿼터/한도 안내를 감지하기 위한 패턴. */
 const QUOTA_PATTERNS: RegExp[] = [
   /reached (?:your|the)[^.]{0,40}limit/i,
@@ -197,6 +225,54 @@ export class ChatGPTDriver {
   }
 
   /**
+   * 기존 대화로 복귀한다. 열지 못하면 false 를 반환한다 (호출부가 새 대화로 폴백).
+   *
+   * 대화가 삭제됐거나 다른 계정의 것이면 ChatGPT 는 오류 문구를 띄우거나
+   * 루트로 되돌린다. 둘 다 "복귀 실패" 로 취급해야 이전 대화에 이어 쓴 것처럼
+   * 착각한 채 엉뚱한 화면에 프롬프트를 넣는 일을 막을 수 있다.
+   */
+  async resumeChat(url: string): Promise<boolean> {
+    const p = this.requirePage();
+    const want = parseConversationUrl(url);
+    if (!want) return false;
+
+    try {
+      await p.goto(want, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
+    } catch {
+      return false;
+    }
+    await p.keyboard.press('Escape').catch(() => {});
+    await p.waitForTimeout(1_000);
+
+    // 접근 불가 시 루트나 다른 대화로 튕긴다
+    if (parseConversationUrl(p.url()) !== want) return false;
+
+    const body = await p
+      .locator('body')
+      .innerText()
+      .catch(() => '');
+    if (CONVERSATION_GONE_PATTERNS.some((re) => re.test(body))) return false;
+
+    // 이전 라운드의 응답이 하나도 안 보이면 본문 로드에 실패한 것이다.
+    // 그대로 진행하면 sendAndCollect 가 기존 메시지를 새 응답으로 오인한다.
+    try {
+      await p
+        .locator(this.cfg.selectors.assistantMessage)
+        .first()
+        .waitFor({ state: 'attached', timeout: 15_000 });
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  /** 현재 페이지가 대화 화면이면 그 URL, 아니면 null. */
+  currentConversationUrl(): string | null {
+    return parseConversationUrl(this.requirePage().url());
+  }
+
+  /**
    * 프롬프트를 전송하고 응답 전문을 반환한다.
    *
    * 1. 텍스트를 입력 (클립보드 paste → 실패 시 keyboard.type fallback)
@@ -208,7 +284,10 @@ export class ChatGPTDriver {
     const sel = this.cfg.selectors;
 
     // ── 기존 어시스턴트 메시지 수 기록 ──
-    const before = await p.locator(sel.assistantMessage).count();
+    // 이어가는 대화에서는 지난 응답들이 순차적으로 렌더링되므로, 개수가 멎기 전에
+    // 세면 실제보다 작게 잡힌다. 그러면 collectResponse 가 "새 응답이 이미 도착했다"
+    // 고 오인해 직전 라운드의 응답을 그대로 반환한다.
+    const before = await this.countSettledMessages(p);
 
     // ── 프롬프트 입력 ──
     await this.fillPrompt(p, prompt);
@@ -225,6 +304,22 @@ export class ChatGPTDriver {
   private requirePage(): Page {
     if (!this.page) throw new Error('Browser not launched — call launch() first');
     return this.page;
+  }
+
+  /**
+   * 어시스턴트 메시지 개수가 더 늘지 않을 때까지 기다렸다가 그 값을 반환한다.
+   * 새 대화(0건)에서는 즉시 확정되므로 사실상 비용이 없다.
+   */
+  private async countSettledMessages(page: Page): Promise<number> {
+    const loc = page.locator(this.cfg.selectors.assistantMessage);
+    let last = -1;
+    for (let i = 0; i < 12; i++) {
+      const cur = await loc.count().catch(() => last);
+      if (cur === last) return cur;
+      last = cur;
+      await page.waitForTimeout(500);
+    }
+    return last; // 계속 늘어나는 중 — 마지막 관측값으로 진행
   }
 
   /** 화면 하단 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */

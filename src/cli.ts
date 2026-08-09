@@ -568,6 +568,10 @@ program
     console.log(`  상태:       ${stateBadge(ctx.state)}`);
     console.log(`  라운드:     ${ctx.round}회 완료`);
     console.log(`  요청 누적:  ${ctx.requestedCount}개 코멘트`);
+    if (ctx.conversationUrl) {
+      const used = ctx.round - (ctx.conversationStartRound ?? ctx.round) + 1;
+      console.log(`  대화:       ${ctx.conversationUrl} ${chalk.dim(`(${used}라운드 진행)`)}`);
+    }
     if (ctx.quotaRetryAt) {
       console.log(`  쿼터 해제:  ${new Date(ctx.quotaRetryAt).toLocaleString('ko-KR')}`);
     }

@@ -9,7 +9,15 @@ import { createContext } from '../src/state/store.js';
 import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
 import { ghErrorMessage, THREAD_ALIAS_CHUNK, type PRProbe } from '../src/github.js';
-import { syncPRFromProbe, adoptThreads } from '../src/reviewer.js';
+import {
+  syncPRFromProbe,
+  adoptThreads,
+  applySyncEvents,
+  planConversation,
+  releaseConversation,
+  buildPreviousBlock,
+} from '../src/reviewer.js';
+import { parseConversationUrl } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import type { PRInfo, PRState, PRContext } from '../src/types.js';
 
@@ -266,6 +274,163 @@ const fakePR: PRInfo = {
   assert(chunks.length === 3, `45건은 ${THREAD_ALIAS_CHUNK}개씩 3청크 (실제 ${chunks.length})`);
   assert(chunks.flat().length === 45, '청크 분할에서 누락 없음');
   assert(chunks.every((c) => c.length <= THREAD_ALIAS_CHUNK), '각 청크가 상한 이하');
+}
+
+// ── 시나리오 11: 대화 URL 파싱 ─────────────────────────────
+
+{
+  const uuid = '68c1f0aa-1111-2222-3333-444455556666';
+  assert(
+    parseConversationUrl(`https://chatgpt.com/c/${uuid}`) === `https://chatgpt.com/c/${uuid}`,
+    '대화 URL 인식',
+  );
+  assert(
+    parseConversationUrl(`https://chatgpt.com/c/${uuid}?model=gpt-5#x`) ===
+      `https://chatgpt.com/c/${uuid}`,
+    '쿼리·프래그먼트는 제거하고 정규화',
+  );
+  assert(
+    parseConversationUrl(`https://chatgpt.com/g/g-abc123/c/${uuid}`) ===
+      `https://chatgpt.com/g/g-abc123/c/${uuid}`,
+    'GPTs 안의 대화 URL 도 인식',
+  );
+  // 첫 메시지 전송 전에는 아직 루트다 — 여기서 URL 을 확보하면 안 된다
+  assert(parseConversationUrl('https://chatgpt.com/') === null, '루트는 대화 URL 아님');
+  assert(parseConversationUrl('https://chatgpt.com/codex') === null, '다른 경로는 대화 URL 아님');
+  assert(parseConversationUrl(`https://evil.example/c/${uuid}`) === null, '다른 오리진 거부');
+  assert(parseConversationUrl('about:blank') === null, 'URL 이 아니면 null');
+}
+
+// ── 시나리오 12: 대화 세션 유지·회전·해제 ──────────────────
+
+{
+  const cfg = { ...loadConfig(), maxRoundsPerConversation: 3 };
+  const CONV = 'https://chatgpt.com/c/68c1f0aa-1111-2222-3333-444455556666';
+
+  // 1차는 대화가 없으니 새로 연다
+  const fresh = createContext(fakePR);
+  const p1 = planConversation(cfg, fresh, 1);
+  assert(p1.action === 'new' && p1.reason === 'first', '1차 라운드는 새 대화');
+
+  // 2차부터는 저장된 대화로 복귀
+  const tracked = createContext(fakePR);
+  tracked.conversationUrl = CONV;
+  tracked.conversationStartRound = 1;
+  const p2 = planConversation(cfg, tracked, 2);
+  assert(p2.action === 'resume' && p2.url === CONV, '2차 라운드는 저장된 대화로 복귀');
+  assert(p2.action === 'resume' && p2.roundsUsed === 1, '누적 라운드 수 계산');
+
+  // 상한(3)에 닿으면 새 대화로 회전한다 — 대화 1개에 diff 가 무한히 쌓이면 안 된다
+  const p4 = planConversation(cfg, tracked, 4);
+  assert(p4.action === 'new' && p4.reason === 'rotate', '상한 초과 시 새 대화로 회전');
+  const p3 = planConversation(cfg, tracked, 3);
+  assert(p3.action === 'resume', '상한 직전 라운드까지는 이어서 진행');
+
+  // conversationStartRound 가 없는 구버전 컨텍스트도 안전하게 이어 쓴다
+  const legacy = createContext(fakePR);
+  legacy.conversationUrl = CONV;
+  const pl = planConversation(cfg, legacy, 7);
+  assert(pl.action === 'resume' && pl.roundsUsed === 0, '구버전 컨텍스트는 이번 라운드가 첫 사용');
+
+  // 해제
+  releaseConversation(tracked);
+  assert(
+    tracked.conversationUrl === undefined && tracked.conversationStartRound === undefined,
+    'releaseConversation 이 대화 참조를 지운다',
+  );
+  assert(
+    planConversation(cfg, tracked, 5).action === 'new',
+    '해제 후에는 다시 새 대화',
+  );
+  assert(
+    !('conversationUrl' in JSON.parse(JSON.stringify(tracked))),
+    '해제된 대화 URL 은 저장 파일에 남지 않는다',
+  );
+}
+
+// ── 시나리오 13: 수렴·PR 종료 시 대화 해제 ─────────────────
+
+{
+  const cfg = loadConfig();
+  const CONV = 'https://chatgpt.com/c/68c1f0aa-aaaa-bbbb-cccc-ddddeeeeffff';
+
+  // 수렴하면 놓는다 — 새 커밋으로 재개될 때는 새 대화에서 시작해야 한다
+  const conv = createContext(fakePR);
+  conv.conversationUrl = CONV;
+  conv.conversationStartRound = 1;
+  fire(conv, 'START_REVIEW');
+  fire(conv, 'POSTED_CLEAN', { patch: { round: 1 } });
+  releaseConversation(conv); // runRound 의 수렴 경로와 동일
+  assert(conv.state === 'CONVERGED' && !conv.conversationUrl, 'CONVERGED 시 대화 참조 해제');
+
+  // PR 이 닫히면 applySyncEvents 가 놓는다
+  const closed = createContext(fakePR);
+  closed.conversationUrl = CONV;
+  closed.conversationStartRound = 1;
+  fire(closed, 'START_REVIEW');
+  fire(closed, 'POSTED_COMMENTS', { patch: { round: 1, headShaAtLastReview: 'abc123' } });
+  applySyncEvents(cfg, closed, { status: 'MERGED', headSha: 'abc123' });
+  assert(closed.state === 'CLOSED' && !closed.conversationUrl, 'PR_CLOSED 시 대화 참조 해제');
+
+  // 미수렴 상태에서는 유지된다 (이슈 #2 의 대상 상태들)
+  const awaiting = createContext(fakePR);
+  awaiting.conversationUrl = CONV;
+  awaiting.conversationStartRound = 1;
+  fire(awaiting, 'START_REVIEW');
+  fire(awaiting, 'POSTED_COMMENTS', { patch: { round: 1, headShaAtLastReview: 'abc123' } });
+  applySyncEvents(cfg, awaiting, { status: 'OPEN', headSha: 'def456' });
+  assert(
+    awaiting.state === 'REVIEW_DUE' && awaiting.conversationUrl === CONV,
+    '미수렴 PR 은 새 커밋이 와도 대화를 유지',
+  );
+}
+
+// ── 시나리오 14: 이전 라운드 블록 (대화 유지 여부에 따른 모양) ──
+
+{
+  const ctx = createContext(fakePR);
+  ctx.round = 2;
+  ctx.conversationStartRound = 1;
+  ctx.threads = [
+    { id: 'T0', path: 'old.ts', line: 5, isResolved: true, authorReplied: false, round: 1, snippet: '이미 반영됨' },
+    { id: 'T1', path: 'a.ts', line: 10, isResolved: false, authorReplied: false, round: 1, snippet: '널 체크 누락' },
+    { id: 'T2', path: 'b.ts', line: 20, isResolved: false, authorReplied: true, round: 2, snippet: '경계값 처리' },
+  ];
+
+  // 1차 라운드에는 이전 현황이 없다
+  assert(buildPreviousBlock(ctx, 1, false).text === '', '1차 라운드는 이전 블록 없음');
+
+  // 새 대화 — 스니펫까지 실어 맥락을 이월한다
+  const fresh = buildPreviousBlock(ctx, 3, false);
+  assert(fresh.text.includes('널 체크 누락') && fresh.text.includes('경계값 처리'), '새 대화면 스니펫 포함');
+  assert(fresh.shown === 2 && fresh.total === 2, '직전 라운드 + 미해결 과거 항목만 싣는다');
+  assert(!fresh.text.includes('이미 반영됨'), '해결된 과거 라운드 항목은 제외');
+
+  // 같은 대화 — 본문은 대화에 있으니 생략하고, 대화에 없는 처리 결과만 싣는다
+  const cont = buildPreviousBlock(ctx, 3, true);
+  assert(!cont.text.includes('널 체크 누락'), '대화를 이어가면 스니펫 생략');
+  assert(cont.text.includes('a.ts:10') && cont.text.includes('b.ts:20'), '경로·라인은 유지');
+  assert(
+    cont.text.includes('[미해결]') && cont.text.includes('[답변만 있음]'),
+    'resolve·답글 여부는 대화에 없는 정보이므로 반드시 싣는다',
+  );
+
+  // 회전한 대화 — 그 대화에 없는 과거 라운드는 스니펫을 남긴다
+  const rotated = { ...ctx, conversationStartRound: 2 };
+  const mixed = buildPreviousBlock(rotated, 3, true);
+  assert(mixed.text.includes('널 체크 누락'), '회전 이전 라운드(1차)는 스니펫 유지');
+  assert(!mixed.text.includes('경계값 처리'), '회전 이후 라운드(2차)는 스니펫 생략');
+
+  // 상한 초과 시 조용히 버리지 않고 생략 건수를 알린다
+  const many = createContext(fakePR);
+  many.round = 1;
+  many.threads = Array.from({ length: 42 }, (_, i) => ({
+    id: `T${i}`, path: `f${i}.ts`, line: i, isResolved: false,
+    authorReplied: false, round: 1, snippet: `s${i}`,
+  }));
+  const capped = buildPreviousBlock(many, 2, false);
+  assert(capped.shown === 30 && capped.total === 42, '이전 현황은 30건까지만 싣는다');
+  assert(capped.text.includes('그 외 12건 생략'), '생략 건수를 프롬프트에 명시');
 }
 
 // ── 결과 ────────────────────────────────────────────────────

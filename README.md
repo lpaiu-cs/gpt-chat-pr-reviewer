@@ -143,6 +143,14 @@ npm run dev -- review <pr-url> --from-cache
 
 이 경우 브라우저를 아예 띄우지 않습니다.
 
+### 대화 세션
+
+한 PR의 리뷰 라운드는 **같은 ChatGPT 대화**에서 이어집니다. 1차 라운드가 만든 대화 URL을 상태 파일에 기록해 두고, 다음 라운드에서 그 대화로 돌아가 이어서 질문합니다. GPT가 이전 라운드에 무엇을 왜 지적했는지 그대로 기억하므로, 반복 패턴이나 이미 합의한 판단 기준이 매 라운드 초기화되지 않습니다. `status <pr>`에서 현재 대화 URL을 볼 수 있습니다.
+
+- 대화가 삭제됐거나 다른 계정으로 바뀌어 열 수 없으면 새 대화로 폴백하고 그 사실을 로그로 알립니다.
+- `maxRoundsPerConversation`(기본 5)을 넘기면 컨텍스트 한도를 피해 새 대화로 전환하고, 프롬프트가 이전 지적을 요약해 이월합니다.
+- 리뷰가 수렴(`CONVERGED`)하거나 PR이 닫히면 대화 참조를 놓습니다. 새 커밋으로 재개될 때는 새 대화에서 시작합니다.
+
 `review`는 상태를 존중합니다. `AWAITING_AUTHOR`인 PR에 실행하면 대기 중임을 알리고 종료하며, `--force`로만 강제 실행됩니다.
 
 ## 맞춤 지침
@@ -167,6 +175,7 @@ npm run dev -- review <pr-url> --from-cache
 | `watchIntervalMs` | `10000` | 폴링 간격 (10초, 하한 5초) |
 | `quotaCooldownMs` | `10800000` | 쿼터 쿨다운 (3시간) |
 | `maxAutoRetries` | `2` | ERROR 자동 재시도 횟수 |
+| `maxRoundsPerConversation` | `5` | 대화 1개에서 진행할 최대 라운드 수 (초과 시 새 대화) |
 | `headless` | `false` | 헤드리스 실행 |
 | `browserChannel` | `chrome` | Playwright 채널 |
 | `selectors` | — | ChatGPT DOM 셀렉터 오버라이드 |

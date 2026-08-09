@@ -115,6 +115,7 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
   if (data.status !== 'OPEN') {
     if (ctx.state !== 'CLOSED') {
       fire(ctx, 'PR_CLOSED', { note: data.status === 'MERGED' ? '머지됨' : '닫힘' });
+      releaseConversation(ctx); // 끝난 PR 의 대화는 더 이어 쓰지 않는다
     }
     return;
   }
@@ -197,38 +198,168 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
   return needsFull;
 }
 
+// ── 대화 세션 ───────────────────────────────────────────────
+
+/**
+ * 이번 라운드에 쓸 대화. 대화 URL 은 상태가 아니라 실행기 사정이므로
+ * 상태 머신(TRANSITIONS)이 아니라 여기서만 다룬다.
+ */
+export type ConversationPlan =
+  | { action: 'resume'; url: string; roundsUsed: number }
+  | { action: 'new'; reason: 'first' | 'rotate'; roundsUsed: number };
+
+/**
+ * 저장된 대화를 이어 쓸지, 새로 열지 결정한다 (순수 함수).
+ *
+ * 라운드마다 PR diff 전문이 대화에 쌓이므로 무한히 이어 붙이면 모델의 컨텍스트
+ * 한도에 걸린다. maxRoundsPerConversation 을 넘기면 대화를 회전시키고,
+ * 그때는 프롬프트가 스니펫까지 실어 맥락을 이월한다(buildPreviousBlock 참고).
+ */
+export function planConversation(
+  cfg: AppConfig,
+  ctx: PRContext,
+  round: number,
+): ConversationPlan {
+  const url = ctx.conversationUrl;
+  if (!url) return { action: 'new', reason: 'first', roundsUsed: 0 };
+
+  // conversationStartRound 가 없는 구버전 컨텍스트는 이번 라운드가 첫 사용인 셈
+  const roundsUsed = Math.max(0, round - (ctx.conversationStartRound ?? round));
+  if (roundsUsed >= cfg.maxRoundsPerConversation) {
+    return { action: 'new', reason: 'rotate', roundsUsed };
+  }
+  return { action: 'resume', url, roundsUsed };
+}
+
+/** 대화 참조를 놓는다 (수렴·PR 종료·복귀 실패 시). */
+export function releaseConversation(ctx: PRContext): void {
+  ctx.conversationUrl = undefined;
+  ctx.conversationStartRound = undefined;
+}
+
+/**
+ * 이번 라운드를 진행할 대화를 화면에 띄운다.
+ * @returns 이전 라운드 맥락이 살아 있는 대화면 true
+ */
+async function enterConversation(
+  cfg: AppConfig,
+  driver: ChatGPTDriver,
+  ctx: PRContext,
+  round: number,
+): Promise<boolean> {
+  const plan = planConversation(cfg, ctx, round);
+
+  if (plan.action === 'resume') {
+    if (await driver.resumeChat(plan.url)) {
+      console.log(chalk.dim(`  이전 대화 이어서 진행 (누적 ${plan.roundsUsed}라운드) — ${plan.url}`));
+      return true;
+    }
+    // 대화 삭제·계정 변경 등 — 조용히 새 대화로 넘어가면 맥락이 사라진 걸 모른다
+    console.log(
+      chalk.yellow(`  ⚠ 이전 대화를 열지 못했습니다 (${plan.url}) — 새 대화로 시작합니다.`),
+    );
+    releaseConversation(ctx);
+  } else if (plan.reason === 'rotate') {
+    console.log(
+      chalk.dim(`  대화 누적 ${plan.roundsUsed}라운드 — 컨텍스트 한도를 피해 새 대화로 전환합니다.`),
+    );
+    releaseConversation(ctx);
+  }
+
+  await driver.startNewChat();
+  return false;
+}
+
+/**
+ * 방금 만들어진 대화의 URL 을 컨텍스트에 기록한다.
+ * ChatGPT 는 첫 메시지를 보낸 뒤에야 주소를 /c/<uuid> 로 바꾸므로 전송 후에 부른다.
+ */
+function rememberConversation(driver: ChatGPTDriver, ctx: PRContext, round: number): void {
+  if (ctx.conversationUrl) return; // 이어가던 대화 — 그대로 둔다
+
+  const url = driver.currentConversationUrl();
+  if (!url) {
+    console.log(
+      chalk.yellow('  ⚠ 대화 URL 을 확보하지 못했습니다 — 다음 라운드는 새 대화로 시작합니다.'),
+    );
+    return;
+  }
+  ctx.conversationUrl = url;
+  ctx.conversationStartRound = round;
+  console.log(chalk.dim(`  대화 기록: ${url}`));
+}
+
 // ── 프롬프트 구성 ───────────────────────────────────────────
 
 /** 이전 라운드 현황에 실을 스레드 최대 개수. */
 const MAX_PREVIOUS_THREADS = 30;
 
-function buildPrompt(cfg: AppConfig, ctx: PRContext, round: number, instructions: string): string {
-  let previous = '';
-  if (round > 1) {
-    // 직전 라운드에서 우리가 남긴 것 + 아직 미해결로 남은 과거 항목만 싣는다.
-    // 전체를 싣으면 이전 리뷰 세션에서 넘어온 해결된 스레드까지 수십 개가 붙어
-    // 프롬프트가 비대해지고 초점이 흐려진다.
-    const relevant = ctx.threads.filter((t) => t.round === ctx.round || !t.isResolved);
-    const shown = relevant.slice(0, MAX_PREVIOUS_THREADS);
+/**
+ * "이전 라운드 코멘트 현황" 블록을 만든다.
+ *
+ * 같은 대화를 이어갈 때도 이 블록은 없앨 수 없다. GPT 가 대화에서 이미 아는 것은
+ * **자기가 무엇을 지적했는가** 뿐이고, resolve·답글 여부는 그 응답 이후 GitHub 에서
+ * 벌어진 일이라 대화 어디에도 없다. 수렴 판단의 근거가 바로 그 처리 결과이므로,
+ * 블록을 제거하는 대신 대화 안에 본문이 있는 항목의 스니펫만 걷어낸다.
+ *
+ * 대화를 회전했거나 폴백으로 새로 열었다면 그 대화에는 맥락이 없으므로 스니펫까지
+ * 싣는다 — 이 블록이 곧 새 대화로의 요약 이월이다.
+ */
+export function buildPreviousBlock(
+  ctx: PRContext,
+  round: number,
+  continued: boolean,
+): { text: string; total: number; shown: number } {
+  const empty = { text: '', total: 0, shown: 0 };
+  if (round <= 1) return empty;
 
-    if (shown.length > 0) {
-      const lines = shown.map((t) => {
-        const status = t.isResolved ? '해결됨' : t.authorReplied ? '답변만 있음' : '미해결';
-        return `- [${status}] ${t.path}:${t.line ?? '?'} — ${t.snippet}`;
-      });
-      const omitted = relevant.length - shown.length;
-      previous = [
-        '## 이전 라운드 코멘트 현황',
-        ...lines,
-        ...(omitted > 0 ? [`- (그 외 ${omitted}건 생략)`] : []),
-        '',
-        '위 코멘트가 실제로 반영되었는지 확인하고, 미반영 항목은 다시 지적해주세요.',
-      ].join('\n');
-      if (omitted > 0) {
-        console.log(chalk.dim(`  이전 라운드 현황 ${relevant.length}건 중 ${shown.length}건만 프롬프트에 포함`));
-      }
-    }
+  // 직전 라운드에서 우리가 남긴 것 + 아직 미해결로 남은 과거 항목만 싣는다.
+  // 전체를 싣으면 이전 리뷰 세션에서 넘어온 해결된 스레드까지 수십 개가 붙어
+  // 프롬프트가 비대해지고 초점이 흐려진다.
+  const relevant = ctx.threads.filter((t) => t.round === ctx.round || !t.isResolved);
+  const shown = relevant.slice(0, MAX_PREVIOUS_THREADS);
+  if (shown.length === 0) return empty;
+
+  // 이어가는 대화라도 회전 이전 라운드의 코멘트는 그 대화에 없다 — 스니펫을 남긴다.
+  const inConversationFrom = continued
+    ? (ctx.conversationStartRound ?? round)
+    : Number.POSITIVE_INFINITY;
+
+  const lines = shown.map((t) => {
+    const status = t.isResolved ? '해결됨' : t.authorReplied ? '답변만 있음' : '미해결';
+    const head = `- [${status}] ${t.path}:${t.line ?? '?'}`;
+    return t.round >= inConversationFrom ? head : `${head} — ${t.snippet}`;
+  });
+  const omitted = relevant.length - shown.length;
+
+  const text = [
+    '## 이전 라운드 코멘트 현황',
+    ...(continued
+      ? ['아래는 이 대화에서 당신이 남긴 지적의 GitHub 상 처리 결과입니다. 코멘트 본문은 위 대화를 참조하세요.']
+      : []),
+    ...lines,
+    ...(omitted > 0 ? [`- (그 외 ${omitted}건 생략)`] : []),
+    '',
+    '위 코멘트가 실제로 반영되었는지 확인하고, 미반영 항목은 다시 지적해주세요.',
+  ].join('\n');
+
+  return { text, total: relevant.length, shown: shown.length };
+}
+
+function buildPrompt(
+  cfg: AppConfig,
+  ctx: PRContext,
+  round: number,
+  instructions: string,
+  continued: boolean,
+): string {
+  const prev = buildPreviousBlock(ctx, round, continued);
+  if (prev.total > prev.shown) {
+    console.log(
+      chalk.dim(`  이전 라운드 현황 ${prev.total}건 중 ${prev.shown}건만 프롬프트에 포함`),
+    );
   }
+  const previous = prev.text;
 
   // 지침은 "리뷰의 제약"임을 명시한다. 이 래핑이 없으면 GPT 가 지침 문서 자체를
   // 주제로 착각해 리뷰 대신 지침을 다듬어 응답하는 경우가 있다.
@@ -307,6 +438,9 @@ export interface RunRoundOptions {
 
 /**
  * 리뷰 원본 응답을 확보한다.
+ *
+ * 프롬프트는 여기서 만든다 — 대화를 이어 쓰는지 여부에 따라 이전 라운드 블록의
+ * 모양이 달라지고, 그건 실제로 대화를 열어봐야 알 수 있기 때문이다.
  * 새로 받은 응답은 즉시 저장해, 게시 실패 시 대화 한도를 다시 쓰지 않고
  * --from-cache 로 재시도할 수 있게 한다.
  */
@@ -314,11 +448,11 @@ async function obtainRaw(
   cfg: AppConfig,
   driver: ChatGPTDriver | null,
   ctx: PRContext,
-  prompt: string,
   round: number,
-  fromCache: boolean,
+  instructions: string,
+  opts: RunRoundOptions,
 ): Promise<string> {
-  if (fromCache) {
+  if (opts.fromCache) {
     const hit = loadLatestResponse(cfg, ctx);
     if (!hit) {
       throw new Error('캐시된 응답이 없습니다. --from-cache 없이 먼저 리뷰를 실행하세요.');
@@ -328,8 +462,14 @@ async function obtainRaw(
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
-  await driver.startNewChat();
-  const raw = await driver.sendAndCollect(prompt);
+  const continued = await enterConversation(cfg, driver, ctx, round);
+  const raw = await driver.sendAndCollect(buildPrompt(cfg, ctx, round, instructions, continued));
+
+  rememberConversation(driver, ctx, round);
+  // 게시 도중 죽더라도 대화를 잃지 않게 URL 확보 즉시 저장한다.
+  // dry-run 은 "상태 변화 없음" 이 원칙이므로 저장하지 않는다.
+  if (!opts.dryRun) saveContext(cfg, ctx);
+
   console.log(chalk.dim(`  응답 저장: ${saveResponse(cfg, ctx, round, raw)}`));
   return raw;
 }
@@ -347,7 +487,6 @@ export async function runRound(
 ): Promise<RoundOutcome> {
   const round = ctx.round + 1;
   const instructions = loadInstructions(cfg, opts.instructionsFile);
-  const prompt = buildPrompt(cfg, ctx, round, instructions);
 
   console.log(chalk.bold(`\n  📋 ${ctx.title}`));
   console.log(chalk.dim(`     ${ctx.prUrl}  (${round}차 리뷰${opts.dryRun ? ' · dry-run' : ''})`));
@@ -355,7 +494,7 @@ export async function runRound(
   // ── dry-run: 상태 전이 없이 결과만 ──
   if (opts.dryRun) {
     try {
-      const raw = await obtainRaw(cfg, driver, ctx, prompt, round, !!opts.fromCache);
+      const raw = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
       const result = parseGPTResponse(raw);
       if (!assertReviewable(result)) return 'failed';
       console.log(chalk.dim(`  approval=${result.approval}  comments=${result.comments.length}`));
@@ -381,7 +520,7 @@ export async function runRound(
   saveContext(cfg, ctx);
 
   try {
-    const raw = await obtainRaw(cfg, driver, ctx, prompt, round, !!opts.fromCache);
+    const raw = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
     const result = parseGPTResponse(raw);
 
     // 리뷰가 아닌 응답을 PR 에 게시하지 않는다.
@@ -418,6 +557,8 @@ export async function runRound(
         lastError: undefined,
       },
     });
+    // 수렴하면 대화를 놓아준다 — 새 커밋으로 재개될 때는 새 대화에서 시작한다
+    if (converged) releaseConversation(ctx);
     saveContext(cfg, ctx);
     return converged ? 'clean' : 'posted';
   } catch (e) {

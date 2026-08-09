@@ -49,12 +49,21 @@ CONVERGED ─ NEW_COMMITS → REVIEW_DUE
 PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레드별 resolve/답글 여부·
 쿼터 해제 시각·전체 이벤트 히스토리가 기록된다. `status --json` 이 UI 연동 포인트.
 
+## 대화 세션
+
+미수렴 PR 은 라운드 간 같은 ChatGPT 대화를 이어 쓴다. 대화 URL 은 **상태가 아니라
+실행기 사정**이므로 `TRANSITIONS` 에 관여하지 않고 `PRContext.conversationUrl` /
+`conversationStartRound` 로만 관리한다 (`reviewer.ts` 의 `planConversation` ·
+`releaseConversation`). 복귀 실패 시 새 대화로 폴백하고,
+`maxRoundsPerConversation` 초과 시 회전한다. CONVERGED · CLOSED 에서 해제.
+
 ## 핵심 흐름
 
 1. `setup` → Chrome 영속 프로필로 ChatGPT 수동 로그인 (1회)
 2. `watch` → 레포 폴링 → `syncPR` 이 GitHub 현황(스레드 resolve·head SHA·닫힘)을
    상태 머신 이벤트로 변환 → `REVIEW_DUE` 인 PR 만 `runRound` 실행
-3. `runRound` → 새 대화 → 프롬프트(맞춤 지침 + 이전 라운드 스레드 현황 포함) 전송
+3. `runRound` → PR 전용 대화 진입(`conversationUrl` 이 있으면 복귀, 없으면 새 대화)
+   → 프롬프트(맞춤 지침 + 이전 라운드 스레드 현황 포함) 전송
    → 응답 JSON 파싱 → diff 대조 → 인라인 리뷰 게시 → 스레드 동기화 → 상태 전이
 
 ## 빌드 & 실행
