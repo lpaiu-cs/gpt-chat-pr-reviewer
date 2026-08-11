@@ -56,6 +56,11 @@ node "{{DAEMON}}" wait owner/repo#12 --timeout 3600
 | `ERROR` | 라운드 실패 — 자동 재시도한다 |
 | `CLOSED` | 머지되거나 닫힘 |
 
+`스레드 3/7` 은 리뷰 스레드 7건 중 3건이 resolve 됐다는 뜻이다. `AWAITING_AUTHOR`
+에서 **전체 resolve** 는 새 커밋과 함께 `AUTHOR_RESPONDED` 를 일으키는 신호이므로,
+남아 있는 스레드는 곧 "아직 대응하지 않은 지적" 이다. 지적에 답변하고 resolve 하는
+절차는 `pr-review` 스킬에 있다 (이 스킬은 읽기 전용이라 게시하지 않는다).
+
 ## 하지 말 것
 
 데몬은 **여러 세션이 함께 쓴다.**

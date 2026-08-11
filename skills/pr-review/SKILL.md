@@ -53,12 +53,46 @@ node "{{DAEMON}}" wait owner/repo#12 --since-seq 7
 
 | 이벤트 | 뜻 | 할 일 |
 |---|---|---|
-| `posted` | 지적 사항이 인라인 코멘트로 게시됨 | `gh pr view --comments` 등으로 읽고 대응 |
+| `posted` | 지적 사항이 인라인 코멘트로 게시됨 | 읽고 대응 → **4번(스레드 답변·resolve)까지 반드시** |
 | `converged` | approve — 더 지적할 것 없음 | 사용자에게 알린다 |
 | `failed` | 라운드 실패 (파싱 실패·리뷰 거부 등) | 데몬이 자동 재시도한다. 반복되면 사용자에게 알린다 |
 | `quota` | ChatGPT 대화 한도 도달 | 쿨다운(기본 3시간) 후 자동 재개. 사용자에게 알린다 |
 | `closed` | PR 이 닫히거나 머지됨 | 대기 종료 |
 | `timeout` | 지정 시간 안에 아무 일도 없었음 | `status` 로 현황 확인 |
+
+**4. 스레드 답변 + resolve** — 수정 커밋을 push 한 뒤 **반드시** 한다.
+잊기 쉬운데, 빼먹으면 다음 라운드가 나빠진다.
+
+```bash
+# 열려 있는 스레드 목록 (스레드 id · 첫 코멘트 id · 제목)
+gh api graphql -f query='
+query { repository(owner:"OWNER", name:"REPO") { pullRequest(number:N) {
+  reviewThreads(first:60) { nodes { id isResolved
+    comments(first:1){ nodes { databaseId body } } } } } } }' \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved | not)
+        | "\(.id)\t\(.comments.nodes[0].databaseId)\t\(.comments.nodes[0].body|split("\n")[0])"'
+
+# 각 스레드에 답변 (무엇을 어떻게 고쳤는지 + 커밋 해시)
+gh api repos/OWNER/REPO/pulls/N/comments/<comment_id>/replies -f body='반영했습니다 (abc1234). ...'
+
+# 그리고 resolve
+gh api graphql -f query='mutation {
+  resolveReviewThread(input:{threadId:"<thread_id>"}) { thread { isResolved } } }'
+```
+
+건수가 많으면 위 세 단계를 스크립트로 묶어 한 번에 돈다.
+
+**왜 생략하면 안 되는가**
+
+- 다음 라운드 프롬프트에 **이전 라운드 스레드 현황**이 들어간다. 답변이 없으면
+  리뷰어는 무엇이 반영됐는지 모른 채 같은 지적을 다시 올린다.
+- 상태 머신이 `AUTHOR_RESPONDED` 를 **새 커밋 또는 전체 resolve** 로 판정한다.
+  resolve 는 "이 지적은 끝났다" 는 신호다.
+
+**반영하지 않기로 한 지적도 이유를 적고 resolve 한다.** 조용히 두면 다음
+라운드에 그대로 다시 올라온다. 지적이 틀렸다고 판단했으면 근거를 적는다 —
+동의하지 않는다는 말만 남기고 resolve 하지 않는다.
 
 대응 커밋을 push 하면 데몬이 새 커밋을 감지해 **다음 라운드를 자동으로 돈다.**
 `status --pr <ref> --json` 의 `seq` 를 읽어 그 값으로 다시 `wait` 를 건다.
