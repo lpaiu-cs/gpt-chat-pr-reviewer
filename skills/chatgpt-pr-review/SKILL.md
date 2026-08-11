@@ -1,6 +1,6 @@
 ---
-name: pr-review
-description: ChatGPT 웹 대화창을 이용한 GitHub PR 자동 리뷰를 요청하고 결과를 기다린다. PR 을 새로 만든 직후, 리뷰 대응 커밋을 push 한 직후, 또는 사용자가 "리뷰 돌려 / 리뷰 받아줘 / 리뷰어 붙여줘" 라고 할 때 사용한다. 한 라운드가 2~15분 걸리므로 백그라운드로 기다리고 그 사이 다른 작업을 계속한다.
+name: chatgpt-pr-review
+description: Request and monitor automated GitHub PR reviews through the local gpt-chat-pr-reviewer daemon, then handle posted threads through convergence. Use after opening a PR, after pushing review fixes, or when the user asks "review this PR", "run the reviewer", "리뷰 돌려", "리뷰 받아줘", or "리뷰어 붙여줘". A round takes 2–15 minutes, so wait without blocking other work.
 ---
 
 # PR 리뷰 요청
@@ -33,8 +33,9 @@ node "{{DAEMON}}" review owner/repo#12
 사용자에게 전달한다 — 범위는 레포 단위라, 넓히면 그 레포의 다른 열린 PR 까지
 리뷰 대상이 되기 때문이다.
 
-**2. 대기** — 반드시 **백그라운드로** 실행한다 (Bash 도구의 `run_in_background`).
-앞에서 기다리면 2~15분 동안 아무것도 못 한다.
+**2. 대기** — 반드시 현재 에이전트 런타임의 **백그라운드·비동기 실행**을
+사용한다. 런타임이 지연된 셸 셀을 되살리는 방식을 제공하면 그것을 쓴다.
+앞에서 동기로 기다리면 2~15분 동안 다른 작업을 못 한다.
 
 `review` 출력이 알려준 `wait` 명령을 **그대로** 쓴다:
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT PR Review"
+  short_description: "Request and manage ChatGPT-based PR reviews"
+  default_prompt: "Use $chatgpt-pr-review to request a review for this GitHub PR and handle the result through convergence."
