@@ -22,7 +22,7 @@
  *   node scripts/daemon.mjs wait   owner/repo#12 [--timeout 2700]
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, openSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -238,8 +238,29 @@ function launch() {
     windowsHide: true,
     stdio: ['ignore', log, log],
   });
+  // **일찍 죽었는지 본다.** watch 는 감시 범위가 비었거나 로그인이 만료됐으면
+  // UI 를 열기도 전에 종료한다. 그걸 모르면 "데몬이 90초 안에 안 떴다" 는
+  // 엉뚱한 원인을 보고하게 된다 — 진짜 원인은 이미 로그에 적혀 있는데도.
+  const died = { code: null };
+  child.on('exit', (code) => {
+    died.code = code ?? 0;
+  });
   child.unref();
-  return child.pid;
+  return died;
+}
+
+/** watch.log 꼬리 — 기동 실패의 진짜 원인이 여기 적혀 있다. */
+function logTail(lines = 15) {
+  try {
+    const all = readFileSync(path.join(dataDir(), 'watch.log'), 'utf-8')
+      .split(/\r?\n/)
+      // ANSI 색을 걷어낸다 — 로그 파일에는 chalk 이 그대로 들어 있다.
+      .map((l) => l.replace(/\x1b\[[0-9;]*m/g, '').trimEnd())
+      .filter(Boolean);
+    return all.slice(-lines).map((l) => `    ${l}`).join('\n');
+  } catch {
+    return '    (로그를 읽지 못했습니다)';
+  }
 }
 
 /**
@@ -261,18 +282,31 @@ async function ensure({ start = false } = {}) {
     );
   }
 
-  launch();
+  const died = launch();
   const deadline = Date.now() + START_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, POLL_MS));
     const d = await findDaemon();
     if (d) return { ...d, started: true };
+
+    // 죽었다면 기다릴 이유가 없다. 단, 다른 세션이 잠금을 먼저 잡아서 우리
+    // 프로세스만 물러난 경우일 수 있으므로 위의 findDaemon 을 먼저 본다
+    // (그쪽이 이겼으면 이미 위에서 돌아갔다).
+    if (died.code !== null) {
+      die(
+        `데몬이 기동 직후 종료했습니다 (코드 ${died.code}).\n` +
+          `  로그 마지막 부분 (${path.join(dataDir(), 'watch.log')}):\n` +
+          `${logTail()}\n` +
+          `  감시 범위가 비어 있으면 ${ROOT}/pr-review.config.json 의 watch.include 를,\n` +
+          `  ChatGPT 로그인이 만료됐으면 ${ROOT} 에서 \`npm run setup\` 을 실행해야 합니다.`,
+      );
+    }
+
     if (Date.now() >= deadline) {
       die(
         `데몬이 ${Math.round(START_TIMEOUT_MS / 1000)}초 안에 뜨지 않았습니다.\n` +
-          `로그를 확인하세요: ${path.join(dataDir(), 'watch.log')}\n` +
-          `(ChatGPT 로그인이 만료됐다면 사람이 개입해야 합니다 — ` +
-          `${ROOT} 에서 \`npm run setup\`)`,
+          `  로그 마지막 부분 (${path.join(dataDir(), 'watch.log')}):\n` +
+          `${logTail()}`,
       );
     }
   }
@@ -399,11 +433,24 @@ async function resolveCard(ui, ref, key) {
   let card = cardsFor(state, ref)[0];
   if (card) return card;
 
+  // probedAt 키는 소문자로 정규화돼 있다 (cli.ts) — 조회도 같은 형태로 한다.
+  // GitHub slug 는 대소문자를 구분하지 않아 사용자가 아무렇게나 적을 수 있다.
+  const slugKey = ref.slug.toLowerCase();
   const deadline = askedAt + FRESH_SCAN_TIMEOUT_MS;
   for (;;) {
-    // 그 레포를 **우리 요청 뒤에** 실제로 조회했는데도 없으면, 그때는 PR 쪽 문제다.
+    // 그 레포를 **우리 요청 뒤에** 실제로 조회했는데도 카드가 없다. 원인은
+    // "PR 이 없다" 일 수도 "필터에 걸렸다" 일 수도 있으므로 단정하지 않는다.
     const probedAt = state.snapshot?.cycle?.probedAt ?? {};
-    if (Number(probedAt[ref.slug]) > askedAt) die(prNotFound(key), { notFound: true });
+    if (Number(probedAt[slugKey]) > askedAt) {
+      const ctl = state.snapshot?.control ?? {};
+      const filters = [
+        ctl.skip?.length ? `skip ${ctl.skip.length}건` : '',
+        ctl.only?.length ? `only ${ctl.only.join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      die(cardMissing(key, ref.slug, ref.number, filters), { notTracked: true });
+    }
 
     if (Date.now() >= deadline) {
       // 끝내 조회 기록을 못 봤다. 범위 밖일 가능성이 가장 크지만 **단정하지
@@ -422,11 +469,48 @@ async function resolveCard(ui, ref, key) {
   }
 }
 
-/** 레포는 감시 중인데 그 PR 만 안 보인다 — 원인이 PR 쪽에 있다. */
-function prNotFound(key) {
+/**
+ * 레포는 조회했는데 카드가 없다 — **그렇다고 PR 이 없는 건 아니다.**
+ *
+ * `scan()` 은 `passesFilters()`/`admitsNewPR()` 에서 걸린 PR 의 컨텍스트를 아예
+ * 만들지 않는다 (`if (!existing && !admitted) continue`). 그래서 기본 설정의
+ * draft PR 은 열려 있어도 카드가 없다 — 그걸 "번호가 틀렸다" 고 보고하면
+ * 사용자는 멀쩡한 번호를 몇 번이고 다시 확인하게 된다.
+ *
+ * 데몬이 남긴 것만으로는 구분할 수 없으므로 **실패 경로에서만** GitHub 에
+ * 직접 한 번 물어본다 (정상 경로에는 비용이 붙지 않는다).
+ */
+function inspectPR(slug, number) {
+  try {
+    const out = execFileSync(
+      'gh',
+      ['pr', 'view', String(number), '--repo', slug, '--json', 'state,isDraft,author,title'],
+      { windowsHide: true, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    return JSON.parse(out);
+  } catch {
+    return null; // 없거나 권한이 없거나 gh 가 없다 — 아래에서 그대로 말한다
+  }
+}
+
+function cardMissing(key, slug, number, filters) {
+  const pr = inspectPR(slug, number);
+  if (!pr) {
+    return (
+      `${key} 를 찾지 못했습니다. 레포는 방금 조회했는데 이 PR 이 없습니다.\n` +
+      `  번호가 맞는지 확인하세요 (또는 접근 권한·gh 인증).`
+    );
+  }
+  if (pr.state !== 'OPEN') {
+    return `${key} 는 이미 ${pr.state === 'MERGED' ? '머지됐습니다' : '닫혔습니다'}.`;
+  }
+  // 열려 있는데 추적되지 않는다 = 감시 설정에서 걸러졌다.
   return (
-    `${key} 를 찾지 못했습니다. 레포는 감시 중이고 방금 조회했는데 이 PR 이 없습니다.\n` +
-    `  번호가 맞는지, 이미 닫혔거나 머지되지 않았는지 확인하세요.`
+    `${key} 는 열려 있지만 감시 대상이 아닙니다 — 설정 필터에서 제외됐습니다.\n` +
+    (pr.isDraft ? `  draft PR 입니다 (기본값은 제외 — filters.draft: true 로 포함).\n` : '') +
+    `  작성자: ${pr.author?.login ?? '?'}\n` +
+    `  현재 필터: ${filters || '(없음)'}\n` +
+    `  필터는 사용자가 정합니다 — 대시보드나 pr-review.config.json 을 확인하세요.`
   );
 }
 
@@ -566,7 +650,9 @@ async function main() {
   데몬 종료도 여기 없습니다 — 대시보드의 종료 버튼이나
   \`npm run dev -- stop\` 을 쓰세요 (여러 세션이 함께 씁니다).
 `);
-    process.exit(VERB && !VERBS[VERB] ? 1 : 0);
+    // 도움말을 **요청해서** 본 것은 성공이다. 모르는 동사만 실패로 친다.
+    const askedForHelp = !VERB || flag('--help') || flag('-h');
+    process.exit(askedForHelp ? 0 : 1);
   }
   await VERBS[VERB]();
 }

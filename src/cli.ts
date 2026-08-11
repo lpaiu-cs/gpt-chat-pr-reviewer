@@ -1111,10 +1111,16 @@ program
       });
       // 레포별 실제 조회 시각을 그대로 내보낸다 — 붙는 쪽이 "그 레포를 이번에
       // 정말 봤나" 를 판정해야 한다 (CycleInfo.probedAt 주석 참고).
+      // 키는 소문자로 정규화한다. GitHub 레포 slug 는 대소문자를 구분하지 않고
+      // `parsePRRef` 도 그 전제로 접어서 비교하는데, 여기만 원본 casing 을 쓰면
+      // 붙는 쪽이 `owner/imagetoeditableppt` 로 조회했을 때 키가 안 맞아
+      // "조회한 적 없다" 로 오판한다.
       progress.cycle({
         openCount,
         watchedRepos,
-        probedAt: Object.fromEntries(lastProbeAt),
+        probedAt: Object.fromEntries(
+          [...lastProbeAt].map(([slug, at]) => [slug.toLowerCase(), at]),
+        ),
       });
       publishControl();
     };
