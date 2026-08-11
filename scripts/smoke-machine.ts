@@ -12,6 +12,8 @@ import { resolveEvent } from '../src/poster.js';
 import {
   ghErrorMessage,
   buildReviewPayload,
+  buildPullRequestReactionPayload,
+  viewerReactionIds,
   THREAD_ALIAS_CHUNK,
   type PRProbe,
 } from '../src/github.js';
@@ -235,6 +237,26 @@ const fakePR: PRInfo = {
   const loose = JSON.parse(buildReviewPayload('본문', 'COMMENT', [], null));
   assert(!('commit_id' in loose), '커밋을 모르면 넣지 않는다 (기존 동작)');
   assert(!('comments' in loose), '코멘트가 없으면 빈 배열을 보내지 않는다');
+  assert(
+    buildPullRequestReactionPayload('eyes') === '{"content":"eyes"}',
+    '리뷰 시작 반응은 eyes',
+  );
+  assert(
+    buildPullRequestReactionPayload('+1') === '{"content":"+1"}',
+    '리뷰 수렴 반응은 +1',
+  );
+  assert(
+    viewerReactionIds(
+      [
+        { id: 1, content: 'eyes', user: { login: 'review-bot' } },
+        { id: 2, content: 'eyes', user: { login: 'someone-else' } },
+        { id: 3, content: '+1', user: { login: 'review-bot' } },
+      ],
+      'eyes',
+      'Review-Bot',
+    ).join(',') === '1',
+    '현재 사용자의 지정 반응만 제거 대상으로 고른다',
+  );
 }
 
 // ── 시나리오 8: gh 오류 메시지 추출 ────────────────────────

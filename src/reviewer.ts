@@ -15,6 +15,10 @@ import {
   fetchPRSyncData,
   getViewerLogin,
   getPRInfo,
+  addPullRequestReaction,
+  removePullRequestReaction,
+  ghErrorMessage,
+  type PullRequestReaction,
   type SyncThread,
   type PRProbe,
 } from './github.js';
@@ -29,6 +33,26 @@ import {
   type ResponseMeta,
 } from './cache.js';
 import { progress } from './progress.js';
+
+function addReactionToPullRequest(ctx: PRContext, content: PullRequestReaction): void {
+  try {
+    addPullRequestReaction(ctx.owner, ctx.repo, ctx.prNumber, content);
+  } catch (e) {
+    console.log(
+      chalk.yellow(`  ⚠ PR 반응 ${content} 게시 실패 — 리뷰는 계속합니다: ${ghErrorMessage(e)}`),
+    );
+  }
+}
+
+function removeReactionFromPullRequest(ctx: PRContext, content: PullRequestReaction): void {
+  try {
+    removePullRequestReaction(ctx.owner, ctx.repo, ctx.prNumber, content);
+  } catch (e) {
+    console.log(
+      chalk.yellow(`  ⚠ PR 반응 ${content} 제거 실패 — 리뷰는 계속합니다: ${ghErrorMessage(e)}`),
+    );
+  }
+}
 
 // ── 스레드 동기화 ───────────────────────────────────────────
 
@@ -833,6 +857,7 @@ export async function runRound(
       await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
         dryRun: true,
         isSelfReview: resolveSelfReview(ctx),
+        round,
       });
       console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
       return 'dry';
@@ -851,6 +876,8 @@ export async function runRound(
   // ── 실제 라운드 ──
   fire(ctx, 'START_REVIEW', { note: `${round}차 리뷰 시작` });
   saveContext(cfg, ctx);
+  removeReactionFromPullRequest(ctx, '+1');
+  addReactionToPullRequest(ctx, 'eyes');
 
   try {
     const { raw, target: reviewed } = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
@@ -872,6 +899,7 @@ export async function runRound(
       isSelfReview: resolveSelfReview(ctx),
       commitId: reviewed.headSha,
       baseRef: reviewed.baseRef,
+      round,
     });
 
     // 게시 직후 head SHA · 새 스레드 동기화
@@ -907,6 +935,8 @@ export async function runRound(
     // 수렴하면 대화를 놓아준다 — 새 커밋으로 재개될 때는 새 대화에서 시작한다
     if (converged) releaseConversation(ctx);
     saveContext(cfg, ctx);
+    removeReactionFromPullRequest(ctx, 'eyes');
+    if (converged) addReactionToPullRequest(ctx, '+1');
     return converged ? 'clean' : 'posted';
   } catch (e) {
     if (e instanceof QuotaLimitError) {
@@ -916,6 +946,7 @@ export async function runRound(
         patch: { quotaRetryAt: retryAt },
       });
       saveContext(cfg, ctx);
+      removeReactionFromPullRequest(ctx, 'eyes');
       console.log(
         chalk.yellow(
           `  ⚠ 쿼터 한도 — ${new Date(retryAt).toLocaleString('ko-KR')} 이후 자동 재시도`,
@@ -932,6 +963,7 @@ export async function runRound(
     const msg = timedOut ? `타임아웃 — ${raw}` : raw;
     fire(ctx, 'REVIEW_FAILED', { note: msg, patch: { lastError: msg } });
     saveContext(cfg, ctx);
+    removeReactionFromPullRequest(ctx, 'eyes');
     if (timedOut) {
       console.log(chalk.yellow('  ⏱ 응답 타임아웃:'), raw);
     } else {

@@ -53,6 +53,8 @@ export interface PostOptions {
   dryRun?: boolean;
   /** PR 작성자 == 리뷰 계정 인지 여부 */
   isSelfReview?: boolean;
+  /** 현재 리뷰 라운드 번호 */
+  round?: number;
   /**
    * **모델이 실제로 검토한 커밋.** 리뷰를 여기에 고정한다.
    *
@@ -87,6 +89,25 @@ function diffForPost(
   return fetchDiff(owner, repo, prNumber);
 }
 
+export function buildReviewBody(
+  review: ReviewResult,
+  opts: Pick<PostOptions, 'round' | 'isSelfReview'> = {},
+): string {
+  const { round, isSelfReview = false } = opts;
+  const { downgraded } = resolveEvent(review.approval, isSelfReview);
+
+  let body = `## gpt-chat-pr-reviewer`;
+  if (round !== undefined) {
+    body += ` ${round}차 리뷰`;
+  }
+  body += `\n\n**판정: ${VERDICT_LABEL[review.approval] ?? review.approval}**`;
+  if (downgraded) {
+    body += '\n\n> self PR 이므로 코멘트로 게시됩니다.';
+  }
+  body += `\n\n${review.summary}`;
+  return body;
+}
+
 export async function postReviewToGitHub(
   owner: string,
   repo: string,
@@ -94,7 +115,7 @@ export async function postReviewToGitHub(
   review: ReviewResult,
   opts: PostOptions = {},
 ): Promise<void> {
-  const { dryRun = false, isSelfReview = false, commitId = null, baseRef = null } = opts;
+  const { dryRun = false, isSelfReview = false, commitId = null, baseRef = null, round } = opts;
 
   // ── diff 로 유효 라인 확인 ──
   let hunks: DiffHunk[] = [];
@@ -119,13 +140,9 @@ export async function postReviewToGitHub(
   const { event, downgraded } = resolveEvent(review.approval, isSelfReview);
 
   // ── 리뷰 본문 구성 ──
-  let body = `## 🤖 ChatGPT PR 리뷰\n\n**판정: ${VERDICT_LABEL[review.approval] ?? review.approval}**`;
-  if (downgraded) {
-    body += '\n\n> 본인이 작성한 PR 이라 GitHub 정책상 승인/변경요청을 남길 수 없어 코멘트로 게시합니다.';
-  }
-  body += `\n\n${review.summary}`;
+  let body = buildReviewBody(review, { round, isSelfReview });
   if (invalid.length > 0) {
-    body += '\n\n---\n\n### 추가 코멘트 (인라인 위치 확인 불가)\n';
+    body += '\n\n---\n\n### Non-inline Review Comments\n';
     for (const c of invalid) {
       body += `\n- **\`${c.path}:${c.line}\`** — ${c.body}`;
     }

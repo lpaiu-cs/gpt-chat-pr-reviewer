@@ -58,6 +58,12 @@ stateDiagram-v2
 
 PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레드별 resolve/답글 여부 · 전체 이벤트 히스토리**가 기록됩니다. `data/state/<owner>__<repo>__<n>.json`에 영속화되며, `status --json`으로 그대로 읽을 수 있어 UI를 얹기 쉽습니다.
 
+실제 리뷰 라운드를 시작하면 PR에 👀 반응을 남기고, 지적 없이 수렴하면 👍 반응을
+추가합니다.
+
+새 라운드가 시작되면 이전 수렴 반응을 제거하고, 라운드가 끝나면 진행 반응도
+제거합니다. 반응 처리 실패는 리뷰 실행이나 상태 전이를 막지 않습니다.
+
 ### 리컨실리에이션
 
 `watch` 루프는 매 사이클마다 GitHub 현황(스레드 resolve 상태, head SHA, PR 열림/닫힘)을 읽어 상태 머신 이벤트로 변환합니다. 프로세스가 죽어 `REVIEWING`에 멈춰 있어도 다음 사이클에서 자동 복구됩니다.
@@ -171,11 +177,48 @@ npm run dev -- queue --json   # UI/스크립트 연동
 
 ## 설치
 
+### 에이전트에게 설치 요청 (권장)
+
+아래 문장을 Codex나 Claude Code에게 전달하면 된다. 스킬은 설치본의
+절대 경로를 기억하므로, 에이전트가 임시 디렉터리가 아닌 계속 유지할
+공구 디렉터리에 저장하게 한다.
+
+```text
+https://github.com/lpaiu-cs/gpt-chat-pr-reviewer 의 gpt-chat-pr-review와
+gpt-chat-pr-watch 스킬을 함께 설치해줘.
+저장소는 임시 경로가 아닌 안정적인 공구 디렉터리에 clone하고,
+기존 clone이 있으면 로컬 변경을 덮어쓰지 말고 안전하게 갱신해줘.
+Node.js 20+, gh CLI, Chrome 요구사항을 확인한 뒤 npm ci, npm run build,
+npm run smoke:install을 실행해. 그리고 현재 에이전트가 Codex면
+npm run install-skills -- --target codex, Claude Code면
+npm run install-skills -- --target claude를 실행해줘.
+설치 경로와 검증 결과를 알려주고, ChatGPT 로그인과 GitHub 감시 범위는
+내 확인 없이 넓히거나 변경하지 마.
+```
+
+Codex와 Claude Code를 둘 다 쓰면 `--target all`로 한 번에 설치할 수 있다.
+새로 설치한 스킬은 다음 에이전트 세션에서 발견되는 것을 기본으로 한다.
+
+일반적인 코드 리뷰 요청과 혼동하지 않도록 자동 호출은 꺼져 있다. 사용할 때는
+`$gpt-chat-pr-review 스킬로 이 PR에 ChatGPT 리뷰어를 붙여줘`처럼 스킬 이름을
+명시한다. 읽기 전용인 `gpt-chat-pr-watch`는 PR 상태 확인이나 변화 대기 요청에
+자동으로 호출될 수 있다.
+
+### 직접 설치
+
 ```bash
 git clone https://github.com/lpaiu-cs/gpt-chat-pr-reviewer.git
 cd gpt-chat-pr-reviewer
-npm install
+npm ci
+npm run build
+npm run smoke:install
+npm run install-skills -- --target codex
 ```
+
+Claude Code는 `--target claude`, 둘 다는 `--target all`을 쓴다. 기본값은
+이미 존재하는 `~/.codex` 또는 `~/.claude`를 감지하고, 둘 다 없으면
+Codex에 설치한다. `--dest <skills-dir>`로 다른 에이전트의 skills 경로도
+지정할 수 있다.
 
 ## 시작하기
 
@@ -413,18 +456,26 @@ node scripts/notify.mjs --porcelain --pr myorg/api#34 \
 
 **상태 파일을 건드리지 않고 SSE만 읽으므로 별도 프로세스로 띄워도 안전합니다.** 의존성이 없어 `node scripts/notify.mjs`로 바로 돌고, `watch`를 재시작하면 알아서 다시 붙습니다. 잠깐 끊긴 사이에 일어난 전이도 재연결 후 첫 스냅샷에서 잡아냅니다 (`watch` 자체가 재시작된 경우에만 기준선을 새로 잡습니다).
 
-## 스킬 (Claude Code)
+## 에이전트 스킬 (Codex · Claude Code)
 
 코딩 세션이 자기 PR의 리뷰를 요청하고 결과를 기다릴 수 있게 하는 두 개의 스킬입니다.
+아래 기본 설치 명령은 두 스킬을 항상 함께 설치합니다.
 
 ```bash
-npm run install-skills   # skills/ → ~/.claude/skills/
+npm run install-skills -- --target codex
+npm run install-skills -- --target claude
+npm run install-skills -- --target all
 ```
+
+에이전트에게 설치를 맡기는 프롬프트와 수동 설치 절차는 [설치](#설치)를
+참고한다. 설치기는 `{{DAEMON}}`을 현재 저장소의 절대 경로로 치환하고
+스킬 폴더 전체(에이전트 UI 메타데이터 포함)를 복사한다. 저장소를
+옮겼으면 설치 명령을 다시 실행한다.
 
 | 스킬 | 하는 일 |
 |---|---|
-| `pr-review` | 리뷰 요청(`review`) · 결과 대기(`wait`) · 건너뛰기(`skip`) |
-| `pr-watch` | 상태 조회(`status`) · 변화 대기(`wait`) — **완전히 읽기 전용** |
+| `gpt-chat-pr-review` | ChatGPT 리뷰 요청(`review`) · 결과 대기(`wait`) · 건너뛰기(`skip`) |
+| `gpt-chat-pr-watch` | 상태 조회(`status`) · 변화 대기(`wait`) — **완전히 읽기 전용** |
 
 둘 다 **얇은 클라이언트**입니다. 리뷰를 직접 실행하지 않고 돌고 있는 watch에 요청만 넣습니다. 설계 선택이 아니라 이미 정해져 있던 것입니다 — 루프백 포트 잠금이 두 번째 실행을 커널 수준에서 막고, 브라우저 페이지가 하나뿐이라 리뷰는 직렬만 가능하며, 라운드가 2~15분이라 세션이 동기적으로 기다릴 수도 없습니다. **직렬화 지점은 데몬 하나**이고 세션들은 아무것도 다투지 않습니다.
 
@@ -494,7 +545,7 @@ npm run smoke   # 상태 머신 테스트
 npm run build   # dist/ 생성
 ```
 
-구조는 [CLAUDE.md](CLAUDE.md)를 참고하세요.
+구조와 에이전트 작업 지침은 [AGENTS.md](AGENTS.md)를 참고하세요.
 
 ---
 
