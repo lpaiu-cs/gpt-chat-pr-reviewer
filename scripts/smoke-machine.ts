@@ -1649,6 +1649,38 @@ const fakePR: PRInfo = {
   assert(typeof set !== 'string' && set.kind === 'scope-set', 'scope-set 은 받는다');
 }
 
+// ── 시나리오 41: 신선도 토큰 (라운드로는 못 재는 것) ───────
+{
+  // `wait` 는 "내 요청 이후에 결과가 나왔나" 를 판정해야 한다. 그 기준이
+  // 전이 횟수(history 길이)인 이유가 이 시나리오다 — 라운드로 재면 실패·쿼터·
+  // 닫힘을 전부 "예전 것" 으로 버리고 타임아웃까지 기다린다.
+  const ctx = createContext(fakePR);
+  const seq = (): number => ctx.history.length;
+
+  const atRequest = seq();
+  fire(ctx, 'START_REVIEW');
+  fire(ctx, 'REVIEW_FAILED', { note: '파싱 실패' });
+  assert(ctx.state === 'ERROR', '실패는 ERROR 로 전이한다');
+  assert(ctx.round === 0, '실패는 라운드를 올리지 않는다');
+  assert(seq() > atRequest, '그래도 전이 횟수는 늘어난다 (판정 가능)');
+
+  fire(ctx, 'RETRY');
+  const beforeQuota = seq();
+  const roundBeforeQuota = ctx.round;
+  fire(ctx, 'START_REVIEW');
+  fire(ctx, 'QUOTA_EXCEEDED');
+  assert(ctx.state === 'QUOTA_BLOCKED', '쿼터 한도는 QUOTA_BLOCKED');
+  assert(ctx.round === roundBeforeQuota, '쿼터도 라운드를 올리지 않는다');
+  assert(seq() > beforeQuota, '쿼터도 전이 횟수로는 잡힌다');
+
+  const beforeClose = seq();
+  const roundBeforeClose = ctx.round;
+  fire(ctx, 'PR_CLOSED');
+  assert(ctx.state === 'CLOSED', 'PR_CLOSED → CLOSED');
+  assert(ctx.round === roundBeforeClose, '닫힘도 라운드를 올리지 않는다');
+  assert(seq() > beforeClose, '닫힘도 전이 횟수로는 잡힌다');
+}
+
 // ── 시나리오 40: 데몬 안내 파일 ────────────────────────────
 {
   const dir = mkdtempSync(path.join(tmpdir(), 'pr-daemon-'));

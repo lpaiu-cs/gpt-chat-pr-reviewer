@@ -39,12 +39,12 @@ node "{{DAEMON}}" review owner/repo#12
 `review` 출력이 알려준 `wait` 명령을 **그대로** 쓴다:
 
 ```bash
-node "{{DAEMON}}" wait owner/repo#12 --since-round 1
+node "{{DAEMON}}" wait owner/repo#12 --since-seq 7
 ```
 
-`--since-round` 는 요청 시점의 라운드 번호다. 이게 없으면 **이전 라운드가 남긴
+`--since-seq` 는 요청 시점의 기준값이다. 이게 없으면 **이전 라운드가 남긴
 상태**(예: 1차의 `AWAITING_AUTHOR`)를 이번 요청의 결과로 오인해 즉시 깨어난다.
-직접 지어내지 말고 `review` 가 낸 값을 쓴다.
+직접 지어내지 말고 `review` 가 낸 값을 그대로 쓴다.
 
 이벤트 하나를 받으면 종료한다. 즉 **이 명령이 끝났다 = 확인할 게 생겼다.**
 대기하는 동안 사용자의 다른 요청을 계속 처리한다.
@@ -61,8 +61,8 @@ node "{{DAEMON}}" wait owner/repo#12 --since-round 1
 | `timeout` | 지정 시간 안에 아무 일도 없었음 | `status` 로 현황 확인 |
 
 대응 커밋을 push 하면 데몬이 새 커밋을 감지해 **다음 라운드를 자동으로 돈다.**
-`status` 로 지금 라운드를 확인하고 그 값으로 다시 `wait` 를 건다. approve 가 날
-때까지 이 왕복이 반복된다.
+`status --pr <ref> --json` 의 `seq` 를 읽어 그 값으로 다시 `wait` 를 건다.
+approve 가 날 때까지 이 왕복이 반복된다.
 
 ## 그 밖의 동사
 

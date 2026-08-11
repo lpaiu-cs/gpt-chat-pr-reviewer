@@ -191,6 +191,7 @@ function toCard(c: PRContext): ContextCard {
     conversationUrl: c.conversationUrl,
     conversationTurns: c.conversationUrl ? c.conversationTurns : undefined,
     updatedAt: c.updatedAt,
+    seq: c.history?.length ?? 0,
   };
 }
 

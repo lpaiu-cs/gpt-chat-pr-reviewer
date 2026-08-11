@@ -92,6 +92,15 @@ export interface ContextCard {
   conversationUrl?: string;
   conversationTurns?: number;
   updatedAt: string;
+  /**
+   * 지금까지 일어난 **상태 전이 횟수** (이벤트 히스토리 길이).
+   *
+   * "내 요청 이후에 무슨 일이 있었나" 를 판정하는 단조 증가 토큰이다.
+   * `round` 로는 안 된다 — 실패·쿼터 한도·PR 닫힘은 라운드를 올리지 않고
+   * 전이만 하므로, 라운드로 재면 그 결과들을 "예전 것" 으로 버린다.
+   * `updatedAt` 도 안 된다 — 스캔마다 갱신돼서 아무 일이 없어도 계속 움직인다.
+   */
+  seq: number;
 }
 
 export interface CycleInfo {

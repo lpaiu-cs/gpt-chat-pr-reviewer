@@ -39,8 +39,17 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_UI_PORT = 4478;
 /** UI 서버가 포트 충돌 시 물러서는 칸 수 (startUIServer 와 같아야 한다). */
 const UI_PORT_WALK = 10;
-/** 데몬이 떠서 /api/state 를 열 때까지 기다리는 시간. 브라우저 기동을 포함한다. */
+/** 데몬이 떠서 /api/state 를 열 때까지 기다리는 시간. */
 const START_TIMEOUT_MS = 90_000;
+/**
+ * 첫 스캔이 끝날 때까지 기다리는 시간.
+ *
+ * UI 는 **브라우저 기동보다 먼저** 열린다 (로그인 안내도 대시보드에 남아야
+ * 하므로). 그래서 `/api/state` 가 응답하는 시점에는 아직 아무 PR 도 안 보인다 —
+ * 그 상태를 "범위 밖" 으로 읽으면 멀쩡히 설정에 들어 있는 PR 에 대고 "범위를
+ * 넓히세요" 라고 답하게 된다. 브라우저 기동·로그인 확인까지 포함해서 넉넉히 준다.
+ */
+const FIRST_SCAN_TIMEOUT_MS = 180_000;
 const POLL_MS = 1_000;
 
 function config() {
@@ -93,7 +102,7 @@ function positionals() {
     const a = argv[i];
     if (a.startsWith('--')) {
       // 값을 받는 플래그면 그 값도 건너뛴다
-      if (['--pr', '--timeout', '--until', '--since-round'].includes(a)) i++;
+      if (['--pr', '--timeout', '--until', '--since-seq'].includes(a)) i++;
       continue;
     }
     out.push(a);
@@ -354,6 +363,36 @@ async function verbStatus() {
  * 게시할 수 있고, 게시는 되돌릴 수 없다. 출력으로 경고해봐야 이미 보낸 의도를
  * 막지 못한다. 그래서 넓히는 일은 사람이 설정이나 대시보드로 한다.
  */
+/**
+ * 첫 스캔이 끝난 뒤의 스냅샷을 돌려준다.
+ *
+ * `cycle.lastScanAt` 이 그 신호다 — 스캔이 한 번이라도 끝났으면 contexts 는
+ * "지금 아는 전부" 이므로 없는 PR 은 정말 없는 것이다. 그 전에는 판정 불가다.
+ */
+async function waitForFirstScan(ui) {
+  const deadline = Date.now() + FIRST_SCAN_TIMEOUT_MS;
+  for (;;) {
+    let state;
+    try {
+      state = await getState(ui);
+    } catch {
+      // 로그인 실패 등으로 데몬이 내려갔을 수 있다 — 조용히 기다리면 안 된다.
+      die(
+        `데몬과의 연결이 끊겼습니다. 로그를 확인하세요: ${path.join(dataDir(), 'watch.log')}\n` +
+          `(ChatGPT 로그인이 만료됐다면 ${ROOT} 에서 \`npm run setup\`)`,
+      );
+    }
+    if (state.snapshot?.cycle?.lastScanAt) return state;
+    if (Date.now() >= deadline) {
+      die(
+        `${Math.round(FIRST_SCAN_TIMEOUT_MS / 1000)}초 안에 첫 스캔이 끝나지 않았습니다.\n` +
+          `  대시보드 ${ui} 와 로그 ${path.join(dataDir(), 'watch.log')} 를 확인하세요.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+}
+
 function outOfScope(key) {
   return (
     `${key} 는 감시 범위 밖입니다.\n` +
@@ -390,9 +429,13 @@ async function verbReview() {
     );
   }
 
-  // **이미 추적 중인 PR 만 리뷰한다.** 범위를 넓히지 않으므로 여기 없으면
-  // 그건 사람이 결정할 일이다 (outOfScope 주석 참고).
-  const card = cardsFor(await getState(ui), ref)[0];
+  // **첫 스캔이 끝나기 전에는 아무것도 단정하지 않는다.** 카드가 없다는 건
+  // "범위 밖" 일 수도 있고 "아직 안 봤다" 일 수도 있는데, 둘을 구분하지 않으면
+  // 멀쩡히 설정에 들어 있는 PR 에 대고 범위를 넓히라고 답하게 된다.
+  const state = await waitForFirstScan(ui);
+
+  // 이제 없으면 정말 범위 밖이다 (또는 닫혔거나). 넓히는 건 사람이 정한다.
+  const card = cardsFor(state, ref)[0];
   if (!card) die(outOfScope(key), { outOfScope: true });
 
   // 필터에 걸린 PR 은 큐에 오르지 않는다. 여기서 멈추고 알린다 —
@@ -405,16 +448,21 @@ async function verbReview() {
 
   await postIntent(ui, { kind: 'review-now', ref: key });
 
-  // **지금 라운드 번호를 같이 낸다.** wait 가 "이 요청의 결과" 와 "이전 라운드가
+  // **지금 전이 횟수를 같이 낸다.** wait 가 "이 요청의 결과" 와 "이전 라운드가
   // 남긴 상태" 를 구분하려면 기준점이 필요하다 — 이게 없으면 AWAITING_AUTHOR
   // 로 남아 있던 이전 결과를 새 결과로 오인해 즉시 깨어난다.
-  const sinceRound = card.round ?? 0;
+  //
+  // 라운드 번호가 아니라 전이 횟수인 이유: 실패·쿼터 한도·PR 닫힘은 라운드를
+  // 올리지 않는다. 라운드로 재면 요청 직후에 실패하거나 한도에 걸린 경우를
+  // "예전 것" 으로 버리고, 45분 뒤 timeout 으로 끝나 원인까지 잘못 전한다
+  // (쿼터는 실제로는 몇 시간짜리 대기다).
+  const sinceSeq = card.seq ?? 0;
   const self = path.join(ROOT, 'scripts', 'daemon.mjs').replace(/\\/g, '/');
   out(
     `${key} 를 리뷰 큐 맨 앞에 넣었습니다 (현재 ${card.stateLabel ?? card.state}).\n` +
       `결과를 기다리려면 (백그라운드로):\n` +
-      `  node "${self}" wait ${key} --since-round ${sinceRound}`,
-    { ok: true, ui, key, state: card.state, sinceRound },
+      `  node "${self}" wait ${key} --since-seq ${sinceSeq}`,
+    { ok: true, ui, key, state: card.state, sinceSeq },
   );
 }
 
@@ -440,10 +488,10 @@ async function verbWait() {
     '--until', until,
     '--timeout', timeout,
   ];
-  // review 가 알려준 기준 라운드. 그 **이후** 결과만 이미 도달한 것으로 인정한다
-  // (notify.mjs 참고). 없으면 붙은 뒤의 전이만 본다.
-  const since = value('--since-round', null);
-  if (since !== null) args.push('--since-round', since);
+  // review 가 알려준 기준 전이 횟수. 그 **이후** 결과만 이미 도달한 것으로
+  // 인정한다 (notify.mjs 참고). 없으면 붙은 뒤의 전이만 본다.
+  const since = value('--since-seq', null);
+  if (since !== null) args.push('--since-seq', since);
   const child = spawn(process.execPath, args, { stdio: 'inherit', windowsHide: true });
   child.on('exit', (code) => process.exit(code ?? 0));
 }
@@ -470,9 +518,9 @@ async function main() {
 
     status [--pr <ref>] [--json]  현재 상태
     skip   <ref>                이 PR 은 리뷰하지 않는다
-    wait   <ref> [--since-round <n>] [--timeout <초>] [--until <이벤트>]
+    wait   <ref> [--since-seq <n>] [--timeout <초>] [--until <이벤트>]
                                 결과까지 대기 (백그라운드로 실행할 것)
-                                --since-round 는 review 가 알려준 값을 그대로
+                                --since-seq 는 review 가 알려준 값을 그대로
 
   <ref> 는 owner/repo#12 또는 PR URL.
 
