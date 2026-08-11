@@ -345,6 +345,25 @@ function onSnapshot(s) {
     baselined = true;
     const watching = s.contexts.filter((c) => matchesFilter(c.key));
 
+    /**
+     * 붙기 **전에** 이미 끝나 있던 경우 (--until 모드 한정).
+     *
+     * `review` 와 `wait` 는 별도 프로세스라 그 사이에 라운드가 끝날 수 있다.
+     * 기준선은 전이만 보므로 그 결과는 영영 안 오고, 기본 45분 타임아웃까지
+     * 기다리게 된다 — 이미 답이 나와 있는데 아무도 모르는 상태다.
+     *
+     * 계속 구독하는 모드에서는 하지 않는다. 거기서는 "지금 상태" 를 이벤트로
+     * 쏟으면 재연결마다 같은 소식이 반복된다 (기준선을 두는 이유가 그것이다).
+     */
+    if (UNTIL.size > 0) {
+      for (const c of watching) {
+        const event = STATE_EVENT[c.state];
+        if (!event || !UNTIL.has(event)) continue;
+        emit(event, c, `${c.round}라운드 · 이미 도달한 상태`);
+        return;
+      }
+    }
+
     if (PORCELAIN) {
       console.log(
         `connected  ${FILTERS.length ? FILTERS.map((f) => f.label).join(',') : '전체'}  ` +

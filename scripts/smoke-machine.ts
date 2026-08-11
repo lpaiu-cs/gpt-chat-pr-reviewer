@@ -39,7 +39,13 @@ import {
 } from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
 import { parseIntent } from '../src/ui/server.js';
-import { publishDaemonFile, readDaemonFile, clearDaemonFile } from '../src/daemon-file.js';
+import {
+  publishDaemonFile,
+  readDaemonFile,
+  clearDaemonFile,
+  instanceId,
+} from '../src/daemon-file.js';
+import { createHash } from 'node:crypto';
 import {
   admitsNewPR,
   createRepoSource,
@@ -1671,7 +1677,22 @@ const fakePR: PRInfo = {
   clearDaemonFile(dir);
   assert(readDaemonFile(dir) === null, '내가 쓴 것은 지운다');
 
+  // 설치본 식별자 — 포트만 보고 남의 데몬에 붙는 걸 막는 근거다.
+  const other = mkdtempSync(path.join(tmpdir(), 'pr-daemon2-'));
+  assert(instanceId(dir) === instanceId(dir), 'instance 는 같은 dataDir 에서 안정적이다');
+  assert(instanceId(dir) !== instanceId(other), 'dataDir 이 다르면 instance 도 다르다');
+  assert(
+    instanceId(dir) === instanceId(path.join(dir, 'x', '..')),
+    'instance 는 경로를 해석한 뒤 계산한다',
+  );
+
+  // scripts/daemon.mjs 는 의존성 없이 돌아야 해서 같은 계산을 JS 로 복제한다.
+  // 갈라지면 클라이언트가 자기 데몬을 영영 못 알아본다 — 여기서 붙잡는다.
+  const jsSide = createHash('sha1').update(path.resolve(dir)).digest('hex').slice(0, 16);
+  assert(jsSide === instanceId(dir), 'daemon.mjs 의 instance 계산과 일치한다');
+
   rmSync(dir, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
 }
 
 // ── 결과 ────────────────────────────────────────────────────

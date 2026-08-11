@@ -15,7 +15,21 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
+
+/**
+ * 이 설치본의 식별자 — 해석된 dataDir 의 해시.
+ *
+ * 잠금은 dataDir 단위인데 대시보드 포트는 머신 전체에서 공유된다. 체크아웃이
+ * 둘이면 (worktree 를 포함해) 서로 다른 설치본의 데몬이 4478·4479 에 동시에
+ * 뜰 수 있고, 붙는 쪽이 포트만 보고 고르면 **남의 설정·계정으로** 리뷰를
+ * 요청하거나 남의 데몬을 종료한다. 잠금 포트가 `dirKey` 로 신원을 밝히는 것과
+ * 같은 이유·같은 방식이다.
+ */
+export function instanceId(dataDir: string): string {
+  return createHash('sha1').update(path.resolve(dataDir)).digest('hex').slice(0, 16);
+}
 
 export interface DaemonInfo {
   /** 대시보드 origin — `http://127.0.0.1:4478` */

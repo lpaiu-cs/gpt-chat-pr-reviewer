@@ -28,8 +28,8 @@ import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
-import { acquireLock, LockHeldError, LockPortBusyError } from './lock.js';
-import { publishDaemonFile, readDaemonFile, clearDaemonFile } from './daemon-file.js';
+import { acquireLock, probeLock, LockHeldError, LockPortBusyError } from './lock.js';
+import { publishDaemonFile, readDaemonFile, clearDaemonFile, instanceId } from './daemon-file.js';
 import {
   admitsNewPR,
   createRepoSource,
@@ -442,6 +442,10 @@ program
   .option('--observe', '감시·동기화만 하고 리뷰는 실행하지 않는다 (브라우저·한도 소비 없음)', false)
   .option('--ui', '관측 대시보드를 localhost 에 띄운다 (읽기 전용)', false)
   .option('--ui-port <port>', `대시보드 포트 (기본 ${DEFAULT_UI_PORT})`)
+  .option(
+    '--include <patterns>',
+    '감시 범위를 이 패턴으로 시작한다 (쉼표 구분). 설정이 비어 있을 때 첫 기동용',
+  )
   .action(async (opts: {
     headless: boolean;
     dryRun: boolean;
@@ -449,6 +453,7 @@ program
     observe: boolean;
     ui: boolean;
     uiPort?: string;
+    include?: string;
   }) => {
     banner();
     const cfg = loadConfig();
@@ -468,6 +473,23 @@ program
     // 도달하면 4479 에 조용히 붙어 "정상" 처럼 보인다 — 실제로 그렇게 사고가 났다.
     const releaseLock = await lockOrExplain(cfg, 'watch');
     if (!releaseLock) return;
+
+    // 첫 기동 부트스트랩. 설정의 include 가 비어 있으면 resolveWatchScope 가
+    // null 을 돌려주고 **UI 를 열기도 전에** 종료하는데, 그러면 붙어서
+    // `scope-add` 를 넣으려던 클라이언트는 영영 문을 못 찾는다 (닭이 먼저냐
+    // 문제다). 그래서 기동 시점에 씨앗을 받는다. 메모리에만 반영하고 저장은
+    // 하지 않는다 — 뒤따르는 `scope-add` 가 정식 경로로 영속화한다.
+    if (opts.include) {
+      const seeds = opts.include.split(',').map((s) => s.trim()).filter(Boolean);
+      if (seeds.length > 0) {
+        const base = cfg.watch ?? { mode: 'account' as const, include: [], exclude: [] };
+        cfg.watch = {
+          ...base,
+          include: [...new Set([...(base.include ?? []), ...seeds])],
+        };
+        console.log(chalk.dim(`  감시 범위 씨앗: ${seeds.join(', ')}`));
+      }
+    }
 
     const scope = resolveWatchScope(cfg);
     if (!scope) {
@@ -877,6 +899,9 @@ program
           startedAt: Date.now(),
           scope: describeScope(scope),
           dryRun: opts.dryRun,
+          // 붙는 쪽이 "이게 내 설치본의 데몬인가" 를 판정할 근거 (daemon-file.ts).
+          instance: instanceId(cfg.dataDir),
+          mode: opts.observe ? 'observe' : 'review',
         });
         console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
 
@@ -1381,8 +1406,17 @@ program
 
 const STOP_PORT_WALK = 10;
 
-/** 살아 있는 대시보드를 찾는다 — 기록된 주소 우선, 없으면 기본 포트 주변. */
-async function findDashboard(recorded: string | null): Promise<string | null> {
+/**
+ * **이 설치본의** 살아 있는 대시보드를 찾는다.
+ *
+ * 포트가 열려 있다는 것만으로 받아들이면 안 된다 — 잠금은 dataDir 단위인데
+ * 포트는 머신 전체에서 공유되므로, 체크아웃이 둘이면 4478·4479 에 서로 다른
+ * 설치본의 데몬이 뜬다. 그대로 붙으면 남의 데몬을 종료하게 된다.
+ * 그래서 스냅샷의 instance 를 대조하고, **밝히지 않는 데몬은 거부한다**
+ * (구버전이다 — 모르는 값으로 전진하면 그게 바로 막으려던 사고다).
+ */
+async function findDashboard(dataDir: string, recorded: string | null): Promise<string | null> {
+  const want = instanceId(dataDir);
   const candidates = recorded ? [recorded] : [];
   for (let i = 0; i < STOP_PORT_WALK; i++) {
     const u = `http://127.0.0.1:${DEFAULT_UI_PORT + i}`;
@@ -1391,7 +1425,9 @@ async function findDashboard(recorded: string | null): Promise<string | null> {
   for (const ui of candidates) {
     try {
       const res = await fetch(`${ui}/api/state`, { signal: AbortSignal.timeout(1_500) });
-      if (res.ok) return ui;
+      if (!res.ok) continue;
+      const body = (await res.json()) as { snapshot?: { instance?: string | null } };
+      if (body.snapshot?.instance === want) return ui;
     } catch {
       /* 다음 후보 */
     }
@@ -1406,19 +1442,28 @@ program
   .action(async (opts: { now: boolean }) => {
     const cfg = loadConfig();
     const info = readDaemonFile(cfg.dataDir);
-    const ui = await findDashboard(info?.ui ?? null);
 
     if (opts.now) {
-      if (!info?.pid) {
-        console.log(chalk.red('  ✗ 실행 중인 데몬의 pid 를 찾지 못했습니다.'));
-        console.log(chalk.dim(`    ${cfg.dataDir}/daemon.json 이 없습니다 — 대시보드가 없는 데몬일 수 있습니다.`));
+      // **pid 는 안내 파일이 아니라 잠금에서 얻는다.** daemon.json 은 강제
+      // 종료·크래시 뒤에 남을 수 있고, 그 사이 OS 가 pid 를 재사용했으면
+      // 거기 적힌 번호는 무관한 프로세스를 가리킨다 — 그걸 죽이면 남의
+      // 작업을 날린다. 포트를 쥔 쪽만이 지금 살아 있는 주인이다.
+      const owner = await probeLock(cfg.dataDir);
+      if (owner === 'gone') {
+        console.log(chalk.dim('  실행 중인 데몬이 없습니다 (잠금이 비어 있습니다).'));
+        if (info) console.log(chalk.dim(`    ${cfg.dataDir}/daemon.json 은 잔여물입니다 — 무시합니다.`));
+        return;
+      }
+      if (owner === 'foreign') {
+        console.log(chalk.red('  ✗ 잠금 포트를 다른 프로그램이 쓰고 있어 주인을 확인할 수 없습니다.'));
+        console.log(chalk.dim('    확인되지 않은 pid 는 종료하지 않습니다.'));
         return;
       }
       // 진행 중인 라운드가 있으면 이미 소비한 대화 한도가 버려진다. 그래도
       // 응답이 멎어 15분을 기다리는 상황에서는 이 문이 필요하다.
       try {
-        process.kill(info.pid);
-        console.log(chalk.yellow(`  ■ 데몬(pid ${info.pid})을 즉시 종료했습니다.`));
+        process.kill(owner.pid);
+        console.log(chalk.yellow(`  ■ 데몬(pid ${owner.pid} · ${owner.command})을 즉시 종료했습니다.`));
         console.log(chalk.dim('    진행 중이던 라운드가 있었다면 그 응답은 버려집니다.'));
       } catch (e) {
         console.log(chalk.red(`  ✗ 종료하지 못했습니다: ${e instanceof Error ? e.message : String(e)}`));
@@ -1427,8 +1472,16 @@ program
       return;
     }
 
+    const ui = await findDashboard(cfg.dataDir, info?.ui ?? null);
+
     if (!ui) {
-      console.log(chalk.dim('  실행 중인 데몬을 찾지 못했습니다 (이미 종료된 것으로 보입니다).'));
+      console.log(chalk.dim('  이 설치본의 대시보드를 찾지 못했습니다.'));
+      console.log(
+        chalk.dim(
+          '    이미 종료됐거나, --ui 없이 떠 있거나, instance 를 알리지 않는 구버전일 수 있습니다.',
+        ),
+      );
+      console.log(chalk.dim('    프로세스를 확실히 끝내려면  npm run dev -- stop --now'));
       return;
     }
 

@@ -25,6 +25,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, openSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -56,6 +57,14 @@ function config() {
 
 function dataDir() {
   return path.resolve(ROOT, config().dataDir ?? './data');
+}
+
+/**
+ * 이 설치본의 식별자 — `src/daemon-file.ts` 의 `instanceId` 와 **같은 계산**이다.
+ * 갈라지면 클라이언트가 자기 데몬을 못 알아본다.
+ */
+function instanceId() {
+  return createHash('sha1').update(dataDir()).digest('hex').slice(0, 16);
 }
 
 /** 실행 중인 데몬의 주소·신원. watch 가 기동 시 쓰고 종료 시 지운다. */
@@ -153,24 +162,42 @@ async function postIntent(ui, body) {
   return json;
 }
 
-/** 살아 있는 데몬의 URL 을 찾는다. 없으면 null. */
+/**
+ * **이 설치본의** 살아 있는 데몬을 찾는다. 없으면 null.
+ *
+ * 포트가 열려 있다는 것만으로 받아들이면 안 된다. 잠금은 dataDir 단위인데
+ * 대시보드 포트는 머신 전체에서 공유되므로, 체크아웃이 둘이면(worktree 포함)
+ * 4478·4479 에 서로 다른 설치본의 데몬이 동시에 뜬다. 그대로 붙으면 **남의
+ * 설정·계정으로** 리뷰를 요청하게 되고, 그건 게시된 뒤에야 드러난다.
+ *
+ * instance 를 밝히지 않는 데몬은 **거부한다.** 구버전이라는 뜻인데, 모르는
+ * 값으로 전진하는 게 정확히 막으려던 사고다. 재시작하면 풀린다.
+ */
 async function findDaemon() {
   const recorded = readDaemonFile()?.ui;
+  const want = instanceId();
   const candidates = [];
   if (recorded) candidates.push(recorded);
   // 기록이 없거나 낡았을 수 있다 — UI 는 포트가 막히면 옆으로 물러선다.
-  // 구버전 데몬(daemon.json 을 안 쓰는)도 이 폴백으로 잡힌다.
   for (let i = 0; i < UI_PORT_WALK; i++) {
     const u = `http://127.0.0.1:${DEFAULT_UI_PORT + i}`;
     if (u !== recorded) candidates.push(u);
   }
+  let sawStranger = false;
   for (const ui of candidates) {
     try {
       const s = await getState(ui, 1_500);
-      if (s && s.snapshot) return ui;
+      if (!s || !s.snapshot) continue;
+      if (s.snapshot.instance === want) return { ui, mode: s.snapshot.mode ?? 'review' };
+      sawStranger = true;
     } catch {
       /* 다음 후보 */
     }
+  }
+  if (sawStranger) {
+    process.stderr.write(
+      '  (다른 설치본 또는 구버전 데몬이 같은 포트 대역에 떠 있습니다 — 붙지 않습니다)\n',
+    );
   }
   return null;
 }
@@ -186,14 +213,21 @@ async function findDaemon() {
  * 못 없애고, 없앨 필요도 없다. 띄우고 나서 **누구의 것이든** 살아 있는
  * 데몬에 붙으면 된다.
  */
-function launch() {
+function launch(seed) {
   mkdirSync(dataDir(), { recursive: true });
   const log = openSync(path.join(dataDir(), 'watch.log'), 'a');
 
-  const dist = path.join(ROOT, 'dist', 'cli.js');
-  const args = existsSync(dist)
-    ? [dist, 'watch', '--ui']
-    : ['--import', 'tsx', path.join(ROOT, 'src', 'cli.ts'), 'watch', '--ui'];
+  // **소스가 있으면 소스를 쓴다.** `dist/` 는 gitignore 대상이라 브랜치를 바꾸거나
+  // 새로 pull 한 체크아웃에 낡은 빌드가 그대로 남아 있을 수 있다. 그걸 띄우면
+  // 구버전 서버가 뜨고, 새 클라이언트의 intent 가 거부돼 스킬이 조용히 안 된다.
+  // 존재 여부는 신선도가 아니다.
+  const src = path.join(ROOT, 'src', 'cli.ts');
+  const args = existsSync(src)
+    ? ['--import', 'tsx', src, 'watch', '--ui']
+    : [path.join(ROOT, 'dist', 'cli.js'), 'watch', '--ui'];
+  // 설정의 include 가 비어 있으면 watch 는 UI 를 열기도 전에 종료한다.
+  // 첫 기동이 그 상태면 붙어서 범위를 넣을 방법이 없으므로 씨앗을 들려 보낸다.
+  if (seed) args.push('--include', seed);
 
   const child = spawn(process.execPath, args, {
     cwd: ROOT, // dataDir·설정 파일 경로가 cwd 상대다
@@ -205,16 +239,31 @@ function launch() {
   return child.pid;
 }
 
-async function ensure({ quiet = false } = {}) {
-  const existing = await findDaemon();
-  if (existing) return { ui: existing, started: false };
+/**
+ * 데몬을 찾는다. `start` 가 참일 때만 없으면 띄운다.
+ *
+ * **관측용 동사는 띄우지 않는다.** 일반 watch 는 브라우저를 열고 범위 안의
+ * REVIEW_DUE PR 을 자동으로 리뷰한다 — 상태만 보려던 호출이 ChatGPT 한도를
+ * 쓰고 GitHub 에 리뷰를 게시하면, 그건 요청한 적 없는 부작용이다. 비용을
+ * 만드는 것은 비용을 의도한 동사(`review`)뿐이다.
+ */
+async function ensure({ start = false, seed = null } = {}) {
+  const found = await findDaemon();
+  if (found) return { ...found, started: false };
+  if (!start) {
+    die(
+      '이 설치본의 리뷰 데몬이 돌고 있지 않습니다.\n' +
+        `  시작하려면 (브라우저·ChatGPT 한도를 씁니다):  node "${path.join(ROOT, 'scripts', 'daemon.mjs').replace(/\\/g, '/')}" review <PR>\n` +
+        `  또는 ${ROOT} 에서  npm run dev -- watch --ui`,
+    );
+  }
 
-  const pid = launch();
+  launch(seed);
   const deadline = Date.now() + START_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, POLL_MS));
-    const ui = await findDaemon();
-    if (ui) return { ui, started: true, pid };
+    const d = await findDaemon();
+    if (d) return { ...d, started: true };
     if (Date.now() >= deadline) {
       die(
         `데몬이 ${Math.round(START_TIMEOUT_MS / 1000)}초 안에 뜨지 않았습니다.\n` +
@@ -222,10 +271,6 @@ async function ensure({ quiet = false } = {}) {
           `(ChatGPT 로그인이 만료됐다면 사람이 개입해야 합니다 — ` +
           `${ROOT} 에서 \`npm run setup\`)`,
       );
-    }
-    if (!quiet && Date.now() - deadline + START_TIMEOUT_MS > 15_000) {
-      // 브라우저 기동까지 포함하면 십수 초가 걸린다 — 조용하면 멈춘 줄 안다
-      process.stderr.write('.');
     }
   }
 }
@@ -274,21 +319,22 @@ function describeCard(c) {
 // ── 동사 ────────────────────────────────────────────────────
 
 async function verbEnsure() {
-  const { ui, started } = await ensure();
+  const { ui, started, mode } = await ensure({ start: true });
   if (JSON_OUT) {
-    console.log(JSON.stringify({ ok: true, ui, started, root: ROOT }));
+    console.log(JSON.stringify({ ok: true, ui, started, mode, root: ROOT }));
     return;
   }
   if (started) console.log(startedNotice(ui));
-  else console.log(`데몬이 이미 돌고 있습니다 — ${ui}`);
+  else console.log(`데몬이 이미 돌고 있습니다 — ${ui} (${mode})`);
 }
 
 async function verbStatus() {
-  const ui = await findDaemon();
-  if (!ui) {
-    out('데몬이 돌고 있지 않습니다.', { ok: true, running: false });
+  const found = await findDaemon();
+  if (!found) {
+    out('이 설치본의 데몬이 돌고 있지 않습니다.', { ok: true, running: false });
     return;
   }
+  const { ui } = found;
   const state = await getState(ui);
   const ref = value('--pr', null) ? parseRef(value('--pr', null)) : null;
   if (value('--pr', null) && !ref) die(`잘못된 PR 참조: ${value('--pr', null)}`);
@@ -314,18 +360,21 @@ async function addScope(ui, slug) {
 async function verbTrack() {
   const refs = positionals().map(parseRef);
   if (refs.length === 0 || refs.some((r) => !r)) die('추적할 PR 또는 레포를 지정하세요.');
-  const { ui, started } = await ensure();
+  // 데몬을 띄우지 않는다 — 추적은 관측이고, 기동은 리뷰를 시작시킨다.
+  const { ui } = await ensure({ start: false });
   const slugs = [...new Set(refs.map((r) => r.slug))];
   for (const slug of slugs) await addScope(ui, slug);
-  if (started && !JSON_OUT) console.log(startedNotice(ui) + '\n');
-  out(`감시 범위에 추가했습니다: ${slugs.join(', ')}`, { ok: true, ui, added: slugs, started });
+  out(
+    `감시 범위에 추가했습니다: ${slugs.join(', ')}\n` +
+      `주의: 이 레포의 다른 열린 PR 도 리뷰 대상이 될 수 있습니다 (필터 설정에 따름).`,
+    { ok: true, ui, added: slugs },
+  );
 }
 
 async function verbSkip() {
   const ref = parseRef(positionals()[0]);
   if (!ref || ref.number === null) die('건너뛸 PR 을 owner/repo#12 형식으로 지정하세요.');
-  const ui = await findDaemon();
-  if (!ui) die('데몬이 돌고 있지 않습니다.');
+  const { ui } = await ensure({ start: false });
   await postIntent(ui, { kind: 'skip-add', ref: refKey(ref) });
   out(`${refKey(ref)} 는 리뷰하지 않습니다.`, { ok: true, skipped: refKey(ref) });
 }
@@ -334,15 +383,32 @@ async function verbReview() {
   const ref = parseRef(positionals()[0]);
   if (!ref || ref.number === null) die('리뷰할 PR 을 owner/repo#12 형식으로 지정하세요.');
   const key = refKey(ref);
-  const { ui, started } = await ensure();
+  // 비용을 의도한 동사다 — 데몬이 없으면 여기서 띄운다. 설정 범위가 비어 있어도
+  // 뜰 수 있도록 이 PR 의 레포를 씨앗으로 들려 보낸다.
+  const { ui, started, mode } = await ensure({ start: true, seed: ref.slug });
   if (started && !JSON_OUT) console.log(startedNotice(ui) + '\n');
+
+  // 관측 모드 데몬은 큐만 쌓고 실행하지 않는다. 202 를 받아두면 "요청했다" 고
+  // 답해놓고 영영 아무 일도 안 일어난다 — 재시작은 사람이 결정할 일이므로
+  // 여기서는 사실만 알리고 멈춘다.
+  if (mode === 'observe') {
+    die(
+      `데몬이 관측 모드(--observe)로 떠 있어 리뷰를 실행하지 않습니다.\n` +
+        `  리뷰가 필요하면 사용자가 데몬을 --observe 없이 다시 띄워야 합니다.`,
+      { mode },
+    );
+  }
 
   // 추적 중이 아니면 레포를 범위에 넣고 첫 스캔에 잡힐 때까지 기다린다.
   // `review-now` 는 추적 중이 아닌 PR 을 거절하는데, 그건 옳은 동작이다 —
   // 여기서 순서를 맞춰 주는 게 서버가 예외를 만드는 것보다 낫다.
+  // 범위 추가는 **언제나** 보낸다. 멱등이고(이미 있으면 루프가 무동작으로
+  // 접는다), 기동 씨앗(`--include`)은 메모리에만 있으므로 설정 파일에
+  // 영속화하는 경로가 여기뿐이다.
+  await addScope(ui, ref.slug);
+
   let card = cardsFor(await getState(ui), ref)[0];
   if (!card) {
-    await addScope(ui, ref.slug);
     const deadline = Date.now() + TRACK_TIMEOUT_MS;
     while (!card && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, POLL_MS * 2));
@@ -382,8 +448,7 @@ async function verbReview() {
 async function verbWait() {
   const ref = parseRef(positionals()[0]);
   if (!ref) die('기다릴 PR 을 owner/repo#12 형식으로 지정하세요.');
-  const ui = await findDaemon();
-  if (!ui) die('데몬이 돌고 있지 않습니다. 먼저 ensure 를 실행하세요.');
+  const { ui } = await ensure({ start: false });
 
   const until = value('--until', 'posted,converged,failed,quota,closed');
   const timeout = value('--timeout', '2700');
@@ -415,10 +480,13 @@ async function main() {
     console.log(`
   PR 리뷰 데몬 클라이언트
 
-    ensure                      데몬이 없으면 띄운다 (멱등)
+    ensure                      데몬이 없으면 띄운다 (멱등) ← 브라우저·한도를 쓴다
+    review <ref>                리뷰 큐 맨 앞으로 (필요하면 데몬을 띄운다)
+
+  아래는 **데몬을 띄우지 않는다** (돌고 있지 않으면 그 사실을 알린다):
+
     status [--pr <ref>] [--json]  현재 상태
     track  <ref...>             레포를 감시 범위에 추가
-    review <ref>                리뷰 큐 맨 앞으로
     skip   <ref>                이 PR 은 리뷰하지 않는다
     wait   <ref> [--timeout <초>] [--until <이벤트>]
                                 결과까지 대기 (백그라운드로 실행할 것)

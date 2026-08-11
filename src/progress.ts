@@ -136,6 +136,18 @@ export interface Snapshot {
    * 전부 "이미 본 것" 으로 버린다 (재연결 자체는 EventSource 가 알아서 한다).
    */
   session: string;
+  /**
+   * 이 데몬이 **어느 설치본**인지 (dataDir 기준). 세션 id 와 다르다 — 저건
+   * 프로세스마다 새로 만들고, 이건 재시작해도 같다.
+   *
+   * 잠금은 dataDir 단위인데 UI 포트는 머신 전체에서 공유된다. 그래서 체크아웃이
+   * 둘이면 4478·4479 에 서로 다른 설치본의 데몬이 동시에 존재할 수 있고, 붙는
+   * 쪽이 포트만 보고 고르면 **남의 설정·계정으로** 리뷰를 요청하거나 남의
+   * 데몬을 종료하게 된다. 클라이언트는 자기 dataDir 로 같은 값을 계산해 대조한다.
+   */
+  instance: string | null;
+  /** 'observe' 면 리뷰를 실행하지 않는다 — 리뷰를 요청해도 큐에만 쌓인다. */
+  mode: 'review' | 'observe';
   control: ControlState;
   startedAt: number;
   scope: string;
@@ -199,6 +211,8 @@ const LOG_CAP = 600;
 function emptySnapshot(session: string): Snapshot {
   return {
     session,
+    instance: null,
+    mode: 'review',
     control: {
       mode: '',
       paused: false,
