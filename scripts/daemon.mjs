@@ -376,19 +376,22 @@ async function fetchState(ui) {
 }
 
 /**
- * 그 PR 의 카드를 찾는다. **없다는 사실은 신선한 스캔으로만 확정한다.**
+ * 그 PR 의 카드를 찾는다. **없다는 사실은 그 레포를 실제로 조회한 뒤에만 믿는다.**
  *
- * 카드가 없는 데는 두 가지 이유가 있고 결론이 정반대다:
- *   · 정말 범위 밖이다 → 사람이 범위를 넓혀야 한다
- *   · 아직 스캔이 그 PR 을 못 봤다 → 곧 보인다
+ * 카드가 없는 데는 서로 다른 이유가 있고 결론이 정반대다:
+ *   · 그 PR 이 없다 (번호 오류·닫힘) → 사람이 확인할 일
+ *   · 그 레포가 감시 대상이 아니다 → 사람이 범위를 넓힐 일
+ *   · 아직 그 레포를 조회하지 않았다 → 곧 보인다, 기다리면 된다
  *
- * 후자를 전자로 읽으면 멀쩡한 PR 에 대고 "범위를 넓히세요" 라고 답한다. 그런데
- * 스킬이 내세우는 대표 경로가 **"PR 을 만든 직후 리뷰"** 라서, 마지막 스캔이
- * 그 PR 생성보다 앞선 상황이 오히려 흔하다. 그래서 **요청 이후에 끝난 스캔**을
- * 본 뒤에만 범위 밖으로 확정한다 (cold start 의 "아직 한 번도 안 스캔함" 도
- * 같은 조건으로 덮인다).
+ * 마지막을 앞의 것으로 읽으면 멀쩡한 PR 을 거부한다. 그런데 스킬의 대표 경로가
+ * **"PR 을 만든 직후 리뷰"** 라 하필 그 상황이 가장 흔하다.
  *
- * 있으면 즉시 돌려준다 — 흔한 경로에 대기를 붙이지 않는다.
+ * 전역 `lastScanAt` 으로는 판정할 수 없다. 사이클은 매번 끝나지만
+ * `probeIdleIntervalMs`(기본 60초) 안에 있는 레포는 조회를 건너뛰므로,
+ * "방금 스캔했다" 가 참인데 그 레포는 안 본 상태가 정상적으로 발생한다.
+ * 그래서 **레포별** 조회 시각(`cycle.probedAt`)이 우리 요청보다 뒤인지를 본다.
+ *
+ * 카드가 있으면 즉시 돌려준다 — 흔한 경로에 대기를 붙이지 않는다.
  */
 async function resolveCard(ui, ref, key) {
   const askedAt = Date.now();
@@ -398,31 +401,41 @@ async function resolveCard(ui, ref, key) {
 
   const deadline = askedAt + FRESH_SCAN_TIMEOUT_MS;
   for (;;) {
+    // 그 레포를 **우리 요청 뒤에** 실제로 조회했는데도 없으면, 그때는 PR 쪽 문제다.
+    const probedAt = state.snapshot?.cycle?.probedAt ?? {};
+    if (Number(probedAt[ref.slug]) > askedAt) die(prNotFound(key), { notFound: true });
+
     if (Date.now() >= deadline) {
+      // 끝내 조회 기록을 못 봤다. 범위 밖일 가능성이 가장 크지만 **단정하지
+      // 않는다** — 리뷰가 도는 동안에는 스캔 자체가 밀린다.
       const active = state.snapshot?.active;
       die(
-        `${key} 를 확인하지 못했습니다 — 요청 이후의 스캔이 ` +
-          `${Math.round(FRESH_SCAN_TIMEOUT_MS / 1000)}초 안에 끝나지 않았습니다.\n` +
-          (active
-            ? `  ${active.key} ${active.round}차 리뷰가 진행 중이라 스캔이 밀려 있습니다.\n`
-            : `  대시보드 ${ui} 를 확인하세요.\n`) +
-          `  범위 밖이라고 단정하지 않습니다 — 잠시 뒤 다시 시도하세요.`,
+        repoNotWatched(key, ref.slug, state.snapshot?.control?.include ?? []) +
+          (active ? `\n  (지금 ${active.key} ${active.round}차 리뷰 중이라 스캔이 밀려 있습니다)` : ''),
+        { outOfScope: true },
       );
     }
     await new Promise((r) => setTimeout(r, POLL_MS));
     state = await fetchState(ui);
     card = cardsFor(state, ref)[0];
     if (card) return card;
-    // 우리 요청 **뒤에** 끝난 스캔에서도 안 보이면 그때는 정말 없는 것이다.
-    const scannedAt = state.snapshot?.cycle?.lastScanAt;
-    if (scannedAt && scannedAt > askedAt) die(outOfScope(key), { outOfScope: true });
   }
 }
 
-function outOfScope(key) {
+/** 레포는 감시 중인데 그 PR 만 안 보인다 — 원인이 PR 쪽에 있다. */
+function prNotFound(key) {
   return (
-    `${key} 는 감시 범위 밖입니다.\n` +
-    `  이 레포를 감시하려면 사용자가 범위를 넓혀야 합니다 —\n` +
+    `${key} 를 찾지 못했습니다. 레포는 감시 중이고 방금 조회했는데 이 PR 이 없습니다.\n` +
+    `  번호가 맞는지, 이미 닫혔거나 머지되지 않았는지 확인하세요.`
+  );
+}
+
+/** 그 레포 자체가 감시 대상이 아니다 (또는 아직 발견되지 않았다). */
+function repoNotWatched(key, slug, include) {
+  return (
+    `${key} 를 확인하지 못했습니다 — ${slug} 를 조회한 기록이 없습니다.\n` +
+    `  현재 감시 범위: ${include.length ? include.join(', ') : '(없음)'}\n` +
+    `  이 레포가 범위에 없다면 사용자가 넓혀야 합니다 —\n` +
     `  대시보드의 '감시 범위' 또는 ${ROOT}/pr-review.config.json 의 watch.include.\n` +
     `  (레포를 넣으면 그 레포의 다른 열린 PR 도 리뷰 대상이 되므로 사람이 정합니다)`
   );

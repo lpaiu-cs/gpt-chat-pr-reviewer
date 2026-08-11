@@ -115,6 +115,15 @@ export interface CycleInfo {
   /** GraphQL 잔여 한도 (-1 = 미관측) */
   remaining: number;
   lastScanAt: number | null;
+  /**
+   * 레포별 **실제로 GitHub 을 조회한** 마지막 시각 (slug → epoch ms).
+   *
+   * `lastScanAt` 으로는 대신할 수 없다. 사이클은 매번 끝나지만 `probeIdleIntervalMs`
+   * (기본 60초) 안에 있는 레포는 조회를 건너뛰기 때문이다 — 전역 시각만 보면
+   * "방금 스캔했다" 가 참인데 정작 그 레포는 안 봤을 수 있고, 그 사이에 생긴 PR 을
+   * 없는 것으로 단정하게 된다. 키에 없는 레포는 이번 스캔 대상이 아니었다는 뜻이다.
+   */
+  probedAt: Record<string, number>;
   /** 다음 스캔 예정 시각 — 카운트다운은 클라이언트가 계산한다 */
   nextScanAt: number | null;
 }
@@ -244,6 +253,7 @@ function emptySnapshot(session: string): Snapshot {
       remaining: -1,
       lastScanAt: null,
       nextScanAt: null,
+      probedAt: {},
     },
     quotaUntil: null,
     active: null,

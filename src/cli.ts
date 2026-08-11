@@ -1109,7 +1109,13 @@ program
         contexts: seen.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(toCard),
         quotaUntil: quotaAt > Date.now() ? quotaAt : null,
       });
-      progress.cycle({ openCount, watchedRepos });
+      // 레포별 실제 조회 시각을 그대로 내보낸다 — 붙는 쪽이 "그 레포를 이번에
+      // 정말 봤나" 를 판정해야 한다 (CycleInfo.probedAt 주석 참고).
+      progress.cycle({
+        openCount,
+        watchedRepos,
+        probedAt: Object.fromEntries(lastProbeAt),
+      });
       publishControl();
     };
 
