@@ -58,6 +58,9 @@ stateDiagram-v2
 
 PR별 컨텍스트에 **라운드 수 · 누적 요청 코멘트 수 · 스레드별 resolve/답글 여부 · 전체 이벤트 히스토리**가 기록됩니다. `data/state/<owner>__<repo>__<n>.json`에 영속화되며, `status --json`으로 그대로 읽을 수 있어 UI를 얹기 쉽습니다.
 
+실제 리뷰 라운드를 시작하면 PR에 👀 반응을 남기고, 지적 없이 수렴하면 👍 반응을
+추가합니다. 반응 게시 실패는 리뷰 실행이나 상태 전이를 막지 않습니다.
+
 ### 리컨실리에이션
 
 `watch` 루프는 매 사이클마다 GitHub 현황(스레드 resolve 상태, head SHA, PR 열림/닫힘)을 읽어 상태 머신 이벤트로 변환합니다. 프로세스가 죽어 `REVIEWING`에 멈춰 있어도 다음 사이클에서 자동 복구됩니다.
@@ -207,14 +210,6 @@ Claude Code는 `--target claude`, 둘 다는 `--target all`을 쓴다. 기본값
 이미 존재하는 `~/.codex` 또는 `~/.claude`를 감지하고, 둘 다 없으면
 Codex에 설치한다. `--dest <skills-dir>`로 다른 에이전트의 skills 경로도
 지정할 수 있다.
-
-이전 `pr-review` 스킬을 이 저장소에서 설치했다면 아래처럼 이름을
-안전하게 교체한다. 설치기는 이 프로젝트의 특정 표식과 데몬 경로를
-모두 확인한 경우에만 이전 폴더를 제거한다. 다른 작성자의 동명 스킬은 유지한다.
-
-```bash
-npm run install-skills -- --target codex --skill chatgpt-pr-review --replace-legacy
-```
 
 ## 시작하기
 
@@ -540,7 +535,7 @@ npm run smoke   # 상태 머신 테스트
 npm run build   # dist/ 생성
 ```
 
-구조는 [CLAUDE.md](CLAUDE.md)를 참고하세요.
+구조와 에이전트 작업 지침은 [AGENTS.md](AGENTS.md)를 참고하세요.
 
 ---
 

@@ -15,6 +15,9 @@ import {
   fetchPRSyncData,
   getViewerLogin,
   getPRInfo,
+  addPullRequestReaction,
+  ghErrorMessage,
+  type PullRequestReaction,
   type SyncThread,
   type PRProbe,
 } from './github.js';
@@ -29,6 +32,16 @@ import {
   type ResponseMeta,
 } from './cache.js';
 import { progress } from './progress.js';
+
+function reactToPullRequest(ctx: PRContext, content: PullRequestReaction): void {
+  try {
+    addPullRequestReaction(ctx.owner, ctx.repo, ctx.prNumber, content);
+  } catch (e) {
+    console.log(
+      chalk.yellow(`  ⚠ PR 반응 ${content} 게시 실패 — 리뷰는 계속합니다: ${ghErrorMessage(e)}`),
+    );
+  }
+}
 
 // ── 스레드 동기화 ───────────────────────────────────────────
 
@@ -851,6 +864,7 @@ export async function runRound(
   // ── 실제 라운드 ──
   fire(ctx, 'START_REVIEW', { note: `${round}차 리뷰 시작` });
   saveContext(cfg, ctx);
+  reactToPullRequest(ctx, 'eyes');
 
   try {
     const { raw, target: reviewed } = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
@@ -907,6 +921,7 @@ export async function runRound(
     // 수렴하면 대화를 놓아준다 — 새 커밋으로 재개될 때는 새 대화에서 시작한다
     if (converged) releaseConversation(ctx);
     saveContext(cfg, ctx);
+    if (converged) reactToPullRequest(ctx, '+1');
     return converged ? 'clean' : 'posted';
   } catch (e) {
     if (e instanceof QuotaLimitError) {

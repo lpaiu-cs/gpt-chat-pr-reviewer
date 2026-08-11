@@ -13,7 +13,6 @@ import {
   mkdirSync,
   readdirSync,
   existsSync,
-  rmSync,
 } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -39,10 +38,6 @@ const hostRoots = {
   codex: path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex')),
   claude: path.resolve(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')),
 };
-const legacyNames = {
-  'chatgpt-pr-review': ['pr-review'],
-};
-
 function usage() {
   console.log(`
   PR reviewer 스킬 설치
@@ -53,7 +48,6 @@ function usage() {
     --target codex|claude|all   설치할 에이전트 (반복·쉼표 가능)
     --dest <skills-dir>         사용자 지정 skills 디렉터리
     --skill <name>              이 스킬만 설치 (반복·쉼표 가능)
-    --replace-legacy             이 프로젝트의 이전 스킬 이름을 검증 후 제거
     --dry-run                   파일을 쓰지 않고 대상만 표시
     --help                      도움말
 
@@ -111,44 +105,6 @@ function copySkill(from, to, relative = '') {
   }
 }
 
-function isLegacyProjectSkill(skillFile) {
-  try {
-    const body = readFileSync(skillFile, 'utf-8');
-    return body.includes('scripts/daemon.mjs') && (
-      body.includes('gpt-chat-pr-reviewer') ||
-      body.includes('ChatGPT 웹 대화창을 이용한 GitHub PR 자동 리뷰')
-    );
-  } catch {
-    return false;
-  }
-}
-
-function handleLegacyNames(target, installedName) {
-  for (const legacyName of legacyNames[installedName] ?? []) {
-    const legacyDir = path.resolve(target.dir, legacyName);
-    if (path.dirname(legacyDir) !== path.resolve(target.dir)) {
-      die(`잘못된 레거시 스킬 경로: ${legacyDir}`);
-    }
-    const legacySkill = path.join(legacyDir, 'SKILL.md');
-    if (!existsSync(legacySkill)) continue;
-
-    if (!flag('--replace-legacy')) {
-      console.log(`    ⚠ ${legacyName} 이름의 스킬이 남아 있습니다 — 이 프로젝트의 이전 스킬이면 --replace-legacy로 교체하세요.`);
-      continue;
-    }
-    if (!isLegacyProjectSkill(legacySkill)) {
-      console.log(`    ⚠ ${legacyName} 은 이 프로젝트의 이전 스킬임을 확인할 수 없어 유지합니다.`);
-      continue;
-    }
-    if (flag('--dry-run')) {
-      console.log(`    · 레거시 ${legacyName} 제거 예정`);
-    } else {
-      rmSync(legacyDir, { recursive: true, force: true });
-      console.log(`    ✓ 레거시 ${legacyName} 제거`);
-    }
-  }
-}
-
 if (flag('--help') || flag('-h')) {
   usage();
   process.exit(0);
@@ -184,7 +140,6 @@ for (const target of targets) {
     }
     if (!flag('--dry-run')) copySkill(from, path.join(target.dir, name));
     console.log(`    ${flag('--dry-run') ? '·' : '✓'} ${name}`);
-    handleLegacyNames(target, name);
   }
 }
 

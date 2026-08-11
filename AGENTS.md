@@ -43,9 +43,9 @@ scripts/
                       --pr 로 세션별 대상 한정 · --porcelain 으로 에이전트가 소비
                       --until/--timeout 으로 1건만 받고 종료 (에이전트 대기용)
   daemon.mjs        — 스킬용 데몬 클라이언트. **켜는 것만** 한다 (아래)
-  install-skills.mjs— skills/ → ~/.claude/skills/ 복사 (경로 치환)
+  install-skills.mjs— skills/ → 에이전트 skills 디렉터리 복사 (경로 치환)
 skills/
-  pr-review/        — 리뷰 요청·대기 스킬
+  chatgpt-pr-review/— 리뷰 요청·대기 스킬
   pr-watch/         — 상태 추적·알림 스킬 (브라우저·쿼터 없음)
 ```
 
@@ -492,7 +492,7 @@ npm run dev -- status [pr] [--json]
 npm run dev -- graph [pr]   # mermaid 다이어그램
 npm run dev -- stop [--now] # 데몬 종료 (기본은 현재 라운드를 마친 뒤)
 npm run notify       # 대시보드 이벤트 알림 (watch --ui 가 떠 있어야 한다)
-npm run install-skills      # skills/ → ~/.claude/skills/
+npm run install-skills      # skills/ → Codex·Claude Code skills 디렉터리
 npm run daemon -- ensure    # 스킬이 쓰는 클라이언트 (직접 쓸 일은 드물다)
 ```
 

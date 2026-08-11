@@ -453,6 +453,37 @@ export function getViewerLogin(): string {
   return viewerLoginCache;
 }
 
+// ── PR 반응 ────────────────────────────────────────────────
+
+export type PullRequestReaction = 'eyes' | '+1';
+
+/** GitHub reactions API 에 보낼 본문 (순수 함수). */
+export function buildPullRequestReactionPayload(content: PullRequestReaction): string {
+  return JSON.stringify({ content });
+}
+
+/** PR 자체에 반응을 남긴다. PR 은 reactions API 에서 issue 번호로 다룬다. */
+export function addPullRequestReaction(
+  owner: string,
+  repo: string,
+  number: number,
+  content: PullRequestReaction,
+): void {
+  gh(
+    [
+      'api',
+      `repos/${owner}/${repo}/issues/${number}/reactions`,
+      '--method',
+      'POST',
+      '--input',
+      '-',
+      '-H',
+      'Accept: application/vnd.github+json',
+    ],
+    { input: buildPullRequestReactionPayload(content), captureStderr: true },
+  );
+}
+
 // ── Diff 파싱 ───────────────────────────────────────────────
 
 export function fetchDiff(owner: string, repo: string, number: number): string {
