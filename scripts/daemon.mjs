@@ -297,12 +297,20 @@ async function ensure({ start = false, requireReady = false } = {}) {
     // 열고 그 뒤에 브라우저 기동·로그인 확인을 한다. 로그인이 만료됐으면 UI 가
     // 잠깐 살아 있다가 죽으므로, 여기서 돌아가면 **곧 죽을 데몬을 "정상 기동"
     // 으로 보고**하게 된다.
-    if (d && (d.ready || !requireReady)) return { ...d, started: startedHere };
+    if (d && (d.ready || !requireReady)) {
+      // 우리 자식이 잠금 경쟁에서 졌으면 이 데몬은 남이 띄운 것이다 —
+      // 종료 안내를 우리가 낼 일이 아니다 (띄운 쪽이 낸다).
+      return { ...d, started: startedHere && died.code === null };
+    }
 
-    // 죽었다면 기다릴 이유가 없다. 단, 다른 세션이 잠금을 먼저 잡아서 우리
-    // 프로세스만 물러난 경우일 수 있으므로 위의 findDaemon 을 먼저 본다
-    // (그쪽이 이겼으면 이미 위에서 돌아갔다).
-    if (died.code !== null) {
+    // 자식이 죽었어도 **같은 설치본의 데몬이 보이면 실패가 아니다.**
+    //
+    // 동시 `review` 두 건이 각자 launch 하면 잠금이 하나만 통과시키고 진 쪽
+    // 프로세스는 즉시 죽는다 — 그건 의도된 경쟁 처리다. 그런데 승자가 브라우저
+    // 기동·로그인 확인을 하는 몇 초 동안 `ready` 는 false 이므로, 자식의 종료를
+    // 먼저 보고 실패로 접으면 **정상 경쟁에서 한쪽 요청이 "기동 직후 종료" 로
+    // 죽는다.** 데몬이 보이면 그쪽의 준비를 끝까지 기다린다.
+    if (died.code !== null && !d) {
       die(
         `데몬이 기동 직후 종료했습니다 (코드 ${died.code}).\n` +
           `  로그 마지막 부분 (${path.join(dataDir(), 'watch.log')}):\n` +
