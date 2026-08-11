@@ -1647,6 +1647,17 @@ const fakePR: PRInfo = {
   assert(typeof skip !== 'string' && skip.kind === 'skip-add', 'skip-add 는 받는다');
   const set = parseIntent({ kind: 'scope-set', include: ['a/*'], exclude: [] });
   assert(typeof set !== 'string' && set.kind === 'scope-set', 'scope-set 은 받는다');
+
+  // review-now 의 조건부 적용 토큰. 대시보드(사람)는 안 보내므로 선택이다.
+  const bare = parseIntent({ kind: 'review-now', ref: 'o/r#1' });
+  assert(
+    typeof bare !== 'string' && bare.kind === 'review-now' && bare.seq === undefined,
+    'review-now 는 seq 없이도 받는다 (대시보드 버튼)',
+  );
+  const cond = parseIntent({ kind: 'review-now', ref: 'o/r#1', seq: 4 });
+  assert(typeof cond !== 'string' && cond.kind === 'review-now' && cond.seq === 4, 'seq 를 실어 보낼 수 있다');
+  assert(bad({ kind: 'review-now', ref: 'o/r#1', seq: -1 }), '음수 seq 는 거부한다');
+  assert(bad({ kind: 'review-now', ref: 'o/r#1', seq: 'x' }), '숫자가 아닌 seq 는 거부한다');
 }
 
 // ── 시나리오 41: 신선도 토큰 (라운드로는 못 재는 것) ───────

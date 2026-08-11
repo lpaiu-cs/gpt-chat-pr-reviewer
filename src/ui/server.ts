@@ -142,10 +142,18 @@ export function parseIntent(body: unknown): Intent | string {
     case 'resume':
       return { kind };
     case 'skip-add':
-    case 'skip-remove':
-    case 'review-now': {
+    case 'skip-remove': {
       if (typeof b.ref !== 'string' || !b.ref.trim()) return 'ref 가 필요합니다';
       return { kind, ref: b.ref.trim() };
+    }
+    case 'review-now': {
+      if (typeof b.ref !== 'string' || !b.ref.trim()) return 'ref 가 필요합니다';
+      // seq 는 선택이다 — 대시보드 버튼은 사람이 지금 화면을 보고 누르므로
+      // 굳이 조건을 달지 않는다. 지연 적용되는 클라이언트만 보낸다.
+      if (b.seq === undefined) return { kind, ref: b.ref.trim() };
+      const seq = Number(b.seq);
+      if (!Number.isInteger(seq) || seq < 0) return 'seq 는 0 이상의 정수여야 합니다';
+      return { kind, ref: b.ref.trim(), seq };
     }
     case 'only-set': {
       const refs = strArray(b.refs);

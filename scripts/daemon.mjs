@@ -42,14 +42,14 @@ const UI_PORT_WALK = 10;
 /** 데몬이 떠서 /api/state 를 열 때까지 기다리는 시간. */
 const START_TIMEOUT_MS = 90_000;
 /**
- * 첫 스캔이 끝날 때까지 기다리는 시간.
+ * "이 PR 은 범위 밖" 을 확정하기 전에 신선한 스캔을 기다리는 시간.
  *
- * UI 는 **브라우저 기동보다 먼저** 열린다 (로그인 안내도 대시보드에 남아야
- * 하므로). 그래서 `/api/state` 가 응답하는 시점에는 아직 아무 PR 도 안 보인다 —
- * 그 상태를 "범위 밖" 으로 읽으면 멀쩡히 설정에 들어 있는 PR 에 대고 "범위를
- * 넓히세요" 라고 답하게 된다. 브라우저 기동·로그인 확인까지 포함해서 넉넉히 준다.
+ * cold start 에서는 UI 가 **브라우저 기동보다 먼저** 열리므로(로그인 안내도
+ * 대시보드에 남아야 한다) 첫 스캔까지 시간이 걸리고, 이미 오래 돌던 데몬에서는
+ * 마지막 스캔이 방금 만든 PR 보다 앞선다. 둘 다 "아직 못 봤다" 인데 그걸 범위
+ * 밖으로 읽으면 멀쩡한 PR 을 거부한다. 기동·로그인 확인까지 넉넉히 준다.
  */
-const FIRST_SCAN_TIMEOUT_MS = 180_000;
+const FRESH_SCAN_TIMEOUT_MS = 180_000;
 const POLL_MS = 1_000;
 
 function config() {
@@ -363,33 +363,59 @@ async function verbStatus() {
  * 게시할 수 있고, 게시는 되돌릴 수 없다. 출력으로 경고해봐야 이미 보낸 의도를
  * 막지 못한다. 그래서 넓히는 일은 사람이 설정이나 대시보드로 한다.
  */
+async function fetchState(ui) {
+  try {
+    return await getState(ui);
+  } catch {
+    // 로그인 실패 등으로 데몬이 내려갔을 수 있다 — 조용히 기다리면 안 된다.
+    die(
+      `데몬과의 연결이 끊겼습니다. 로그를 확인하세요: ${path.join(dataDir(), 'watch.log')}\n` +
+        `(ChatGPT 로그인이 만료됐다면 ${ROOT} 에서 \`npm run setup\`)`,
+    );
+  }
+}
+
 /**
- * 첫 스캔이 끝난 뒤의 스냅샷을 돌려준다.
+ * 그 PR 의 카드를 찾는다. **없다는 사실은 신선한 스캔으로만 확정한다.**
  *
- * `cycle.lastScanAt` 이 그 신호다 — 스캔이 한 번이라도 끝났으면 contexts 는
- * "지금 아는 전부" 이므로 없는 PR 은 정말 없는 것이다. 그 전에는 판정 불가다.
+ * 카드가 없는 데는 두 가지 이유가 있고 결론이 정반대다:
+ *   · 정말 범위 밖이다 → 사람이 범위를 넓혀야 한다
+ *   · 아직 스캔이 그 PR 을 못 봤다 → 곧 보인다
+ *
+ * 후자를 전자로 읽으면 멀쩡한 PR 에 대고 "범위를 넓히세요" 라고 답한다. 그런데
+ * 스킬이 내세우는 대표 경로가 **"PR 을 만든 직후 리뷰"** 라서, 마지막 스캔이
+ * 그 PR 생성보다 앞선 상황이 오히려 흔하다. 그래서 **요청 이후에 끝난 스캔**을
+ * 본 뒤에만 범위 밖으로 확정한다 (cold start 의 "아직 한 번도 안 스캔함" 도
+ * 같은 조건으로 덮인다).
+ *
+ * 있으면 즉시 돌려준다 — 흔한 경로에 대기를 붙이지 않는다.
  */
-async function waitForFirstScan(ui) {
-  const deadline = Date.now() + FIRST_SCAN_TIMEOUT_MS;
+async function resolveCard(ui, ref, key) {
+  const askedAt = Date.now();
+  let state = await fetchState(ui);
+  let card = cardsFor(state, ref)[0];
+  if (card) return card;
+
+  const deadline = askedAt + FRESH_SCAN_TIMEOUT_MS;
   for (;;) {
-    let state;
-    try {
-      state = await getState(ui);
-    } catch {
-      // 로그인 실패 등으로 데몬이 내려갔을 수 있다 — 조용히 기다리면 안 된다.
-      die(
-        `데몬과의 연결이 끊겼습니다. 로그를 확인하세요: ${path.join(dataDir(), 'watch.log')}\n` +
-          `(ChatGPT 로그인이 만료됐다면 ${ROOT} 에서 \`npm run setup\`)`,
-      );
-    }
-    if (state.snapshot?.cycle?.lastScanAt) return state;
     if (Date.now() >= deadline) {
+      const active = state.snapshot?.active;
       die(
-        `${Math.round(FIRST_SCAN_TIMEOUT_MS / 1000)}초 안에 첫 스캔이 끝나지 않았습니다.\n` +
-          `  대시보드 ${ui} 와 로그 ${path.join(dataDir(), 'watch.log')} 를 확인하세요.`,
+        `${key} 를 확인하지 못했습니다 — 요청 이후의 스캔이 ` +
+          `${Math.round(FRESH_SCAN_TIMEOUT_MS / 1000)}초 안에 끝나지 않았습니다.\n` +
+          (active
+            ? `  ${active.key} ${active.round}차 리뷰가 진행 중이라 스캔이 밀려 있습니다.\n`
+            : `  대시보드 ${ui} 를 확인하세요.\n`) +
+          `  범위 밖이라고 단정하지 않습니다 — 잠시 뒤 다시 시도하세요.`,
       );
     }
     await new Promise((r) => setTimeout(r, POLL_MS));
+    state = await fetchState(ui);
+    card = cardsFor(state, ref)[0];
+    if (card) return card;
+    // 우리 요청 **뒤에** 끝난 스캔에서도 안 보이면 그때는 정말 없는 것이다.
+    const scannedAt = state.snapshot?.cycle?.lastScanAt;
+    if (scannedAt && scannedAt > askedAt) die(outOfScope(key), { outOfScope: true });
   }
 }
 
@@ -429,14 +455,8 @@ async function verbReview() {
     );
   }
 
-  // **첫 스캔이 끝나기 전에는 아무것도 단정하지 않는다.** 카드가 없다는 건
-  // "범위 밖" 일 수도 있고 "아직 안 봤다" 일 수도 있는데, 둘을 구분하지 않으면
-  // 멀쩡히 설정에 들어 있는 PR 에 대고 범위를 넓히라고 답하게 된다.
-  const state = await waitForFirstScan(ui);
-
-  // 이제 없으면 정말 범위 밖이다 (또는 닫혔거나). 넓히는 건 사람이 정한다.
-  const card = cardsFor(state, ref)[0];
-  if (!card) die(outOfScope(key), { outOfScope: true });
+  // 카드가 없으면 신선한 스캔을 본 뒤에만 범위 밖으로 확정한다 (resolveCard).
+  const card = await resolveCard(ui, ref, key);
 
   // 필터에 걸린 PR 은 큐에 오르지 않는다. 여기서 멈추고 알린다 —
   // 스킬이 필터를 풀어버리면 그건 다른 세션의 설정을 갈아엎는 일이다.
@@ -446,7 +466,10 @@ async function verbReview() {
     });
   }
 
-  await postIntent(ui, { kind: 'review-now', ref: key });
+  // 요청 시점에 **본** 전이 횟수를 함께 보낸다. 이 의도는 진행 중인 라운드가
+  // 끝난 뒤에야 적용되는데, 그 사이 그 PR 이 이미 리뷰됐으면 그대로 적용할 때
+  // 같은 PR 을 한 번 더 리뷰하게 된다 (intents.ts 참고).
+  await postIntent(ui, { kind: 'review-now', ref: key, seq: card.seq ?? 0 });
 
   // **지금 전이 횟수를 같이 낸다.** wait 가 "이 요청의 결과" 와 "이전 라운드가
   // 남긴 상태" 를 구분하려면 기준점이 필요하다 — 이게 없으면 AWAITING_AUTHOR

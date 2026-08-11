@@ -19,8 +19,16 @@ export type Intent =
   /** 빈 배열이면 한정 해제 */
   | { kind: 'only-set'; refs: string[] }
   | { kind: 'scope-set'; include: string[]; exclude: string[] }
-  /** 큐 맨 앞으로. REVIEW_DUE 가 아니면 강제 전이시킨다 (review --force 와 같은 경로) */
-  | { kind: 'review-now'; ref: string }
+  /**
+   * 큐 맨 앞으로. REVIEW_DUE 가 아니면 강제 전이시킨다 (review --force 와 같은 경로)
+   *
+   * `seq` = 요청자가 **본** 전이 횟수. 이 의도는 라운드가 끝난 뒤에야 적용되는데
+   * (2~15분 뒤), 그 사이에 그 PR 이 이미 리뷰돼 버렸을 수 있다. 그때 그대로
+   * 적용하면 방금 끝난 AWAITING_AUTHOR/CONVERGED 를 REVIEW_DUE 로 되돌려
+   * **같은 PR 을 연달아 한 번 더 리뷰한다** — 한도를 두 번 쓰고 중복 리뷰를
+   * 게시한다. 값이 있으면 적용 시점에 대조해 이미 진행됐으면 충족으로 본다.
+   */
+  | { kind: 'review-now'; ref: string; seq?: number }
   | { kind: 'pause' }
   | { kind: 'resume' }
   /**

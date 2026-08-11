@@ -695,6 +695,29 @@ program
           continue;
         }
 
+        // **지연 적용되는 요청은 조건부여야 한다.**
+        //
+        // 이 의도는 진행 중인 라운드가 끝난 다음 사이클에야 배수된다 (2~15분).
+        // 그 사이에 그 PR 이 이미 리뷰됐으면 — cold start 에서 첫 스캔 직후
+        // 자동으로 시작되는 경우가 대표적이다 — 아래의 강제 전이가 방금 끝난
+        // AWAITING_AUTHOR/CONVERGED 를 REVIEW_DUE 로 되돌려 **같은 PR 을 연달아
+        // 한 번 더 리뷰한다.** 대화 한도를 두 번 쓰고 중복 리뷰를 게시한다.
+        //
+        // REVIEW_DUE 는 예외다 — 이미 큐에 오를 상태라 강제할 것이 없고,
+        // 앞으로 당기는 것뿐이라 중복을 만들지 않는다.
+        if (
+          it.seq !== undefined &&
+          target.history.length > it.seq &&
+          target.state !== 'REVIEW_DUE'
+        ) {
+          console.log(
+            chalk.dim(
+              `    ${key} 는 요청 이후 이미 진행됐습니다 (${STATE_LABELS[target.state]}) — 중복 예약하지 않습니다.`,
+            ),
+          );
+          continue;
+        }
+
         // 필터에 걸린 PR 은 **전이시키기 전에** 막는다.
         //
         // scan 이 excludedReason 붙은 컨텍스트를 eligible 에 넣지 않으므로 상태만
