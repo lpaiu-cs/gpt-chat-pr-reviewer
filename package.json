@@ -23,6 +23,8 @@
     "scripts/install-skills.mjs",
     "scripts/notify.mjs",
     "skills/",
+    "docs/",
+    "AGENTS.md",
     "README.md",
     "LICENSE"
   ],
