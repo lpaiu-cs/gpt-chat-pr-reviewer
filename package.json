@@ -27,7 +27,9 @@
     "watch": "tsx src/cli.ts watch",
     "status": "tsx src/cli.ts status",
     "smoke": "tsx scripts/smoke-machine.ts",
-    "notify": "node scripts/notify.mjs"
+    "notify": "node scripts/notify.mjs",
+    "install-skills": "node scripts/install-skills.mjs",
+    "daemon": "node scripts/daemon.mjs"
   },
   "dependencies": {
     "chalk": "^5.4.1",

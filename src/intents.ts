@@ -19,16 +19,42 @@ export type Intent =
   /** 빈 배열이면 한정 해제 */
   | { kind: 'only-set'; refs: string[] }
   | { kind: 'scope-set'; include: string[]; exclude: string[] }
+  /**
+   * 범위 **증분** 변경. `scope-set` 과 달리 나머지를 건드리지 않는다.
+   *
+   * 대시보드는 사람 하나가 쓰지만 스킬은 여러 세션이 동시에 쓴다. 세션 A 가
+   * 자기 레포를 넣겠다고 `scope-set` 을 부르면 세션 B·C 가 넣어둔 레포가
+   * 통째로 사라진다 — read-modify-write 를 클라이언트가 하게 되기 때문이다.
+   * 그래서 "무엇을 원하는가"(추가/제거)를 그대로 보내게 하고 병합은 루프가 한다.
+   */
+  | { kind: 'scope-add'; include: string[] }
+  | { kind: 'scope-remove'; include: string[] }
   /** 큐 맨 앞으로. REVIEW_DUE 가 아니면 강제 전이시킨다 (review --force 와 같은 경로) */
   | { kind: 'review-now'; ref: string }
   | { kind: 'pause' }
-  | { kind: 'resume' };
+  | { kind: 'resume' }
+  /**
+   * 데몬 종료. **`INTENT_KINDS` 에 없다 — `/api/intent` 로는 들어올 수 없다.**
+   * 전용 엔드포인트(`/api/shutdown`)만 만들 수 있다. 이유는 아래 참고.
+   */
+  | { kind: 'stop' };
 
+/**
+ * `/api/intent` 가 받아주는 종류. **의도적으로 `stop` 이 빠져 있다.**
+ *
+ * 이 목록이 곧 "네트워크로 부를 수 있는 것" 의 전부이고, 스킬을 쓰는 세션은
+ * 여럿이다. 종료는 한 세션이 다른 세션들의 리뷰를 통째로 끊는 유일한 동작이라
+ * 일반 의도와 같은 문 안에 두지 않는다. 사람이 쓰는 경로(대시보드 종료 버튼 ·
+ * `stop` 명령)는 전용 엔드포인트를 지나며, 큐에 넣는 것은 똑같다 — 라운드
+ * 중간에 끊지 않으려면 결국 이 완충 지대를 거쳐야 하기 때문이다.
+ */
 export const INTENT_KINDS: Intent['kind'][] = [
   'skip-add',
   'skip-remove',
   'only-set',
   'scope-set',
+  'scope-add',
+  'scope-remove',
   'review-now',
   'pause',
   'resume',

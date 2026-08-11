@@ -194,6 +194,7 @@
   <button class="btn" id="btn-pause">⏸ 일시정지</button>
   <button class="btn" id="btn-scope">감시 범위</button>
   <button class="btn" id="btn-instr">리뷰 지침</button>
+  <button class="btn warn" id="btn-stop" title="watch 프로세스를 종료합니다">■ 종료</button>
 </header>
 
 <main>
@@ -495,6 +496,30 @@ $('btn-pause').addEventListener('click', () => {
   sendIntent({ kind: (snap && snap.control && snap.control.paused) ? 'resume' : 'pause' });
 });
 $('btn-only-clear').addEventListener('click', () => sendIntent({ kind: 'only-set', refs: [] }));
+
+// 종료 — /api/intent 가 아니라 전용 엔드포인트다 (intents.ts 의 INTENT_KINDS 참고).
+// 여러 세션이 이 데몬 하나를 함께 쓰므로 되묻고, 즉시 끊지 않는다는 것도 알린다.
+$('btn-stop').addEventListener('click', async () => {
+  const active = snap && snap.active;
+  const warn = active
+    ? '\n\n지금 ' + active.key + ' ' + active.round + '차 리뷰가 진행 중입니다.\n' +
+      '그 라운드를 마친 뒤 종료합니다 (최대 15분).'
+    : '';
+  if (!confirm('리뷰 데몬을 종료합니다.' + warn + '\n\n계속할까요?')) return;
+  try {
+    const res = await fetch('/api/shutdown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) { alert('종료 요청 실패: ' + (j.error || res.status)); return; }
+    $('btn-stop').textContent = '■ 종료 중…';
+    $('btn-stop').disabled = true;
+  } catch (e) {
+    alert('종료 요청 실패: ' + e.message);
+  }
+});
 
 // ── 감시 범위 편집 ──
 

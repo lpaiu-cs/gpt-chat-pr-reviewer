@@ -43,6 +43,9 @@ if (flag('--help') || flag('-h')) {
     --on <events>     --exec 를 실행할 이벤트, 쉼표 구분 (기본 posted,converged,failed)
     --exec <command>  이벤트 발생 시 실행할 셸 명령
     --porcelain       이벤트 1건 = 1줄, 장식 없음 (에이전트·스크립트가 소비할 때)
+    --until <events>  이 중 하나가 나오면 **종료한다**, 쉼표 구분
+                      (없으면 계속 구독한다)
+    --timeout <초>    이 시간 안에 --until 이벤트가 없으면 'timeout' 을 내고 종료
     --no-bell         터미널 벨 끄기
     --quiet           진행 단계는 **화면에** 찍지 않고 주요 이벤트만
                       (--exec 실행 대상은 --on 이 정한다 — quiet 는 관여하지 않는다)
@@ -68,6 +71,23 @@ const ON = new Set(value('--on', 'posted,converged,failed').split(',').map((s) =
 const PORCELAIN = flag('--porcelain');
 const BELL = !flag('--no-bell') && !PORCELAIN;
 const QUIET = flag('--quiet');
+
+/**
+ * 한 건만 받고 끝내는 모드.
+ *
+ * 세션이 이 프로세스를 **백그라운드로** 띄워두고 종료를 신호로 삼는다 —
+ * 라운드가 2~15분이라 앞에서 기다릴 수 없기 때문이다. 계속 사는 구독자로만
+ * 두면 "무슨 일이 생겼다" 를 알릴 방법이 프로세스 종료밖에 없는 소비자를
+ * 지원할 수 없다.
+ */
+const UNTIL = new Set(
+  (value('--until', '') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+/** 초. 0 이면 무제한. --until 없이 주면 아무 의미가 없다. */
+const TIMEOUT_S = Number(value('--timeout', '0')) || 0;
 
 // ── 감시 대상 필터 ──────────────────────────────────────────
 
@@ -205,6 +225,21 @@ function emit(event, ctx, detail = '') {
   }
 
   runExec(event, ctx);
+
+  // --until 은 출력·exec 뒤에 본다. 종료가 먼저면 방금 받은 이벤트를 소비자가
+  // 못 보고, 그러면 "무엇 때문에 깨어났는지" 를 알 수 없다.
+  if (UNTIL.has(event)) finish(0);
+}
+
+/**
+ * 대기를 끝낸다. --exec 이 걸려 있으면 그 체인이 끝난 뒤에 나간다 —
+ * 핸들러가 git 작업이면 중간에 죽는 게 안 하느니만 못하다.
+ */
+let finishing = false;
+function finish(code) {
+  if (finishing) return;
+  finishing = true;
+  chain.then(() => process.exit(code));
 }
 
 // ── 상태 비교 ───────────────────────────────────────────────
@@ -369,6 +404,19 @@ async function main() {
           `${BELL ? ' · 벨 켜짐' : ''}\n`,
       ),
     );
+  }
+
+  if (TIMEOUT_S > 0) {
+    setTimeout(() => {
+      // 소비자는 침묵을 해석할 수 없다. "아무 일도 없었다" 를 **한 줄로**
+      // 내보내야 대기가 끝난 이유가 이벤트인지 시간 초과인지 갈린다.
+      const label = FILTERS.length ? FILTERS.map((f) => f.label).join(',') : '전체';
+      if (PORCELAIN) console.log(`timeout  ${label}  ${TIMEOUT_S}초`);
+      else say(C.yellow(`${TIMEOUT_S}초 안에 기다리던 이벤트가 없었습니다 — 종료합니다.`));
+      finish(2);
+      // unref 하지 않는다 — 이 타이머가 마지막 핸들일 때 조용히 exit 0 으로
+      // 나가버리면 소비자는 타임아웃을 정상 종료로 읽는다.
+    }, TIMEOUT_S * 1000);
   }
 
   for (;;) {

@@ -121,8 +121,13 @@ function rejectsCrossOrigin(req: IncomingMessage, host: string): string | null {
   return null;
 }
 
-/** 신뢰할 수 없는 입력을 Intent 로 좁힌다. 모르는 종류는 거부한다. */
-function parseIntent(body: unknown): Intent | string {
+/**
+ * 신뢰할 수 없는 입력을 Intent 로 좁힌다. 모르는 종류는 거부한다.
+ *
+ * `stop` 은 `INTENT_KINDS` 에 없으므로 여기서 **반드시 거부된다** — 종료는
+ * 전용 엔드포인트만 만들 수 있다 (intents.ts 참고). 스모크가 이걸 지킨다.
+ */
+export function parseIntent(body: unknown): Intent | string {
   if (!body || typeof body !== 'object') return '본문이 객체가 아닙니다';
   const b = body as Record<string, unknown>;
   const kind = b.kind;
@@ -156,6 +161,14 @@ function parseIntent(body: unknown): Intent | string {
         include: include.map((s) => s.trim()).filter(Boolean),
         exclude: exclude.map((s) => s.trim()).filter(Boolean),
       };
+    }
+    case 'scope-add':
+    case 'scope-remove': {
+      const include = strArray(b.include);
+      if (!include) return 'include 배열이 필요합니다';
+      const cleaned = include.map((s) => s.trim()).filter(Boolean);
+      if (cleaned.length === 0) return 'include 가 비어 있습니다';
+      return { kind, include: cleaned };
     }
     default:
       return `처리되지 않은 intent: ${kind}`;
@@ -266,6 +279,23 @@ async function handle(
         }
         const path = hooks.writeInstructions(b.body);
         json(res, 200, { ok: true, path });
+        return;
+      }
+
+      /**
+       * 종료 — **사람이 쓰는 문이다.** `/api/intent` 와 따로 둔 이유는
+       * intents.ts 의 `INTENT_KINDS` 주석에 적어두었다.
+       *
+       * 끊는 게 아니라 **예약한다.** 라운드 하나가 2~15분이고 그 사이에
+       * 프로세스를 죽이면 이미 소비한 대화 한도로 만든 응답을 버리고,
+       * `pendingSend` 만 남아 다음 실행이 회수 판정을 해야 한다. 그래서 다른
+       * 제어와 같은 완충 지대에 넣고, 루프가 **라운드가 돌지 않는 지점**에서
+       * 꺼내 스스로 정리하고 나간다.
+       */
+      if (url === '/api/shutdown') {
+        const pending = intents.push({ kind: 'stop' });
+        progress.control({ pendingIntents: pending });
+        json(res, 202, { ok: true, pending });
         return;
       }
     } catch (e) {

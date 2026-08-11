@@ -29,6 +29,7 @@ import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './sta
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
 import { acquireLock, LockHeldError, LockPortBusyError } from './lock.js';
+import { publishDaemonFile, readDaemonFile, clearDaemonFile } from './daemon-file.js';
 import {
   admitsNewPR,
   createRepoSource,
@@ -492,6 +493,15 @@ program
 
     // ── 제어 상태 (UI 의도 큐가 바꾼다) ──
     let paused = false;
+    /**
+     * 종료 예약. `/api/shutdown` 이 넣은 의도를 applyIntents 가 여기로 옮긴다.
+     *
+     * 플래그를 두는 이유는 **끊지 않기 위해서**다. 라운드가 도는 중에
+     * 프로세스를 죽이면 이미 소비한 대화 한도로 만든 응답을 버린다. 의도 큐는
+     * 라운드가 돌지 않는 지점에서만 배수되므로, 여기 도달했다는 건 이미 안전한
+     * 시점이라는 뜻이다 — 그 자리에서 사이클을 접고 정리 경로로 나간다.
+     */
+    let stopRequested = false;
     /** '지금 리뷰' 로 큐 앞으로 당긴 PR (정규화 키). 그 라운드가 돌면 빠진다. */
     const prioritized = new Set<string>();
     scope.filters ??= {};
@@ -658,6 +668,56 @@ program
             console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
             break;
           }
+          case 'scope-add': {
+            // 판정은 scope-set 과 **같은 함수**를 쓴다 — 갈라지면 한쪽만 받아준다.
+            const bad = unsupportedPatterns(scope.mode, it.include);
+            if (bad.length > 0) {
+              console.log(
+                chalk.yellow(`  ⚠ ${scope.mode} 모드가 펼칠 수 없는 패턴 — 무시합니다: ${bad.join(', ')}`),
+              );
+              break;
+            }
+            const have = new Set(scope.include);
+            const added = it.include.filter((p) => !have.has(p));
+            // 이미 다 있으면 아무것도 하지 않는다. 스킬은 매번 track 을 부르므로
+            // (멱등이어야 하므로) 여기서 매번 캐시를 버리면 30초 주기 탐색이
+            // 호출 수만큼 늘어난다.
+            if (added.length === 0) break;
+            scope.include = [...scope.include, ...added];
+            scopeChanged = true;
+            // 추가는 아무것도 빼지 않으므로 캐시를 통째로 버릴 필요가 없다.
+            // freshness 만 무효화해 다음 list() 가 곧바로 새 범위를 탐색하게 한다
+            // (안 하면 discoveryIntervalMs 만큼 새 레포가 안 보인다).
+            repoSource.lastAt = 0;
+            console.log(chalk.cyan(`    감시 범위 추가: ${added.join(', ')}`));
+            break;
+          }
+          case 'scope-remove': {
+            const drop = new Set(it.include);
+            const next = scope.include.filter((p) => !drop.has(p));
+            if (next.length === scope.include.length) break; // 원래 없던 것
+            // 빈 include 는 "감시 중지" 가 아니라 **전부 허용**으로 읽힌다
+            // (scope-set 주석 참고) — 마지막 하나를 빼는 건 거부한다.
+            if (next.length === 0 && scope.mode !== 'review-requested') {
+              console.log(
+                chalk.yellow(`  ⚠ ${scope.mode} 모드에서는 include 를 비울 수 없습니다 — 무시합니다.`),
+              );
+              break;
+            }
+            scope.include = next;
+            scopeChanged = true;
+            // 제거는 통째로 버려야 한다. 부분 실패 시 캐시가 보존되면 방금 뺀
+            // 레포가 살아남아 리뷰를 게시할 수 있다 (scope-set 주석 참고).
+            repoSource.reset();
+            console.log(chalk.cyan(`    감시 범위 제거: ${it.include.join(', ')}`));
+            break;
+          }
+          case 'stop':
+            if (!stopRequested) {
+              console.log(chalk.magenta('    ■ 종료 요청 — 정리하고 나갑니다.'));
+            }
+            stopRequested = true;
+            break;
         }
       }
 
@@ -787,6 +847,27 @@ program
                 }
                 return null;
               }
+              case 'scope-add': {
+                // scope-set 과 같은 판정. 여기서 걸러야 스킬이 즉시 400 을 받는다 —
+                // 큐까지 흘려보내면 "추가했다" 고 답해놓고 아무것도 안 잡힌다.
+                const bad = unsupportedPatterns(scope.mode, intent.include);
+                if (bad.length > 0) {
+                  return scope.mode === 'repos'
+                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
+                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
+                }
+                return null;
+              }
+              case 'scope-remove': {
+                const drop = new Set(intent.include);
+                if (
+                  scope.mode !== 'review-requested' &&
+                  scope.include.every((p) => drop.has(p))
+                ) {
+                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
+                }
+                return null;
+              }
               default:
                 return null;
             }
@@ -798,6 +879,17 @@ program
           dryRun: opts.dryRun,
         });
         console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
+
+        // 붙으려는 쪽이 포트를 찾을 수 있게 남긴다. 잠금 해제와 같은 자리에
+        // 걸어 어떤 반환 경로로 끝나도 정리되게 한다 (daemon-file.ts 참고).
+        publishDaemonFile(cfg.dataDir, {
+          ui: ui.url,
+          pid: process.pid,
+          root: process.cwd(),
+          startedAt: new Date().toISOString(),
+          mode: opts.observe ? 'observe' : 'review',
+        });
+        process.once('exit', () => clearDaemonFile(cfg.dataDir));
       } catch (e) {
         // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
         console.log(
@@ -1067,6 +1159,11 @@ program
       // 제어 의도는 스캔 직전에만 적용한다 — 라운드가 돌지 않는 유일한 지점이다.
       applyIntents();
 
+      // 종료가 예약됐으면 **여기서 접는다.** 아래로 내려가면 이 사이클이 또
+      // 라운드를 시작해 2~15분을 더 붙잡는다 — 사용자가 종료를 누른 뒤 그만큼
+      // 더 기다리게 되고, 그 라운드는 어차피 버려질 수도 있다.
+      if (stopRequested) return false;
+
       const { eligible, openCount, seen } = scan();
 
       // '지금 리뷰' 로 지목된 PR 을 맨 앞으로. sort 는 안정적이므로 그 안에서는
@@ -1245,6 +1342,13 @@ program
         } catch (e) {
           console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
         }
+        // 종료 요청은 사이클이 완전히 끝난 뒤에만 처리한다 — 라운드 중간에
+        // 끊으면 이미 소비한 대화 한도로 만든 응답을 버린다.
+        if (stopRequested) {
+          console.log(chalk.magenta('\n  ■ 종료합니다 (요청됨).'));
+          await cleanup();
+          return;
+        }
         scheduleNext(reviewRan ? 0 : nextDelay()); // 사이클 종료 후에만 다음 예약
       }, delayMs);
     };
@@ -1266,6 +1370,87 @@ program
     };
     process.on('SIGINT', cleanup);
     process.on('SIGTERM', cleanup);
+  });
+
+// ── stop ──
+//
+// 데몬을 끄는 **사람용 문**이다. 스킬이 쓰는 클라이언트(scripts/daemon.mjs)에는
+// 이 동사가 없다 — 여러 세션이 같은 데몬을 쓰는데 한 세션이 남의 리뷰를 끊을 수
+// 있으면 안 되기 때문이다. 백그라운드로 띄운 데몬은 Ctrl+C 를 받을 터미널이
+// 없으므로, 이 명령과 대시보드 종료 버튼이 유일한 정상 종료 경로다.
+
+const STOP_PORT_WALK = 10;
+
+/** 살아 있는 대시보드를 찾는다 — 기록된 주소 우선, 없으면 기본 포트 주변. */
+async function findDashboard(recorded: string | null): Promise<string | null> {
+  const candidates = recorded ? [recorded] : [];
+  for (let i = 0; i < STOP_PORT_WALK; i++) {
+    const u = `http://127.0.0.1:${DEFAULT_UI_PORT + i}`;
+    if (u !== recorded) candidates.push(u);
+  }
+  for (const ui of candidates) {
+    try {
+      const res = await fetch(`${ui}/api/state`, { signal: AbortSignal.timeout(1_500) });
+      if (res.ok) return ui;
+    } catch {
+      /* 다음 후보 */
+    }
+  }
+  return null;
+}
+
+program
+  .command('stop')
+  .description('돌고 있는 watch 데몬을 종료한다 (진행 중인 라운드는 끝까지 마친다)')
+  .option('--now', '라운드 종료를 기다리지 않고 즉시 끝낸다 (진행 중인 응답을 버린다)', false)
+  .action(async (opts: { now: boolean }) => {
+    const cfg = loadConfig();
+    const info = readDaemonFile(cfg.dataDir);
+    const ui = await findDashboard(info?.ui ?? null);
+
+    if (opts.now) {
+      if (!info?.pid) {
+        console.log(chalk.red('  ✗ 실행 중인 데몬의 pid 를 찾지 못했습니다.'));
+        console.log(chalk.dim(`    ${cfg.dataDir}/daemon.json 이 없습니다 — 대시보드가 없는 데몬일 수 있습니다.`));
+        return;
+      }
+      // 진행 중인 라운드가 있으면 이미 소비한 대화 한도가 버려진다. 그래도
+      // 응답이 멎어 15분을 기다리는 상황에서는 이 문이 필요하다.
+      try {
+        process.kill(info.pid);
+        console.log(chalk.yellow(`  ■ 데몬(pid ${info.pid})을 즉시 종료했습니다.`));
+        console.log(chalk.dim('    진행 중이던 라운드가 있었다면 그 응답은 버려집니다.'));
+      } catch (e) {
+        console.log(chalk.red(`  ✗ 종료하지 못했습니다: ${e instanceof Error ? e.message : String(e)}`));
+        console.log(chalk.dim('    이미 끝났을 수 있습니다.'));
+      }
+      return;
+    }
+
+    if (!ui) {
+      console.log(chalk.dim('  실행 중인 데몬을 찾지 못했습니다 (이미 종료된 것으로 보입니다).'));
+      return;
+    }
+
+    try {
+      const res = await fetch(`${ui}/api/shutdown`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!res.ok || body.ok === false) {
+        console.log(chalk.red(`  ✗ 종료 요청 실패: ${body.error ?? `HTTP ${res.status}`}`));
+        return;
+      }
+      console.log(chalk.magenta(`  ■ 종료를 요청했습니다 — ${ui}`));
+      console.log(
+        chalk.dim('    진행 중인 라운드가 있으면 그 라운드를 마친 뒤 종료합니다 (최대 15분).'),
+      );
+      console.log(chalk.dim('    즉시 끝내려면  npm run dev -- stop --now'));
+    } catch (e) {
+      console.log(chalk.red(`  ✗ 종료 요청 실패: ${e instanceof Error ? e.message : String(e)}`));
+    }
   });
 
 // ── queue ──

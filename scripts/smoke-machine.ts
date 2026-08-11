@@ -38,6 +38,8 @@ import {
   LockPortBusyError,
 } from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
+import { parseIntent } from '../src/ui/server.js';
+import { publishDaemonFile, readDaemonFile, clearDaemonFile } from '../src/daemon-file.js';
 import {
   admitsNewPR,
   createRepoSource,
@@ -1619,6 +1621,57 @@ const fakePR: PRInfo = {
 
   rmSync(dir, { recursive: true, force: true });
   rmSync(other, { recursive: true, force: true });
+}
+
+// ── 시나리오 39: 제어 의도 어휘 (스킬이 여럿이라 문이 좁아야 한다) ──
+{
+  const bad = (b: unknown): boolean => typeof parseIntent(b) === 'string';
+
+  // 종료는 /api/intent 로 들어올 수 없다. 이게 뚫리면 한 세션이 다른 세션들의
+  // 리뷰를 통째로 끊을 수 있다 — 스킬 클라이언트에 동사를 안 넣은 의미가 사라진다.
+  assert(bad({ kind: 'stop' }), 'stop 은 /api/intent 로 받지 않는다');
+
+  const add = parseIntent({ kind: 'scope-add', include: [' a/b ', ''] });
+  assert(
+    typeof add !== 'string' && add.kind === 'scope-add' && add.include.length === 1 &&
+      add.include[0] === 'a/b',
+    'scope-add 는 공백을 다듬고 빈 항목을 버린다',
+  );
+
+  // 빈 include 를 통과시키면 "아무것도 아닌 변경" 이 캐시만 버리게 된다.
+  assert(bad({ kind: 'scope-add', include: [] }), '빈 scope-add 는 거부한다');
+  assert(bad({ kind: 'scope-add', include: 'a/b' }), 'scope-add 는 배열만 받는다');
+
+  const rm = parseIntent({ kind: 'scope-remove', include: ['x/y'] });
+  assert(typeof rm !== 'string' && rm.kind === 'scope-remove', 'scope-remove 를 받는다');
+}
+
+// ── 시나리오 40: 데몬 안내 파일 ────────────────────────────
+{
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-daemon-'));
+  assert(readDaemonFile(dir) === null, '없으면 null (포트 폴백으로 넘어간다)');
+
+  const info = {
+    ui: 'http://127.0.0.1:4480',
+    pid: process.pid,
+    root: dir,
+    startedAt: new Date().toISOString(),
+    mode: 'review' as const,
+  };
+  publishDaemonFile(dir, info);
+  assert(readDaemonFile(dir)?.ui === info.ui, '기록한 주소를 그대로 읽는다');
+
+  // 남의 파일은 지우지 않는다 — 내가 죽는 사이 다음 주인이 덮어썼을 수 있고,
+  // 그걸 지우면 살아 있는 데몬이 안내 파일 없이 남는다.
+  publishDaemonFile(dir, { ...info, pid: process.pid + 1 });
+  clearDaemonFile(dir);
+  assert(readDaemonFile(dir) !== null, '남의 안내 파일은 지우지 않는다');
+
+  publishDaemonFile(dir, info);
+  clearDaemonFile(dir);
+  assert(readDaemonFile(dir) === null, '내가 쓴 것은 지운다');
+
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // ── 결과 ────────────────────────────────────────────────────
