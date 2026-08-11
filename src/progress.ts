@@ -92,6 +92,15 @@ export interface ContextCard {
   conversationUrl?: string;
   conversationTurns?: number;
   updatedAt: string;
+  /**
+   * 지금까지 일어난 **상태 전이 횟수** (이벤트 히스토리 길이).
+   *
+   * "내 요청 이후에 무슨 일이 있었나" 를 판정하는 단조 증가 토큰이다.
+   * `round` 로는 안 된다 — 실패·쿼터 한도·PR 닫힘은 라운드를 올리지 않고
+   * 전이만 하므로, 라운드로 재면 그 결과들을 "예전 것" 으로 버린다.
+   * `updatedAt` 도 안 된다 — 스캔마다 갱신돼서 아무 일이 없어도 계속 움직인다.
+   */
+  seq: number;
 }
 
 export interface CycleInfo {
@@ -106,6 +115,15 @@ export interface CycleInfo {
   /** GraphQL 잔여 한도 (-1 = 미관측) */
   remaining: number;
   lastScanAt: number | null;
+  /**
+   * 레포별 **실제로 GitHub 을 조회한** 마지막 시각 (slug → epoch ms).
+   *
+   * `lastScanAt` 으로는 대신할 수 없다. 사이클은 매번 끝나지만 `probeIdleIntervalMs`
+   * (기본 60초) 안에 있는 레포는 조회를 건너뛰기 때문이다 — 전역 시각만 보면
+   * "방금 스캔했다" 가 참인데 정작 그 레포는 안 봤을 수 있고, 그 사이에 생긴 PR 을
+   * 없는 것으로 단정하게 된다. 키에 없는 레포는 이번 스캔 대상이 아니었다는 뜻이다.
+   */
+  probedAt: Record<string, number>;
   /** 다음 스캔 예정 시각 — 카운트다운은 클라이언트가 계산한다 */
   nextScanAt: number | null;
 }
@@ -136,6 +154,27 @@ export interface Snapshot {
    * 전부 "이미 본 것" 으로 버린다 (재연결 자체는 EventSource 가 알아서 한다).
    */
   session: string;
+  /**
+   * 이 데몬이 **어느 설치본**인지 (dataDir 기준). 세션 id 와 다르다 — 저건
+   * 프로세스마다 새로 만들고, 이건 재시작해도 같다.
+   *
+   * 잠금은 dataDir 단위인데 UI 포트는 머신 전체에서 공유된다. 그래서 체크아웃이
+   * 둘이면 4478·4479 에 서로 다른 설치본의 데몬이 동시에 존재할 수 있고, 붙는
+   * 쪽이 포트만 보고 고르면 **남의 설정·계정으로** 리뷰를 요청하거나 남의
+   * 데몬을 종료하게 된다. 클라이언트는 자기 dataDir 로 같은 값을 계산해 대조한다.
+   */
+  instance: string | null;
+  /** 'observe' 면 리뷰를 실행하지 않는다 — 리뷰를 요청해도 큐에만 쌓인다. */
+  mode: 'review' | 'observe';
+  /**
+   * 초기화가 **끝났는가** — 브라우저 기동과 ChatGPT 로그인 확인까지.
+   *
+   * UI 는 그 모든 것보다 **먼저** 열린다 (로그인 안내도 대시보드에 남아야
+   * 하므로). 그래서 `/api/state` 가 응답한다는 것만으로 기동 성공을 확정하면,
+   * 세션이 만료된 경우 **곧 죽을 프로세스를 "정상 기동" 으로 보고**하게 된다.
+   * 비용을 쓰기 전에 붙는 쪽이 이 값을 본다.
+   */
+  ready: boolean;
   control: ControlState;
   startedAt: number;
   scope: string;
@@ -199,6 +238,9 @@ const LOG_CAP = 600;
 function emptySnapshot(session: string): Snapshot {
   return {
     session,
+    instance: null,
+    mode: 'review',
+    ready: false,
     control: {
       mode: '',
       paused: false,
@@ -221,6 +263,7 @@ function emptySnapshot(session: string): Snapshot {
       remaining: -1,
       lastScanAt: null,
       nextScanAt: null,
+      probedAt: {},
     },
     quotaUntil: null,
     active: null,

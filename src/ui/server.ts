@@ -121,8 +121,13 @@ function rejectsCrossOrigin(req: IncomingMessage, host: string): string | null {
   return null;
 }
 
-/** 신뢰할 수 없는 입력을 Intent 로 좁힌다. 모르는 종류는 거부한다. */
-function parseIntent(body: unknown): Intent | string {
+/**
+ * 신뢰할 수 없는 입력을 Intent 로 좁힌다. 모르는 종류는 거부한다.
+ *
+ * `stop` 은 `INTENT_KINDS` 에 없으므로 여기서 **반드시 거부된다** — 종료는
+ * 전용 엔드포인트만 만들 수 있다 (intents.ts 참고). 스모크가 이걸 지킨다.
+ */
+export function parseIntent(body: unknown): Intent | string {
   if (!body || typeof body !== 'object') return '본문이 객체가 아닙니다';
   const b = body as Record<string, unknown>;
   const kind = b.kind;
@@ -137,10 +142,18 @@ function parseIntent(body: unknown): Intent | string {
     case 'resume':
       return { kind };
     case 'skip-add':
-    case 'skip-remove':
-    case 'review-now': {
+    case 'skip-remove': {
       if (typeof b.ref !== 'string' || !b.ref.trim()) return 'ref 가 필요합니다';
       return { kind, ref: b.ref.trim() };
+    }
+    case 'review-now': {
+      if (typeof b.ref !== 'string' || !b.ref.trim()) return 'ref 가 필요합니다';
+      // seq 는 선택이다 — 대시보드 버튼은 사람이 지금 화면을 보고 누르므로
+      // 굳이 조건을 달지 않는다. 지연 적용되는 클라이언트만 보낸다.
+      if (b.seq === undefined) return { kind, ref: b.ref.trim() };
+      const seq = Number(b.seq);
+      if (!Number.isInteger(seq) || seq < 0) return 'seq 는 0 이상의 정수여야 합니다';
+      return { kind, ref: b.ref.trim(), seq };
     }
     case 'only-set': {
       const refs = strArray(b.refs);
@@ -266,6 +279,23 @@ async function handle(
         }
         const path = hooks.writeInstructions(b.body);
         json(res, 200, { ok: true, path });
+        return;
+      }
+
+      /**
+       * 종료 — **사람이 쓰는 문이다.** `/api/intent` 와 따로 둔 이유는
+       * intents.ts 의 `INTENT_KINDS` 주석에 적어두었다.
+       *
+       * 끊는 게 아니라 **예약한다.** 라운드 하나가 2~15분이고 그 사이에
+       * 프로세스를 죽이면 이미 소비한 대화 한도로 만든 응답을 버리고,
+       * `pendingSend` 만 남아 다음 실행이 회수 판정을 해야 한다. 그래서 다른
+       * 제어와 같은 완충 지대에 넣고, 루프가 **라운드가 돌지 않는 지점**에서
+       * 꺼내 스스로 정리하고 나간다.
+       */
+      if (url === '/api/shutdown') {
+        const pending = intents.push({ kind: 'stop' });
+        progress.control({ pendingIntents: pending });
+        json(res, 202, { ok: true, pending });
         return;
       }
     } catch (e) {

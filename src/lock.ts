@@ -173,6 +173,20 @@ async function probe(dataDir: string, port: number): Promise<LockInfo | 'foreign
   });
 }
 
+/**
+ * 지금 이 dataDir 의 잠금을 쥐고 있는 프로세스. **커널이 보증하는 신원**이다.
+ *
+ * `watch.lock.json`·`daemon.json` 은 안내용이라 강제 종료·크래시 뒤에 남을 수
+ * 있고, 그 사이 OS 가 pid 를 재사용하면 거기 적힌 pid 는 **무관한 프로세스**를
+ * 가리킨다. 그걸 믿고 kill 하면 남의 프로세스를 죽인다. 포트를 쥔 쪽만이
+ * 지금 살아 있는 주인이므로, 죽이기 전에는 반드시 여기에 물어본다.
+ */
+export async function probeLock(dataDir: string): Promise<LockInfo | 'foreign' | 'gone'> {
+  const port = readLockPort(dataDir);
+  if (port === null) return 'gone';
+  return probe(dataDir, port);
+}
+
 function infoFile(dataDir: string): string {
   return path.join(dataDir, 'watch.lock.json');
 }

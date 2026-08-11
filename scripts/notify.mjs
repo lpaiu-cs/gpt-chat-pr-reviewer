@@ -43,6 +43,11 @@ if (flag('--help') || flag('-h')) {
     --on <events>     --exec 를 실행할 이벤트, 쉼표 구분 (기본 posted,converged,failed)
     --exec <command>  이벤트 발생 시 실행할 셸 명령
     --porcelain       이벤트 1건 = 1줄, 장식 없음 (에이전트·스크립트가 소비할 때)
+    --until <events>  이 중 하나가 나오면 **종료한다**, 쉼표 구분
+                      (없으면 계속 구독한다)
+    --since-seq <n>   붙기 전에 이미 끝난 결과도 인정하되 전이 횟수 n **이후**만
+                      (없으면 붙은 뒤의 전이만 본다)
+    --timeout <초>    이 시간 안에 --until 이벤트가 없으면 'timeout' 을 내고 종료
     --no-bell         터미널 벨 끄기
     --quiet           진행 단계는 **화면에** 찍지 않고 주요 이벤트만
                       (--exec 실행 대상은 --on 이 정한다 — quiet 는 관여하지 않는다)
@@ -68,6 +73,45 @@ const ON = new Set(value('--on', 'posted,converged,failed').split(',').map((s) =
 const PORCELAIN = flag('--porcelain');
 const BELL = !flag('--no-bell') && !PORCELAIN;
 const QUIET = flag('--quiet');
+
+/**
+ * 한 건만 받고 끝내는 모드.
+ *
+ * 세션이 이 프로세스를 **백그라운드로** 띄워두고 종료를 신호로 삼는다 —
+ * 라운드가 2~15분이라 앞에서 기다릴 수 없기 때문이다. 계속 사는 구독자로만
+ * 두면 "무슨 일이 생겼다" 를 알릴 방법이 프로세스 종료밖에 없는 소비자를
+ * 지원할 수 없다.
+ */
+const UNTIL = new Set(
+  (value('--until', '') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+/** 초. 0 이면 무제한. --until 없이 주면 아무 의미가 없다. */
+const TIMEOUT_S = Number(value('--timeout', '0')) || 0;
+
+/**
+ * "이 시점 **이후**의 결과만 이미 도달한 것으로 인정한다."
+ *
+ * 붙기 전에 라운드가 끝나면 그 결과를 영영 못 받는 문제(구독 경쟁) 때문에
+ * 첫 스냅샷의 현재 상태도 보는데, 조건 없이 보면 반대로 **이전 라운드가 남긴
+ * 상태**를 새 결과로 재생한다: 1차가 AWAITING_AUTHOR 인 채로 수정을 push 하고
+ * 곧바로 기다리면, watch 가 새 커밋을 보기 전이라 첫 스냅샷은 여전히
+ * AWAITING_AUTHOR 고 — 즉시 깨어나 2차를 아예 안 기다린다.
+ *
+ * 기준은 **전이 횟수**(`ContextCard.seq`)다. 라운드 번호로 재면 안 된다 —
+ * 실패·쿼터 한도·PR 닫힘은 라운드를 올리지 않고 전이만 하므로, 요청 직후에
+ * 그런 일이 나면 "예전 것" 으로 버리고 타임아웃까지 기다린다. 쿼터는 실제로는
+ * 몇 시간짜리 대기라 원인까지 잘못 전하게 된다.
+ *
+ * 값이 없으면 재생하지 않는다 — 놓치는 쪽이 오인하는 쪽보다 낫다. 놓쳐도 다음
+ * 전이나 타임아웃으로 드러나지만, 오인은 "결과가 나왔다" 는 거짓말이라 그 위에
+ * 쌓은 판단이 전부 틀어진다.
+ */
+const SINCE_SEQ = value('--since-seq', null) === null
+  ? null
+  : Number(value('--since-seq', null));
 
 // ── 감시 대상 필터 ──────────────────────────────────────────
 
@@ -205,6 +249,21 @@ function emit(event, ctx, detail = '') {
   }
 
   runExec(event, ctx);
+
+  // --until 은 출력·exec 뒤에 본다. 종료가 먼저면 방금 받은 이벤트를 소비자가
+  // 못 보고, 그러면 "무엇 때문에 깨어났는지" 를 알 수 없다.
+  if (UNTIL.has(event)) finish(0);
+}
+
+/**
+ * 대기를 끝낸다. --exec 이 걸려 있으면 그 체인이 끝난 뒤에 나간다 —
+ * 핸들러가 git 작업이면 중간에 죽는 게 안 하느니만 못하다.
+ */
+let finishing = false;
+function finish(code) {
+  if (finishing) return;
+  finishing = true;
+  chain.then(() => process.exit(code));
 }
 
 // ── 상태 비교 ───────────────────────────────────────────────
@@ -310,6 +369,30 @@ function onSnapshot(s) {
     baselined = true;
     const watching = s.contexts.filter((c) => matchesFilter(c.key));
 
+    /**
+     * 붙기 **전에** 이미 끝나 있던 경우 (`--until` + `--since-round` 한정).
+     *
+     * `review` 와 `wait` 는 별도 프로세스라 그 사이에 라운드가 끝날 수 있다.
+     * 기준선은 전이만 보므로 그 결과는 영영 안 오고 타임아웃까지 기다린다.
+     *
+     * 다만 **기준 시점보다 뒤의 전이만** 인정한다 (SINCE_SEQ 주석 참고).
+     * 계속 구독하는 모드에서는 아예 하지 않는다 — 거기서 "지금 상태" 를 쏟으면
+     * 재연결마다 같은 소식이 반복된다 (기준선을 두는 이유가 그것이다).
+     *
+     * seq 를 알리지 않는 데몬(구버전)에서는 재생하지 않는다. 판별 불가는
+     * 오인보다 낫다.
+     */
+    if (UNTIL.size > 0 && SINCE_SEQ !== null && Number.isFinite(SINCE_SEQ)) {
+      for (const c of watching) {
+        const event = STATE_EVENT[c.state];
+        if (!event || !UNTIL.has(event)) continue;
+        if (!Number.isFinite(Number(c.seq))) continue; // 판별 불가
+        if (!(Number(c.seq) > SINCE_SEQ)) continue; // 요청 이전에 이미 있던 상태
+        emit(event, c, `${c.round}라운드 · 붙기 전에 끝나 있었습니다`);
+        return;
+      }
+    }
+
     if (PORCELAIN) {
       console.log(
         `connected  ${FILTERS.length ? FILTERS.map((f) => f.label).join(',') : '전체'}  ` +
@@ -369,6 +452,19 @@ async function main() {
           `${BELL ? ' · 벨 켜짐' : ''}\n`,
       ),
     );
+  }
+
+  if (TIMEOUT_S > 0) {
+    setTimeout(() => {
+      // 소비자는 침묵을 해석할 수 없다. "아무 일도 없었다" 를 **한 줄로**
+      // 내보내야 대기가 끝난 이유가 이벤트인지 시간 초과인지 갈린다.
+      const label = FILTERS.length ? FILTERS.map((f) => f.label).join(',') : '전체';
+      if (PORCELAIN) console.log(`timeout  ${label}  ${TIMEOUT_S}초`);
+      else say(C.yellow(`${TIMEOUT_S}초 안에 기다리던 이벤트가 없었습니다 — 종료합니다.`));
+      finish(2);
+      // unref 하지 않는다 — 이 타이머가 마지막 핸들일 때 조용히 exit 0 으로
+      // 나가버리면 소비자는 타임아웃을 정상 종료로 읽는다.
+    }, TIMEOUT_S * 1000);
   }
 
   for (;;) {

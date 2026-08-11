@@ -28,7 +28,8 @@ import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
-import { acquireLock, LockHeldError, LockPortBusyError } from './lock.js';
+import { acquireLock, probeLock, LockHeldError, LockPortBusyError } from './lock.js';
+import { publishDaemonFile, readDaemonFile, clearDaemonFile, instanceId } from './daemon-file.js';
 import {
   admitsNewPR,
   createRepoSource,
@@ -190,6 +191,7 @@ function toCard(c: PRContext): ContextCard {
     conversationUrl: c.conversationUrl,
     conversationTurns: c.conversationUrl ? c.conversationTurns : undefined,
     updatedAt: c.updatedAt,
+    seq: c.history?.length ?? 0,
   };
 }
 
@@ -492,6 +494,15 @@ program
 
     // ── 제어 상태 (UI 의도 큐가 바꾼다) ──
     let paused = false;
+    /**
+     * 종료 예약. `/api/shutdown` 이 넣은 의도를 applyIntents 가 여기로 옮긴다.
+     *
+     * 플래그를 두는 이유는 **끊지 않기 위해서**다. 라운드가 도는 중에
+     * 프로세스를 죽이면 이미 소비한 대화 한도로 만든 응답을 버린다. 의도 큐는
+     * 라운드가 돌지 않는 지점에서만 배수되므로, 여기 도달했다는 건 이미 안전한
+     * 시점이라는 뜻이다 — 그 자리에서 사이클을 접고 정리 경로로 나간다.
+     */
+    let stopRequested = false;
     /** '지금 리뷰' 로 큐 앞으로 당긴 PR (정규화 키). 그 라운드가 돌면 빠진다. */
     const prioritized = new Set<string>();
     scope.filters ??= {};
@@ -658,6 +669,12 @@ program
             console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
             break;
           }
+          case 'stop':
+            if (!stopRequested) {
+              console.log(chalk.magenta('    ■ 종료 요청 — 정리하고 나갑니다.'));
+            }
+            stopRequested = true;
+            break;
         }
       }
 
@@ -675,6 +692,29 @@ program
         }
         if (target.state === 'REVIEWING') {
           console.log(chalk.dim(`    ${key} 는 이미 리뷰 중입니다.`));
+          continue;
+        }
+
+        // **지연 적용되는 요청은 조건부여야 한다.**
+        //
+        // 이 의도는 진행 중인 라운드가 끝난 다음 사이클에야 배수된다 (2~15분).
+        // 그 사이에 그 PR 이 이미 리뷰됐으면 — cold start 에서 첫 스캔 직후
+        // 자동으로 시작되는 경우가 대표적이다 — 아래의 강제 전이가 방금 끝난
+        // AWAITING_AUTHOR/CONVERGED 를 REVIEW_DUE 로 되돌려 **같은 PR 을 연달아
+        // 한 번 더 리뷰한다.** 대화 한도를 두 번 쓰고 중복 리뷰를 게시한다.
+        //
+        // REVIEW_DUE 는 예외다 — 이미 큐에 오를 상태라 강제할 것이 없고,
+        // 앞으로 당기는 것뿐이라 중복을 만들지 않는다.
+        if (
+          it.seq !== undefined &&
+          target.history.length > it.seq &&
+          target.state !== 'REVIEW_DUE'
+        ) {
+          console.log(
+            chalk.dim(
+              `    ${key} 는 요청 이후 이미 진행됐습니다 (${STATE_LABELS[target.state]}) — 중복 예약하지 않습니다.`,
+            ),
+          );
           continue;
         }
 
@@ -796,8 +836,22 @@ program
           startedAt: Date.now(),
           scope: describeScope(scope),
           dryRun: opts.dryRun,
+          // 붙는 쪽이 "이게 내 설치본의 데몬인가" 를 판정할 근거 (daemon-file.ts).
+          instance: instanceId(cfg.dataDir),
+          mode: opts.observe ? 'observe' : 'review',
         });
         console.log(chalk.cyan(`  ◆ 대시보드: ${ui.url}`) + chalk.dim('  (localhost 전용)'));
+
+        // 붙으려는 쪽이 포트를 찾을 수 있게 남긴다. 잠금 해제와 같은 자리에
+        // 걸어 어떤 반환 경로로 끝나도 정리되게 한다 (daemon-file.ts 참고).
+        publishDaemonFile(cfg.dataDir, {
+          ui: ui.url,
+          pid: process.pid,
+          root: process.cwd(),
+          startedAt: new Date().toISOString(),
+          mode: opts.observe ? 'observe' : 'review',
+        });
+        process.once('exit', () => clearDaemonFile(cfg.dataDir));
       } catch (e) {
         // 대시보드는 부가 기능이다 — 못 떠도 감시는 계속한다.
         console.log(
@@ -830,6 +884,13 @@ program
       console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
       progress.patch({ account: user.email ?? user.name ?? null });
     }
+
+    // 여기까지 왔으면 초기화가 끝났다 — 관측 모드는 띄울 것이 없고, 리뷰 모드는
+    // 브라우저와 로그인 확인을 통과했다. 이 값을 켜기 전까지 붙는 쪽은 기동
+    // 성공으로 보지 않는다. UI 는 이보다 한참 먼저 열리기 때문이다
+    // (Snapshot.ready 주석 참고 — 로그인 만료 시 곧 죽을 프로세스를 정상으로
+    // 보고하던 자리다).
+    progress.patch({ ready: true });
 
     // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
     // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
@@ -1055,7 +1116,19 @@ program
         contexts: seen.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(toCard),
         quotaUntil: quotaAt > Date.now() ? quotaAt : null,
       });
-      progress.cycle({ openCount, watchedRepos });
+      // 레포별 실제 조회 시각을 그대로 내보낸다 — 붙는 쪽이 "그 레포를 이번에
+      // 정말 봤나" 를 판정해야 한다 (CycleInfo.probedAt 주석 참고).
+      // 키는 소문자로 정규화한다. GitHub 레포 slug 는 대소문자를 구분하지 않고
+      // `parsePRRef` 도 그 전제로 접어서 비교하는데, 여기만 원본 casing 을 쓰면
+      // 붙는 쪽이 `owner/imagetoeditableppt` 로 조회했을 때 키가 안 맞아
+      // "조회한 적 없다" 로 오판한다.
+      progress.cycle({
+        openCount,
+        watchedRepos,
+        probedAt: Object.fromEntries(
+          [...lastProbeAt].map(([slug, at]) => [slug.toLowerCase(), at]),
+        ),
+      });
       publishControl();
     };
 
@@ -1066,6 +1139,11 @@ program
 
       // 제어 의도는 스캔 직전에만 적용한다 — 라운드가 돌지 않는 유일한 지점이다.
       applyIntents();
+
+      // 종료가 예약됐으면 **여기서 접는다.** 아래로 내려가면 이 사이클이 또
+      // 라운드를 시작해 2~15분을 더 붙잡는다 — 사용자가 종료를 누른 뒤 그만큼
+      // 더 기다리게 되고, 그 라운드는 어차피 버려질 수도 있다.
+      if (stopRequested) return false;
 
       const { eligible, openCount, seen } = scan();
 
@@ -1245,6 +1323,13 @@ program
         } catch (e) {
           console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
         }
+        // 종료 요청은 사이클이 완전히 끝난 뒤에만 처리한다 — 라운드 중간에
+        // 끊으면 이미 소비한 대화 한도로 만든 응답을 버린다.
+        if (stopRequested) {
+          console.log(chalk.magenta('\n  ■ 종료합니다 (요청됨).'));
+          await cleanup();
+          return;
+        }
         scheduleNext(reviewRan ? 0 : nextDelay()); // 사이클 종료 후에만 다음 예약
       }, delayMs);
     };
@@ -1266,6 +1351,115 @@ program
     };
     process.on('SIGINT', cleanup);
     process.on('SIGTERM', cleanup);
+  });
+
+// ── stop ──
+//
+// 데몬을 끄는 **사람용 문**이다. 스킬이 쓰는 클라이언트(scripts/daemon.mjs)에는
+// 이 동사가 없다 — 여러 세션이 같은 데몬을 쓰는데 한 세션이 남의 리뷰를 끊을 수
+// 있으면 안 되기 때문이다. 백그라운드로 띄운 데몬은 Ctrl+C 를 받을 터미널이
+// 없으므로, 이 명령과 대시보드 종료 버튼이 유일한 정상 종료 경로다.
+
+const STOP_PORT_WALK = 10;
+
+/**
+ * **이 설치본의** 살아 있는 대시보드를 찾는다.
+ *
+ * 포트가 열려 있다는 것만으로 받아들이면 안 된다 — 잠금은 dataDir 단위인데
+ * 포트는 머신 전체에서 공유되므로, 체크아웃이 둘이면 4478·4479 에 서로 다른
+ * 설치본의 데몬이 뜬다. 그대로 붙으면 남의 데몬을 종료하게 된다.
+ * 그래서 스냅샷의 instance 를 대조하고, **밝히지 않는 데몬은 거부한다**
+ * (구버전이다 — 모르는 값으로 전진하면 그게 바로 막으려던 사고다).
+ */
+async function findDashboard(dataDir: string, recorded: string | null): Promise<string | null> {
+  const want = instanceId(dataDir);
+  const candidates = recorded ? [recorded] : [];
+  for (let i = 0; i < STOP_PORT_WALK; i++) {
+    const u = `http://127.0.0.1:${DEFAULT_UI_PORT + i}`;
+    if (u !== recorded) candidates.push(u);
+  }
+  for (const ui of candidates) {
+    try {
+      const res = await fetch(`${ui}/api/state`, { signal: AbortSignal.timeout(1_500) });
+      if (!res.ok) continue;
+      const body = (await res.json()) as { snapshot?: { instance?: string | null } };
+      if (body.snapshot?.instance === want) return ui;
+    } catch {
+      /* 다음 후보 */
+    }
+  }
+  return null;
+}
+
+program
+  .command('stop')
+  .description('돌고 있는 watch 데몬을 종료한다 (진행 중인 라운드는 끝까지 마친다)')
+  .option('--now', '라운드 종료를 기다리지 않고 즉시 끝낸다 (진행 중인 응답을 버린다)', false)
+  .action(async (opts: { now: boolean }) => {
+    const cfg = loadConfig();
+    const info = readDaemonFile(cfg.dataDir);
+
+    if (opts.now) {
+      // **pid 는 안내 파일이 아니라 잠금에서 얻는다.** daemon.json 은 강제
+      // 종료·크래시 뒤에 남을 수 있고, 그 사이 OS 가 pid 를 재사용했으면
+      // 거기 적힌 번호는 무관한 프로세스를 가리킨다 — 그걸 죽이면 남의
+      // 작업을 날린다. 포트를 쥔 쪽만이 지금 살아 있는 주인이다.
+      const owner = await probeLock(cfg.dataDir);
+      if (owner === 'gone') {
+        console.log(chalk.dim('  실행 중인 데몬이 없습니다 (잠금이 비어 있습니다).'));
+        if (info) console.log(chalk.dim(`    ${cfg.dataDir}/daemon.json 은 잔여물입니다 — 무시합니다.`));
+        return;
+      }
+      if (owner === 'foreign') {
+        console.log(chalk.red('  ✗ 잠금 포트를 다른 프로그램이 쓰고 있어 주인을 확인할 수 없습니다.'));
+        console.log(chalk.dim('    확인되지 않은 pid 는 종료하지 않습니다.'));
+        return;
+      }
+      // 진행 중인 라운드가 있으면 이미 소비한 대화 한도가 버려진다. 그래도
+      // 응답이 멎어 15분을 기다리는 상황에서는 이 문이 필요하다.
+      try {
+        process.kill(owner.pid);
+        console.log(chalk.yellow(`  ■ 데몬(pid ${owner.pid} · ${owner.command})을 즉시 종료했습니다.`));
+        console.log(chalk.dim('    진행 중이던 라운드가 있었다면 그 응답은 버려집니다.'));
+      } catch (e) {
+        console.log(chalk.red(`  ✗ 종료하지 못했습니다: ${e instanceof Error ? e.message : String(e)}`));
+        console.log(chalk.dim('    이미 끝났을 수 있습니다.'));
+      }
+      return;
+    }
+
+    const ui = await findDashboard(cfg.dataDir, info?.ui ?? null);
+
+    if (!ui) {
+      console.log(chalk.dim('  이 설치본의 대시보드를 찾지 못했습니다.'));
+      console.log(
+        chalk.dim(
+          '    이미 종료됐거나, --ui 없이 떠 있거나, instance 를 알리지 않는 구버전일 수 있습니다.',
+        ),
+      );
+      console.log(chalk.dim('    프로세스를 확실히 끝내려면  npm run dev -- stop --now'));
+      return;
+    }
+
+    try {
+      const res = await fetch(`${ui}/api/shutdown`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!res.ok || body.ok === false) {
+        console.log(chalk.red(`  ✗ 종료 요청 실패: ${body.error ?? `HTTP ${res.status}`}`));
+        return;
+      }
+      console.log(chalk.magenta(`  ■ 종료를 요청했습니다 — ${ui}`));
+      console.log(
+        chalk.dim('    진행 중인 라운드가 있으면 그 라운드를 마친 뒤 종료합니다 (최대 15분).'),
+      );
+      console.log(chalk.dim('    즉시 끝내려면  npm run dev -- stop --now'));
+    } catch (e) {
+      console.log(chalk.red(`  ✗ 종료 요청 실패: ${e instanceof Error ? e.message : String(e)}`));
+    }
   });
 
 // ── queue ──

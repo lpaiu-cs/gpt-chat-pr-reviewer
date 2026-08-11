@@ -38,6 +38,14 @@ import {
   LockPortBusyError,
 } from '../src/lock.js';
 import { progress, inferLevel, stripAnsi } from '../src/progress.js';
+import { parseIntent } from '../src/ui/server.js';
+import {
+  publishDaemonFile,
+  readDaemonFile,
+  clearDaemonFile,
+  instanceId,
+} from '../src/daemon-file.js';
+import { createHash } from 'node:crypto';
 import {
   admitsNewPR,
   createRepoSource,
@@ -1616,6 +1624,112 @@ const fakePR: PRInfo = {
   assert(readLock(broken)?.port === followed, '기록된 포트를 그대로 따른다');
   follower();
   rmSync(broken, { recursive: true, force: true });
+
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
+}
+
+// ── 시나리오 39: 제어 의도 어휘 (스킬이 여럿이라 문이 좁아야 한다) ──
+{
+  const bad = (b: unknown): boolean => typeof parseIntent(b) === 'string';
+
+  // 종료는 /api/intent 로 들어올 수 없다. 이게 뚫리면 한 세션이 다른 세션들의
+  // 리뷰를 통째로 끊을 수 있다 — 스킬 클라이언트에 동사를 안 넣은 의미가 사라진다.
+  assert(bad({ kind: 'stop' }), 'stop 은 /api/intent 로 받지 않는다');
+
+  // 범위를 **넓히는** 문은 클라이언트에게 열어주지 않는다. 범위는 레포 단위라
+  // PR 하나를 부탁하는 요청이 그 레포의 다른 열린 PR 까지 리뷰 대상으로 만든다.
+  assert(bad({ kind: 'scope-add', include: ['a/b'] }), 'scope-add 는 받지 않는다');
+  assert(bad({ kind: 'scope-remove', include: ['a/b'] }), 'scope-remove 는 받지 않는다');
+
+  // 좁히는 쪽(PR 단위 skip)과 사람이 쓰는 scope-set 은 그대로 열려 있다.
+  const skip = parseIntent({ kind: 'skip-add', ref: 'o/r#1' });
+  assert(typeof skip !== 'string' && skip.kind === 'skip-add', 'skip-add 는 받는다');
+  const set = parseIntent({ kind: 'scope-set', include: ['a/*'], exclude: [] });
+  assert(typeof set !== 'string' && set.kind === 'scope-set', 'scope-set 은 받는다');
+
+  // review-now 의 조건부 적용 토큰. 대시보드(사람)는 안 보내므로 선택이다.
+  const bare = parseIntent({ kind: 'review-now', ref: 'o/r#1' });
+  assert(
+    typeof bare !== 'string' && bare.kind === 'review-now' && bare.seq === undefined,
+    'review-now 는 seq 없이도 받는다 (대시보드 버튼)',
+  );
+  const cond = parseIntent({ kind: 'review-now', ref: 'o/r#1', seq: 4 });
+  assert(typeof cond !== 'string' && cond.kind === 'review-now' && cond.seq === 4, 'seq 를 실어 보낼 수 있다');
+  assert(bad({ kind: 'review-now', ref: 'o/r#1', seq: -1 }), '음수 seq 는 거부한다');
+  assert(bad({ kind: 'review-now', ref: 'o/r#1', seq: 'x' }), '숫자가 아닌 seq 는 거부한다');
+}
+
+// ── 시나리오 41: 신선도 토큰 (라운드로는 못 재는 것) ───────
+{
+  // `wait` 는 "내 요청 이후에 결과가 나왔나" 를 판정해야 한다. 그 기준이
+  // 전이 횟수(history 길이)인 이유가 이 시나리오다 — 라운드로 재면 실패·쿼터·
+  // 닫힘을 전부 "예전 것" 으로 버리고 타임아웃까지 기다린다.
+  const ctx = createContext(fakePR);
+  const seq = (): number => ctx.history.length;
+
+  const atRequest = seq();
+  fire(ctx, 'START_REVIEW');
+  fire(ctx, 'REVIEW_FAILED', { note: '파싱 실패' });
+  assert(ctx.state === 'ERROR', '실패는 ERROR 로 전이한다');
+  assert(ctx.round === 0, '실패는 라운드를 올리지 않는다');
+  assert(seq() > atRequest, '그래도 전이 횟수는 늘어난다 (판정 가능)');
+
+  fire(ctx, 'RETRY');
+  const beforeQuota = seq();
+  const roundBeforeQuota = ctx.round;
+  fire(ctx, 'START_REVIEW');
+  fire(ctx, 'QUOTA_EXCEEDED');
+  assert(ctx.state === 'QUOTA_BLOCKED', '쿼터 한도는 QUOTA_BLOCKED');
+  assert(ctx.round === roundBeforeQuota, '쿼터도 라운드를 올리지 않는다');
+  assert(seq() > beforeQuota, '쿼터도 전이 횟수로는 잡힌다');
+
+  const beforeClose = seq();
+  const roundBeforeClose = ctx.round;
+  fire(ctx, 'PR_CLOSED');
+  assert(ctx.state === 'CLOSED', 'PR_CLOSED → CLOSED');
+  assert(ctx.round === roundBeforeClose, '닫힘도 라운드를 올리지 않는다');
+  assert(seq() > beforeClose, '닫힘도 전이 횟수로는 잡힌다');
+}
+
+// ── 시나리오 40: 데몬 안내 파일 ────────────────────────────
+{
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-daemon-'));
+  assert(readDaemonFile(dir) === null, '없으면 null (포트 폴백으로 넘어간다)');
+
+  const info = {
+    ui: 'http://127.0.0.1:4480',
+    pid: process.pid,
+    root: dir,
+    startedAt: new Date().toISOString(),
+    mode: 'review' as const,
+  };
+  publishDaemonFile(dir, info);
+  assert(readDaemonFile(dir)?.ui === info.ui, '기록한 주소를 그대로 읽는다');
+
+  // 남의 파일은 지우지 않는다 — 내가 죽는 사이 다음 주인이 덮어썼을 수 있고,
+  // 그걸 지우면 살아 있는 데몬이 안내 파일 없이 남는다.
+  publishDaemonFile(dir, { ...info, pid: process.pid + 1 });
+  clearDaemonFile(dir);
+  assert(readDaemonFile(dir) !== null, '남의 안내 파일은 지우지 않는다');
+
+  publishDaemonFile(dir, info);
+  clearDaemonFile(dir);
+  assert(readDaemonFile(dir) === null, '내가 쓴 것은 지운다');
+
+  // 설치본 식별자 — 포트만 보고 남의 데몬에 붙는 걸 막는 근거다.
+  const other = mkdtempSync(path.join(tmpdir(), 'pr-daemon2-'));
+  assert(instanceId(dir) === instanceId(dir), 'instance 는 같은 dataDir 에서 안정적이다');
+  assert(instanceId(dir) !== instanceId(other), 'dataDir 이 다르면 instance 도 다르다');
+  assert(
+    instanceId(dir) === instanceId(path.join(dir, 'x', '..')),
+    'instance 는 경로를 해석한 뒤 계산한다',
+  );
+
+  // scripts/daemon.mjs 는 의존성 없이 돌아야 해서 같은 계산을 JS 로 복제한다.
+  // 갈라지면 클라이언트가 자기 데몬을 영영 못 알아본다 — 여기서 붙잡는다.
+  const jsSide = createHash('sha1').update(path.resolve(dir)).digest('hex').slice(0, 16);
+  assert(jsSide === instanceId(dir), 'daemon.mjs 의 instance 계산과 일치한다');
 
   rmSync(dir, { recursive: true, force: true });
   rmSync(other, { recursive: true, force: true });
