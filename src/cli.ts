@@ -885,6 +885,13 @@ program
       progress.patch({ account: user.email ?? user.name ?? null });
     }
 
+    // 여기까지 왔으면 초기화가 끝났다 — 관측 모드는 띄울 것이 없고, 리뷰 모드는
+    // 브라우저와 로그인 확인을 통과했다. 이 값을 켜기 전까지 붙는 쪽은 기동
+    // 성공으로 보지 않는다. UI 는 이보다 한참 먼저 열리기 때문이다
+    // (Snapshot.ready 주석 참고 — 로그인 만료 시 곧 죽을 프로세스를 정상으로
+    // 보고하던 자리다).
+    progress.patch({ ready: true });
+
     // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
     // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
     const reported = new Map<string, string>();

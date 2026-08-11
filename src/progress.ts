@@ -166,6 +166,15 @@ export interface Snapshot {
   instance: string | null;
   /** 'observe' 면 리뷰를 실행하지 않는다 — 리뷰를 요청해도 큐에만 쌓인다. */
   mode: 'review' | 'observe';
+  /**
+   * 초기화가 **끝났는가** — 브라우저 기동과 ChatGPT 로그인 확인까지.
+   *
+   * UI 는 그 모든 것보다 **먼저** 열린다 (로그인 안내도 대시보드에 남아야
+   * 하므로). 그래서 `/api/state` 가 응답한다는 것만으로 기동 성공을 확정하면,
+   * 세션이 만료된 경우 **곧 죽을 프로세스를 "정상 기동" 으로 보고**하게 된다.
+   * 비용을 쓰기 전에 붙는 쪽이 이 값을 본다.
+   */
+  ready: boolean;
   control: ControlState;
   startedAt: number;
   scope: string;
@@ -231,6 +240,7 @@ function emptySnapshot(session: string): Snapshot {
     session,
     instance: null,
     mode: 'review',
+    ready: false,
     control: {
       mode: '',
       paused: false,

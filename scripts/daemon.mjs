@@ -194,7 +194,9 @@ async function findDaemon() {
     try {
       const s = await getState(ui, 1_500);
       if (!s || !s.snapshot) continue;
-      if (s.snapshot.instance === want) return { ui, mode: s.snapshot.mode ?? 'review' };
+      if (s.snapshot.instance === want) {
+        return { ui, mode: s.snapshot.mode ?? 'review', ready: s.snapshot.ready === true };
+      }
       sawStranger = true;
     } catch {
       /* 다음 후보 */
@@ -271,10 +273,11 @@ function logTail(lines = 15) {
  * 쓰고 GitHub 에 리뷰를 게시하면, 그건 요청한 적 없는 부작용이다. 비용을
  * 만드는 것은 비용을 의도한 동사(`review`)뿐이다.
  */
-async function ensure({ start = false } = {}) {
+async function ensure({ start = false, requireReady = false } = {}) {
   const found = await findDaemon();
-  if (found) return { ...found, started: false };
-  if (!start) {
+  if (found && (found.ready || !requireReady)) return { ...found, started: false };
+  // 떠 있지만 아직 초기화 중이다 — 비용을 쓸 동사는 기다린다 (아래 루프).
+  if (!found && !start) {
     die(
       '이 설치본의 리뷰 데몬이 돌고 있지 않습니다.\n' +
         `  시작하려면 (브라우저·ChatGPT 한도를 씁니다):  node "${path.join(ROOT, 'scripts', 'daemon.mjs').replace(/\\/g, '/')}" review <PR>\n` +
@@ -282,12 +285,19 @@ async function ensure({ start = false } = {}) {
     );
   }
 
-  const died = launch();
+  // 이미 떠 있으면(초기화 중일 뿐) 새로 띄우지 않는다 — 잠금이 막겠지만
+  // 애초에 띄울 이유가 없고, 로그에 실패 흔적만 쌓인다.
+  const startedHere = !found;
+  const died = startedHere ? launch() : { code: null };
   const deadline = Date.now() + START_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, POLL_MS));
     const d = await findDaemon();
-    if (d) return { ...d, started: true };
+    // **UI 가 떴다는 것만으로 성공을 확정하지 않는다.** watch 는 대시보드를 먼저
+    // 열고 그 뒤에 브라우저 기동·로그인 확인을 한다. 로그인이 만료됐으면 UI 가
+    // 잠깐 살아 있다가 죽으므로, 여기서 돌아가면 **곧 죽을 데몬을 "정상 기동"
+    // 으로 보고**하게 된다.
+    if (d && (d.ready || !requireReady)) return { ...d, started: startedHere };
 
     // 죽었다면 기다릴 이유가 없다. 단, 다른 세션이 잠금을 먼저 잡아서 우리
     // 프로세스만 물러난 경우일 수 있으므로 위의 findDaemon 을 먼저 본다
@@ -303,8 +313,12 @@ async function ensure({ start = false } = {}) {
     }
 
     if (Date.now() >= deadline) {
+      const secs = Math.round(START_TIMEOUT_MS / 1000);
       die(
-        `데몬이 ${Math.round(START_TIMEOUT_MS / 1000)}초 안에 뜨지 않았습니다.\n` +
+        (d
+          ? `데몬이 ${secs}초 안에 초기화를 끝내지 못했습니다 (대시보드는 응답하지만 준비 전).\n` +
+            `  브라우저 기동이나 ChatGPT 로그인 확인에서 멈춰 있을 수 있습니다.\n`
+          : `데몬이 ${secs}초 안에 뜨지 않았습니다.\n`) +
           `  로그 마지막 부분 (${path.join(dataDir(), 'watch.log')}):\n` +
           `${logTail()}`,
       );
@@ -356,7 +370,7 @@ function describeCard(c) {
 // ── 동사 ────────────────────────────────────────────────────
 
 async function verbEnsure() {
-  const { ui, started, mode } = await ensure({ start: true });
+  const { ui, started, mode } = await ensure({ start: true, requireReady: true });
   if (JSON_OUT) {
     console.log(JSON.stringify({ ok: true, ui, started, mode, root: ROOT }));
     return;
@@ -538,7 +552,7 @@ async function verbReview() {
   if (!ref || ref.number === null) die('리뷰할 PR 을 owner/repo#12 형식으로 지정하세요.');
   const key = refKey(ref);
   // 비용을 의도한 동사다 — 데몬이 없으면 여기서 띄운다.
-  const { ui, started, mode } = await ensure({ start: true });
+  const { ui, started, mode } = await ensure({ start: true, requireReady: true });
   if (started && !JSON_OUT) console.log(startedNotice(ui) + '\n');
 
   // 관측 모드 데몬은 큐만 쌓고 실행하지 않는다. 202 를 받아두면 "요청했다" 고
