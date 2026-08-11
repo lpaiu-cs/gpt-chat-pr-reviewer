@@ -21,33 +21,40 @@ function run(args) {
 
 try {
   const destination = path.join(temp, 'installed');
-  const result = run(['--dest', destination, '--skill', 'chatgpt-pr-review']);
+  const result = run(['--dest', destination]);
   assert.equal(result.status, 0, result.stderr || result.stdout);
 
-  const skillDir = path.join(destination, 'chatgpt-pr-review');
-  const body = readFileSync(path.join(skillDir, 'SKILL.md'), 'utf-8');
+  const reviewSkillDir = path.join(destination, 'gpt-chat-pr-review');
+  const body = readFileSync(path.join(reviewSkillDir, 'SKILL.md'), 'utf-8');
   const daemon = path.join(ROOT, 'scripts', 'daemon.mjs').replace(/\\/g, '/');
   assert.ok(body.includes(`node "${daemon}"`), '데몬 절대 경로가 주입되지 않음');
   assert.ok(!body.includes('{{DAEMON}}'), '치환되지 않은 데몬 자리표시자가 남음');
-  const metadataFile = path.join(skillDir, 'agents', 'openai.yaml');
+  const metadataFile = path.join(reviewSkillDir, 'agents', 'openai.yaml');
   assert.ok(existsSync(metadataFile), 'Codex 에이전트 메타데이터가 누락됨');
   const metadata = readFileSync(metadataFile, 'utf-8');
   assert.match(metadata, /allow_implicit_invocation:\s*false/, '암시적 스킬 호출이 차단되지 않음');
   assert.ok(!body.includes('"review this PR"'), '일반 PR 리뷰 문구가 트리거에 남음');
-  assert.ok(!existsSync(path.join(destination, 'pr-watch')), '선택하지 않은 스킬이 설치됨');
+  const watchSkillDir = path.join(destination, 'gpt-chat-pr-watch');
+  const watchBody = readFileSync(path.join(watchSkillDir, 'SKILL.md'), 'utf-8');
+  assert.ok(watchBody.includes(`node "${daemon}"`), '감시 스킬에 데몬 절대 경로가 주입되지 않음');
+  assert.ok(!watchBody.includes('{{DAEMON}}'), '감시 스킬에 치환되지 않은 데몬 자리표시자가 남음');
+  const watchMetadataFile = path.join(watchSkillDir, 'agents', 'openai.yaml');
+  assert.ok(existsSync(watchMetadataFile), '감시 스킬의 Codex 에이전트 메타데이터가 누락됨');
+  const watchMetadata = readFileSync(watchMetadataFile, 'utf-8');
+  assert.match(watchMetadata, /allow_implicit_invocation:\s*true/, '감시 스킬의 암시적 호출이 허용되지 않음');
 
   const dryDestination = path.join(temp, 'dry-run');
-  const dry = run(['--dest', dryDestination, '--skill', 'chatgpt-pr-review', '--dry-run']);
+  const dry = run(['--dest', dryDestination, '--dry-run']);
   assert.equal(dry.status, 0, dry.stderr || dry.stdout);
   assert.ok(!existsSync(dryDestination), 'dry-run이 파일을 생성함');
 
   const invalid = run(['--target', 'unknown']);
   assert.notEqual(invalid.status, 0, '알 수 없는 target을 성공으로 처리함');
 
-  console.log('  ✓ 사용자 지정 경로에 chatgpt-pr-review만 설치');
+  console.log('  ✓ 사용자 지정 경로에 두 GPT Chat PR 스킬 함께 설치');
   console.log('  ✓ {{DAEMON}} 절대 경로 치환');
-  console.log('  ✓ agents/openai.yaml 번들 복사');
-  console.log('  ✓ 명시 호출 전용 정책·트리거 경계');
+  console.log('  ✓ 두 스킬의 agents/openai.yaml 번들 복사');
+  console.log('  ✓ 리뷰는 명시 호출, 감시는 암시적 호출 정책');
   console.log('  ✓ dry-run 무쓰기 보장');
   console.log('  ✓ 잘못된 target 거부');
 } finally {

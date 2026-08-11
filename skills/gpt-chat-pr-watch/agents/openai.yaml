@@ -1,0 +1,6 @@
+interface:
+  display_name: "GPT Chat PR Watch"
+  short_description: "Watch GitHub PR state without running reviews"
+  default_prompt: "Use $gpt-chat-pr-watch to watch this GitHub PR and report the next state change."
+policy:
+  allow_implicit_invocation: true

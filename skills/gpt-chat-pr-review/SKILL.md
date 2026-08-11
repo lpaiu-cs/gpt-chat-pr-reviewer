@@ -1,8 +1,8 @@
 ---
-name: chatgpt-pr-review
+name: gpt-chat-pr-review
 description: Request and monitor GitHub PR reviews through the local
   gpt-chat-pr-reviewer daemon. Use only when the user explicitly invokes
-  $chatgpt-pr-review. Do not use for ordinary PR or code review performed
+  $gpt-chat-pr-review. Do not use for ordinary PR or code review performed
   directly by the current agent.
 ---
 

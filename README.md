@@ -184,13 +184,14 @@ npm run dev -- queue --json   # UI/스크립트 연동
 공구 디렉터리에 저장하게 한다.
 
 ```text
-https://github.com/lpaiu-cs/gpt-chat-pr-reviewer 의 chatgpt-pr-review 스킬을 설치해줘.
+https://github.com/lpaiu-cs/gpt-chat-pr-reviewer 의 gpt-chat-pr-review와
+gpt-chat-pr-watch 스킬을 함께 설치해줘.
 저장소는 임시 경로가 아닌 안정적인 공구 디렉터리에 clone하고,
 기존 clone이 있으면 로컬 변경을 덮어쓰지 말고 안전하게 갱신해줘.
 Node.js 20+, gh CLI, Chrome 요구사항을 확인한 뒤 npm ci, npm run build,
 npm run smoke:install을 실행해. 그리고 현재 에이전트가 Codex면
-npm run install-skills -- --target codex --skill chatgpt-pr-review, Claude Code면
-npm run install-skills -- --target claude --skill chatgpt-pr-review를 실행해줘.
+npm run install-skills -- --target codex, Claude Code면
+npm run install-skills -- --target claude를 실행해줘.
 설치 경로와 검증 결과를 알려주고, ChatGPT 로그인과 GitHub 감시 범위는
 내 확인 없이 넓히거나 변경하지 마.
 ```
@@ -199,8 +200,9 @@ Codex와 Claude Code를 둘 다 쓰면 `--target all`로 한 번에 설치할 �
 새로 설치한 스킬은 다음 에이전트 세션에서 발견되는 것을 기본으로 한다.
 
 일반적인 코드 리뷰 요청과 혼동하지 않도록 자동 호출은 꺼져 있다. 사용할 때는
-`$chatgpt-pr-review 스킬로 이 PR에 ChatGPT 리뷰어를 붙여줘`처럼 스킬 이름을
-명시한다.
+`$gpt-chat-pr-review 스킬로 이 PR에 ChatGPT 리뷰어를 붙여줘`처럼 스킬 이름을
+명시한다. 읽기 전용인 `gpt-chat-pr-watch`는 PR 상태 확인이나 변화 대기 요청에
+자동으로 호출될 수 있다.
 
 ### 직접 설치
 
@@ -210,7 +212,7 @@ cd gpt-chat-pr-reviewer
 npm ci
 npm run build
 npm run smoke:install
-npm run install-skills -- --target codex --skill chatgpt-pr-review
+npm run install-skills -- --target codex
 ```
 
 Claude Code는 `--target claude`, 둘 다는 `--target all`을 쓴다. 기본값은
@@ -457,11 +459,12 @@ node scripts/notify.mjs --porcelain --pr myorg/api#34 \
 ## 에이전트 스킬 (Codex · Claude Code)
 
 코딩 세션이 자기 PR의 리뷰를 요청하고 결과를 기다릴 수 있게 하는 두 개의 스킬입니다.
+아래 기본 설치 명령은 두 스킬을 항상 함께 설치합니다.
 
 ```bash
-npm run install-skills -- --target codex  --skill chatgpt-pr-review
-npm run install-skills -- --target claude --skill chatgpt-pr-review
-npm run install-skills -- --target all --skill chatgpt-pr-review
+npm run install-skills -- --target codex
+npm run install-skills -- --target claude
+npm run install-skills -- --target all
 ```
 
 에이전트에게 설치를 맡기는 프롬프트와 수동 설치 절차는 [설치](#설치)를
@@ -471,8 +474,8 @@ npm run install-skills -- --target all --skill chatgpt-pr-review
 
 | 스킬 | 하는 일 |
 |---|---|
-| `chatgpt-pr-review` | ChatGPT 리뷰 요청(`review`) · 결과 대기(`wait`) · 건너뛰기(`skip`) |
-| `pr-watch` | 상태 조회(`status`) · 변화 대기(`wait`) — **완전히 읽기 전용** |
+| `gpt-chat-pr-review` | ChatGPT 리뷰 요청(`review`) · 결과 대기(`wait`) · 건너뛰기(`skip`) |
+| `gpt-chat-pr-watch` | 상태 조회(`status`) · 변화 대기(`wait`) — **완전히 읽기 전용** |
 
 둘 다 **얇은 클라이언트**입니다. 리뷰를 직접 실행하지 않고 돌고 있는 watch에 요청만 넣습니다. 설계 선택이 아니라 이미 정해져 있던 것입니다 — 루프백 포트 잠금이 두 번째 실행을 커널 수준에서 막고, 브라우저 페이지가 하나뿐이라 리뷰는 직렬만 가능하며, 라운드가 2~15분이라 세션이 동기적으로 기다릴 수도 없습니다. **직렬화 지점은 데몬 하나**이고 세션들은 아무것도 다투지 않습니다.
 

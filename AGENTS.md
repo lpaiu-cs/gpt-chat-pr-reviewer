@@ -45,8 +45,8 @@ scripts/
   daemon.mjs        — 스킬용 데몬 클라이언트. **켜는 것만** 한다 (아래)
   install-skills.mjs— skills/ → 에이전트 skills 디렉터리 복사 (경로 치환)
 skills/
-  chatgpt-pr-review/— 리뷰 요청·대기 스킬
-  pr-watch/         — 상태 추적·알림 스킬 (브라우저·쿼터 없음)
+  gpt-chat-pr-review/— 리뷰 요청·대기 스킬
+  gpt-chat-pr-watch/ — 상태 추적·알림 스킬 (브라우저·쿼터 없음)
 ```
 
 ## 상태 머신
@@ -237,7 +237,7 @@ POST 가 설정 파일을 바꾸기 때문이다.
 
 ## 스킬 (여러 세션이 데몬 하나를 함께 쓴다)
 
-`skills/` 의 두 스킬(`pr-review` · `pr-watch`)은 **얇은 클라이언트**다. 리뷰를
+`skills/` 의 두 스킬(`gpt-chat-pr-review` · `gpt-chat-pr-watch`)은 **얇은 클라이언트**다. 리뷰를
 직접 실행하지 않고 `scripts/daemon.mjs` 를 통해 돌고 있는 watch 에 요청만 넣는다.
 설계 선택이 아니라 이미 정해져 있던 것이다 — `lock.ts` 가 두 번째 실행을 커널
 수준에서 막고, 브라우저 페이지가 하나뿐이라 리뷰는 직렬만 가능하며, 라운드가
@@ -282,7 +282,7 @@ dataDir·브라우저를 다투게 되고, 결국 각자가 데몬에 붙는 얇
 
 그래서 넓히는 일은 사람이 한다 (대시보드 · 설정 파일). 클라이언트가 쓰는 것은
 **좁히는 쪽**(`skip-add` — PR 단위)과 **PR 단위 지목**(`review-now`)뿐이고,
-범위 밖 PR 은 그 사실을 알리고 멈춘다. `pr-watch` 는 그 결과 완전히 읽기
+범위 밖 PR 은 그 사실을 알리고 멈춘다. `gpt-chat-pr-watch` 는 그 결과 완전히 읽기
 전용이 됐다. 부트스트랩용 `watch --include` 씨앗도 같이 걷어냈다 — 넓히는
 경로가 없으면 씨앗도 필요 없다.
 
@@ -317,7 +317,7 @@ UI 포트는 고정이 아니라 막히면 옆으로 물러서므로 상수를 �
 쪽만이 지금 살아 있는 주인이다 (`probeLock`). 확인이 안 되면 죽이지 않는다.
 
 **관측용 동사는 데몬을 띄우지 않는다.** 일반 watch 는 브라우저를 열고 범위 안의
-`REVIEW_DUE` PR 을 자동 리뷰한다. `pr-watch` 의 `status`/`wait` 가 데몬을
+`REVIEW_DUE` PR 을 자동 리뷰한다. `gpt-chat-pr-watch` 의 `status`/`wait` 가 데몬을
 기동하면, 상태만 보려던 호출이 ChatGPT 한도를 쓰고 GitHub 에 리뷰를 게시한다 —
 요청한 적 없는 부작용이다. 기동은 비용을 의도한 동사(`review`·`ensure`)만 한다.
 반대 방향도 막는다: 데몬이 `--observe` 로 떠 있으면 `review` 는 큐에만 쌓이고
