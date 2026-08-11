@@ -162,14 +162,6 @@ export function parseIntent(body: unknown): Intent | string {
         exclude: exclude.map((s) => s.trim()).filter(Boolean),
       };
     }
-    case 'scope-add':
-    case 'scope-remove': {
-      const include = strArray(b.include);
-      if (!include) return 'include 배열이 필요합니다';
-      const cleaned = include.map((s) => s.trim()).filter(Boolean);
-      if (cleaned.length === 0) return 'include 가 비어 있습니다';
-      return { kind, include: cleaned };
-    }
     default:
       return `처리되지 않은 intent: ${kind}`;
   }

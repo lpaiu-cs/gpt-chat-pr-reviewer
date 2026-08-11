@@ -442,10 +442,6 @@ program
   .option('--observe', '감시·동기화만 하고 리뷰는 실행하지 않는다 (브라우저·한도 소비 없음)', false)
   .option('--ui', '관측 대시보드를 localhost 에 띄운다 (읽기 전용)', false)
   .option('--ui-port <port>', `대시보드 포트 (기본 ${DEFAULT_UI_PORT})`)
-  .option(
-    '--include <patterns>',
-    '감시 범위를 이 패턴으로 시작한다 (쉼표 구분). 설정이 비어 있을 때 첫 기동용',
-  )
   .action(async (opts: {
     headless: boolean;
     dryRun: boolean;
@@ -453,7 +449,6 @@ program
     observe: boolean;
     ui: boolean;
     uiPort?: string;
-    include?: string;
   }) => {
     banner();
     const cfg = loadConfig();
@@ -473,23 +468,6 @@ program
     // 도달하면 4479 에 조용히 붙어 "정상" 처럼 보인다 — 실제로 그렇게 사고가 났다.
     const releaseLock = await lockOrExplain(cfg, 'watch');
     if (!releaseLock) return;
-
-    // 첫 기동 부트스트랩. 설정의 include 가 비어 있으면 resolveWatchScope 가
-    // null 을 돌려주고 **UI 를 열기도 전에** 종료하는데, 그러면 붙어서
-    // `scope-add` 를 넣으려던 클라이언트는 영영 문을 못 찾는다 (닭이 먼저냐
-    // 문제다). 그래서 기동 시점에 씨앗을 받는다. 메모리에만 반영하고 저장은
-    // 하지 않는다 — 뒤따르는 `scope-add` 가 정식 경로로 영속화한다.
-    if (opts.include) {
-      const seeds = opts.include.split(',').map((s) => s.trim()).filter(Boolean);
-      if (seeds.length > 0) {
-        const base = cfg.watch ?? { mode: 'account' as const, include: [], exclude: [] };
-        cfg.watch = {
-          ...base,
-          include: [...new Set([...(base.include ?? []), ...seeds])],
-        };
-        console.log(chalk.dim(`  감시 범위 씨앗: ${seeds.join(', ')}`));
-      }
-    }
 
     const scope = resolveWatchScope(cfg);
     if (!scope) {
@@ -690,50 +668,6 @@ program
             console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
             break;
           }
-          case 'scope-add': {
-            // 판정은 scope-set 과 **같은 함수**를 쓴다 — 갈라지면 한쪽만 받아준다.
-            const bad = unsupportedPatterns(scope.mode, it.include);
-            if (bad.length > 0) {
-              console.log(
-                chalk.yellow(`  ⚠ ${scope.mode} 모드가 펼칠 수 없는 패턴 — 무시합니다: ${bad.join(', ')}`),
-              );
-              break;
-            }
-            const have = new Set(scope.include);
-            const added = it.include.filter((p) => !have.has(p));
-            // 이미 다 있으면 아무것도 하지 않는다. 스킬은 매번 track 을 부르므로
-            // (멱등이어야 하므로) 여기서 매번 캐시를 버리면 30초 주기 탐색이
-            // 호출 수만큼 늘어난다.
-            if (added.length === 0) break;
-            scope.include = [...scope.include, ...added];
-            scopeChanged = true;
-            // 추가는 아무것도 빼지 않으므로 캐시를 통째로 버릴 필요가 없다.
-            // freshness 만 무효화해 다음 list() 가 곧바로 새 범위를 탐색하게 한다
-            // (안 하면 discoveryIntervalMs 만큼 새 레포가 안 보인다).
-            repoSource.lastAt = 0;
-            console.log(chalk.cyan(`    감시 범위 추가: ${added.join(', ')}`));
-            break;
-          }
-          case 'scope-remove': {
-            const drop = new Set(it.include);
-            const next = scope.include.filter((p) => !drop.has(p));
-            if (next.length === scope.include.length) break; // 원래 없던 것
-            // 빈 include 는 "감시 중지" 가 아니라 **전부 허용**으로 읽힌다
-            // (scope-set 주석 참고) — 마지막 하나를 빼는 건 거부한다.
-            if (next.length === 0 && scope.mode !== 'review-requested') {
-              console.log(
-                chalk.yellow(`  ⚠ ${scope.mode} 모드에서는 include 를 비울 수 없습니다 — 무시합니다.`),
-              );
-              break;
-            }
-            scope.include = next;
-            scopeChanged = true;
-            // 제거는 통째로 버려야 한다. 부분 실패 시 캐시가 보존되면 방금 뺀
-            // 레포가 살아남아 리뷰를 게시할 수 있다 (scope-set 주석 참고).
-            repoSource.reset();
-            console.log(chalk.cyan(`    감시 범위 제거: ${it.include.join(', ')}`));
-            break;
-          }
           case 'stop':
             if (!stopRequested) {
               console.log(chalk.magenta('    ■ 종료 요청 — 정리하고 나갑니다.'));
@@ -866,27 +800,6 @@ program
                   return scope.mode === 'repos'
                     ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
                     : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
-                }
-                return null;
-              }
-              case 'scope-add': {
-                // scope-set 과 같은 판정. 여기서 걸러야 스킬이 즉시 400 을 받는다 —
-                // 큐까지 흘려보내면 "추가했다" 고 답해놓고 아무것도 안 잡힌다.
-                const bad = unsupportedPatterns(scope.mode, intent.include);
-                if (bad.length > 0) {
-                  return scope.mode === 'repos'
-                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
-                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
-                }
-                return null;
-              }
-              case 'scope-remove': {
-                const drop = new Set(intent.include);
-                if (
-                  scope.mode !== 'review-requested' &&
-                  scope.include.every((p) => drop.has(p))
-                ) {
-                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
                 }
                 return null;
               }

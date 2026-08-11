@@ -1637,19 +1637,16 @@ const fakePR: PRInfo = {
   // 리뷰를 통째로 끊을 수 있다 — 스킬 클라이언트에 동사를 안 넣은 의미가 사라진다.
   assert(bad({ kind: 'stop' }), 'stop 은 /api/intent 로 받지 않는다');
 
-  const add = parseIntent({ kind: 'scope-add', include: [' a/b ', ''] });
-  assert(
-    typeof add !== 'string' && add.kind === 'scope-add' && add.include.length === 1 &&
-      add.include[0] === 'a/b',
-    'scope-add 는 공백을 다듬고 빈 항목을 버린다',
-  );
+  // 범위를 **넓히는** 문은 클라이언트에게 열어주지 않는다. 범위는 레포 단위라
+  // PR 하나를 부탁하는 요청이 그 레포의 다른 열린 PR 까지 리뷰 대상으로 만든다.
+  assert(bad({ kind: 'scope-add', include: ['a/b'] }), 'scope-add 는 받지 않는다');
+  assert(bad({ kind: 'scope-remove', include: ['a/b'] }), 'scope-remove 는 받지 않는다');
 
-  // 빈 include 를 통과시키면 "아무것도 아닌 변경" 이 캐시만 버리게 된다.
-  assert(bad({ kind: 'scope-add', include: [] }), '빈 scope-add 는 거부한다');
-  assert(bad({ kind: 'scope-add', include: 'a/b' }), 'scope-add 는 배열만 받는다');
-
-  const rm = parseIntent({ kind: 'scope-remove', include: ['x/y'] });
-  assert(typeof rm !== 'string' && rm.kind === 'scope-remove', 'scope-remove 를 받는다');
+  // 좁히는 쪽(PR 단위 skip)과 사람이 쓰는 scope-set 은 그대로 열려 있다.
+  const skip = parseIntent({ kind: 'skip-add', ref: 'o/r#1' });
+  assert(typeof skip !== 'string' && skip.kind === 'skip-add', 'skip-add 는 받는다');
+  const set = parseIntent({ kind: 'scope-set', include: ['a/*'], exclude: [] });
+  assert(typeof set !== 'string' && set.kind === 'scope-set', 'scope-set 은 받는다');
 }
 
 // ── 시나리오 40: 데몬 안내 파일 ────────────────────────────

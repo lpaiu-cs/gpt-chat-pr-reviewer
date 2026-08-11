@@ -19,16 +19,6 @@ export type Intent =
   /** 빈 배열이면 한정 해제 */
   | { kind: 'only-set'; refs: string[] }
   | { kind: 'scope-set'; include: string[]; exclude: string[] }
-  /**
-   * 범위 **증분** 변경. `scope-set` 과 달리 나머지를 건드리지 않는다.
-   *
-   * 대시보드는 사람 하나가 쓰지만 스킬은 여러 세션이 동시에 쓴다. 세션 A 가
-   * 자기 레포를 넣겠다고 `scope-set` 을 부르면 세션 B·C 가 넣어둔 레포가
-   * 통째로 사라진다 — read-modify-write 를 클라이언트가 하게 되기 때문이다.
-   * 그래서 "무엇을 원하는가"(추가/제거)를 그대로 보내게 하고 병합은 루프가 한다.
-   */
-  | { kind: 'scope-add'; include: string[] }
-  | { kind: 'scope-remove'; include: string[] }
   /** 큐 맨 앞으로. REVIEW_DUE 가 아니면 강제 전이시킨다 (review --force 와 같은 경로) */
   | { kind: 'review-now'; ref: string }
   | { kind: 'pause' }
@@ -47,14 +37,18 @@ export type Intent =
  * 일반 의도와 같은 문 안에 두지 않는다. 사람이 쓰는 경로(대시보드 종료 버튼 ·
  * `stop` 명령)는 전용 엔드포인트를 지나며, 큐에 넣는 것은 똑같다 — 라운드
  * 중간에 끊지 않으려면 결국 이 완충 지대를 거쳐야 하기 때문이다.
+ *
+ * 범위 변경(`scope-set`)은 **사람(대시보드)만** 쓴다. 한때 스킬용으로
+ * `scope-add` 를 뒀었는데, 범위는 레포 단위라 PR 하나를 부탁하는 요청이 그
+ * 레포의 **다른 열린 PR 까지** 리뷰 대상으로 만들었다. 요청하지 않은 PR 에
+ * 리뷰를 게시하는 건 되돌릴 수 없고, 출력으로 경고해봐야 이미 보낸 의도를
+ * 막지 못한다. 그래서 넓히는 일은 사람이 한다.
  */
 export const INTENT_KINDS: Intent['kind'][] = [
   'skip-add',
   'skip-remove',
   'only-set',
   'scope-set',
-  'scope-add',
-  'scope-remove',
   'review-now',
   'pause',
   'resume',

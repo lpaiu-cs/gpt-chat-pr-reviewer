@@ -45,6 +45,8 @@ if (flag('--help') || flag('-h')) {
     --porcelain       이벤트 1건 = 1줄, 장식 없음 (에이전트·스크립트가 소비할 때)
     --until <events>  이 중 하나가 나오면 **종료한다**, 쉼표 구분
                       (없으면 계속 구독한다)
+    --since-round <n> 붙기 전에 이미 끝난 결과도 인정하되 n 라운드 **이후**만
+                      (없으면 붙은 뒤의 전이만 본다)
     --timeout <초>    이 시간 안에 --until 이벤트가 없으면 'timeout' 을 내고 종료
     --no-bell         터미널 벨 끄기
     --quiet           진행 단계는 **화면에** 찍지 않고 주요 이벤트만
@@ -88,6 +90,24 @@ const UNTIL = new Set(
 );
 /** 초. 0 이면 무제한. --until 없이 주면 아무 의미가 없다. */
 const TIMEOUT_S = Number(value('--timeout', '0')) || 0;
+
+/**
+ * "이 라운드 **이후**의 결과만 이미 도달한 것으로 인정한다."
+ *
+ * 붙기 전에 라운드가 끝나면 그 결과를 영영 못 받는 문제(구독 경쟁) 때문에
+ * 첫 스냅샷의 현재 상태도 보는데, 조건 없이 보면 반대로 **이전 라운드가 남긴
+ * 상태**를 새 결과로 재생한다: 1차가 AWAITING_AUTHOR 인 채로 수정을 push 하고
+ * 곧바로 기다리면, watch 가 새 커밋을 보기 전이라 첫 스냅샷은 여전히
+ * AWAITING_AUTHOR 고 — 즉시 깨어나 2차를 아예 안 기다린다.
+ *
+ * 그래서 요청 시점의 라운드 번호를 기준으로 삼는다 (`daemon.mjs review` 가
+ * 알려준다). 값이 없으면 재생하지 않는다 — 놓치는 쪽이 오인하는 쪽보다 낫다.
+ * 놓쳐도 다음 전이나 타임아웃으로 드러나지만, 오인은 "결과가 나왔다" 는
+ * 거짓말이라 그 위에 쌓은 판단이 전부 틀어진다.
+ */
+const SINCE_ROUND = value('--since-round', null) === null
+  ? null
+  : Number(value('--since-round', null));
 
 // ── 감시 대상 필터 ──────────────────────────────────────────
 
@@ -346,20 +366,21 @@ function onSnapshot(s) {
     const watching = s.contexts.filter((c) => matchesFilter(c.key));
 
     /**
-     * 붙기 **전에** 이미 끝나 있던 경우 (--until 모드 한정).
+     * 붙기 **전에** 이미 끝나 있던 경우 (`--until` + `--since-round` 한정).
      *
      * `review` 와 `wait` 는 별도 프로세스라 그 사이에 라운드가 끝날 수 있다.
-     * 기준선은 전이만 보므로 그 결과는 영영 안 오고, 기본 45분 타임아웃까지
-     * 기다리게 된다 — 이미 답이 나와 있는데 아무도 모르는 상태다.
+     * 기준선은 전이만 보므로 그 결과는 영영 안 오고 타임아웃까지 기다린다.
      *
-     * 계속 구독하는 모드에서는 하지 않는다. 거기서는 "지금 상태" 를 이벤트로
-     * 쏟으면 재연결마다 같은 소식이 반복된다 (기준선을 두는 이유가 그것이다).
+     * 다만 **기준 라운드보다 뒤의 결과만** 인정한다 (SINCE_ROUND 주석 참고).
+     * 계속 구독하는 모드에서는 아예 하지 않는다 — 거기서 "지금 상태" 를 쏟으면
+     * 재연결마다 같은 소식이 반복된다 (기준선을 두는 이유가 그것이다).
      */
-    if (UNTIL.size > 0) {
+    if (UNTIL.size > 0 && SINCE_ROUND !== null && Number.isFinite(SINCE_ROUND)) {
       for (const c of watching) {
         const event = STATE_EVENT[c.state];
         if (!event || !UNTIL.has(event)) continue;
-        emit(event, c, `${c.round}라운드 · 이미 도달한 상태`);
+        if (!(Number(c.round) > SINCE_ROUND)) continue; // 이전 라운드가 남긴 상태
+        emit(event, c, `${c.round}라운드 · 붙기 전에 끝나 있었습니다`);
         return;
       }
     }

@@ -17,7 +17,6 @@
  *
  *   node scripts/daemon.mjs ensure
  *   node scripts/daemon.mjs status [--pr owner/repo#12] [--json]
- *   node scripts/daemon.mjs track  owner/repo#12
  *   node scripts/daemon.mjs review owner/repo#12
  *   node scripts/daemon.mjs skip   owner/repo#12
  *   node scripts/daemon.mjs wait   owner/repo#12 [--timeout 2700]
@@ -42,8 +41,6 @@ const DEFAULT_UI_PORT = 4478;
 const UI_PORT_WALK = 10;
 /** 데몬이 떠서 /api/state 를 열 때까지 기다리는 시간. 브라우저 기동을 포함한다. */
 const START_TIMEOUT_MS = 90_000;
-/** 새 레포를 범위에 넣고 첫 스캔에 잡힐 때까지 (discoveryIntervalMs 기본 30초). */
-const TRACK_TIMEOUT_MS = 75_000;
 const POLL_MS = 1_000;
 
 function config() {
@@ -96,7 +93,7 @@ function positionals() {
     const a = argv[i];
     if (a.startsWith('--')) {
       // 값을 받는 플래그면 그 값도 건너뛴다
-      if (['--pr', '--timeout', '--until'].includes(a)) i++;
+      if (['--pr', '--timeout', '--until', '--since-round'].includes(a)) i++;
       continue;
     }
     out.push(a);
@@ -213,7 +210,7 @@ async function findDaemon() {
  * 못 없애고, 없앨 필요도 없다. 띄우고 나서 **누구의 것이든** 살아 있는
  * 데몬에 붙으면 된다.
  */
-function launch(seed) {
+function launch() {
   mkdirSync(dataDir(), { recursive: true });
   const log = openSync(path.join(dataDir(), 'watch.log'), 'a');
 
@@ -225,9 +222,6 @@ function launch(seed) {
   const args = existsSync(src)
     ? ['--import', 'tsx', src, 'watch', '--ui']
     : [path.join(ROOT, 'dist', 'cli.js'), 'watch', '--ui'];
-  // 설정의 include 가 비어 있으면 watch 는 UI 를 열기도 전에 종료한다.
-  // 첫 기동이 그 상태면 붙어서 범위를 넣을 방법이 없으므로 씨앗을 들려 보낸다.
-  if (seed) args.push('--include', seed);
 
   const child = spawn(process.execPath, args, {
     cwd: ROOT, // dataDir·설정 파일 경로가 cwd 상대다
@@ -247,7 +241,7 @@ function launch(seed) {
  * 쓰고 GitHub 에 리뷰를 게시하면, 그건 요청한 적 없는 부작용이다. 비용을
  * 만드는 것은 비용을 의도한 동사(`review`)뿐이다.
  */
-async function ensure({ start = false, seed = null } = {}) {
+async function ensure({ start = false } = {}) {
   const found = await findDaemon();
   if (found) return { ...found, started: false };
   if (!start) {
@@ -258,7 +252,7 @@ async function ensure({ start = false, seed = null } = {}) {
     );
   }
 
-  launch(seed);
+  launch();
   const deadline = Date.now() + START_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, POLL_MS));
@@ -352,22 +346,20 @@ async function verbStatus() {
   for (const c of cards) console.log(`  · ${describeCard(c)}`);
 }
 
-/** 레포를 감시 범위에 넣는다 (증분). 이미 있으면 무해하다. */
-async function addScope(ui, slug) {
-  await postIntent(ui, { kind: 'scope-add', include: [slug] });
-}
-
-async function verbTrack() {
-  const refs = positionals().map(parseRef);
-  if (refs.length === 0 || refs.some((r) => !r)) die('추적할 PR 또는 레포를 지정하세요.');
-  // 데몬을 띄우지 않는다 — 추적은 관측이고, 기동은 리뷰를 시작시킨다.
-  const { ui } = await ensure({ start: false });
-  const slugs = [...new Set(refs.map((r) => r.slug))];
-  for (const slug of slugs) await addScope(ui, slug);
-  out(
-    `감시 범위에 추가했습니다: ${slugs.join(', ')}\n` +
-      `주의: 이 레포의 다른 열린 PR 도 리뷰 대상이 될 수 있습니다 (필터 설정에 따름).`,
-    { ok: true, ui, added: slugs },
+/**
+ * 감시 범위는 **클라이언트가 넓히지 않는다.**
+ *
+ * 범위는 레포 단위다. PR 하나를 부탁하려고 `owner/repo` 를 넣으면 그 레포의
+ * **다른 열린 PR 까지** 큐 자격을 얻는다 — 상태만 보려던 요청이 #13 에 리뷰를
+ * 게시할 수 있고, 게시는 되돌릴 수 없다. 출력으로 경고해봐야 이미 보낸 의도를
+ * 막지 못한다. 그래서 넓히는 일은 사람이 설정이나 대시보드로 한다.
+ */
+function outOfScope(key) {
+  return (
+    `${key} 는 감시 범위 밖입니다.\n` +
+    `  이 레포를 감시하려면 사용자가 범위를 넓혀야 합니다 —\n` +
+    `  대시보드의 '감시 범위' 또는 ${ROOT}/pr-review.config.json 의 watch.include.\n` +
+    `  (레포를 넣으면 그 레포의 다른 열린 PR 도 리뷰 대상이 되므로 사람이 정합니다)`
   );
 }
 
@@ -383,9 +375,8 @@ async function verbReview() {
   const ref = parseRef(positionals()[0]);
   if (!ref || ref.number === null) die('리뷰할 PR 을 owner/repo#12 형식으로 지정하세요.');
   const key = refKey(ref);
-  // 비용을 의도한 동사다 — 데몬이 없으면 여기서 띄운다. 설정 범위가 비어 있어도
-  // 뜰 수 있도록 이 PR 의 레포를 씨앗으로 들려 보낸다.
-  const { ui, started, mode } = await ensure({ start: true, seed: ref.slug });
+  // 비용을 의도한 동사다 — 데몬이 없으면 여기서 띄운다.
+  const { ui, started, mode } = await ensure({ start: true });
   if (started && !JSON_OUT) console.log(startedNotice(ui) + '\n');
 
   // 관측 모드 데몬은 큐만 쌓고 실행하지 않는다. 202 를 받아두면 "요청했다" 고
@@ -399,28 +390,10 @@ async function verbReview() {
     );
   }
 
-  // 추적 중이 아니면 레포를 범위에 넣고 첫 스캔에 잡힐 때까지 기다린다.
-  // `review-now` 는 추적 중이 아닌 PR 을 거절하는데, 그건 옳은 동작이다 —
-  // 여기서 순서를 맞춰 주는 게 서버가 예외를 만드는 것보다 낫다.
-  // 범위 추가는 **언제나** 보낸다. 멱등이고(이미 있으면 루프가 무동작으로
-  // 접는다), 기동 씨앗(`--include`)은 메모리에만 있으므로 설정 파일에
-  // 영속화하는 경로가 여기뿐이다.
-  await addScope(ui, ref.slug);
-
-  let card = cardsFor(await getState(ui), ref)[0];
-  if (!card) {
-    const deadline = Date.now() + TRACK_TIMEOUT_MS;
-    while (!card && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, POLL_MS * 2));
-      card = cardsFor(await getState(ui), ref)[0];
-    }
-    if (!card) {
-      die(
-        `${key} 를 추적 목록에서 찾지 못했습니다. 열려 있는 PR 인지, ` +
-          `설정의 watch.filters 에 걸리지 않는지 확인하세요.`,
-      );
-    }
-  }
+  // **이미 추적 중인 PR 만 리뷰한다.** 범위를 넓히지 않으므로 여기 없으면
+  // 그건 사람이 결정할 일이다 (outOfScope 주석 참고).
+  const card = cardsFor(await getState(ui), ref)[0];
+  if (!card) die(outOfScope(key), { outOfScope: true });
 
   // 필터에 걸린 PR 은 큐에 오르지 않는다. 여기서 멈추고 알린다 —
   // 스킬이 필터를 풀어버리면 그건 다른 세션의 설정을 갈아엎는 일이다.
@@ -431,10 +404,17 @@ async function verbReview() {
   }
 
   await postIntent(ui, { kind: 'review-now', ref: key });
+
+  // **지금 라운드 번호를 같이 낸다.** wait 가 "이 요청의 결과" 와 "이전 라운드가
+  // 남긴 상태" 를 구분하려면 기준점이 필요하다 — 이게 없으면 AWAITING_AUTHOR
+  // 로 남아 있던 이전 결과를 새 결과로 오인해 즉시 깨어난다.
+  const sinceRound = card.round ?? 0;
+  const self = path.join(ROOT, 'scripts', 'daemon.mjs').replace(/\\/g, '/');
   out(
     `${key} 를 리뷰 큐 맨 앞에 넣었습니다 (현재 ${card.stateLabel ?? card.state}).\n` +
-      `결과는 wait 로 기다리세요.`,
-    { ok: true, ui, key, state: card.state },
+      `결과를 기다리려면 (백그라운드로):\n` +
+      `  node "${self}" wait ${key} --since-round ${sinceRound}`,
+    { ok: true, ui, key, state: card.state, sinceRound },
   );
 }
 
@@ -460,6 +440,10 @@ async function verbWait() {
     '--until', until,
     '--timeout', timeout,
   ];
+  // review 가 알려준 기준 라운드. 그 **이후** 결과만 이미 도달한 것으로 인정한다
+  // (notify.mjs 참고). 없으면 붙은 뒤의 전이만 본다.
+  const since = value('--since-round', null);
+  if (since !== null) args.push('--since-round', since);
   const child = spawn(process.execPath, args, { stdio: 'inherit', windowsHide: true });
   child.on('exit', (code) => process.exit(code ?? 0));
 }
@@ -469,7 +453,6 @@ async function verbWait() {
 const VERBS = {
   ensure: verbEnsure,
   status: verbStatus,
-  track: verbTrack,
   review: verbReview,
   skip: verbSkip,
   wait: verbWait,
@@ -486,14 +469,17 @@ async function main() {
   아래는 **데몬을 띄우지 않는다** (돌고 있지 않으면 그 사실을 알린다):
 
     status [--pr <ref>] [--json]  현재 상태
-    track  <ref...>             레포를 감시 범위에 추가
     skip   <ref>                이 PR 은 리뷰하지 않는다
-    wait   <ref> [--timeout <초>] [--until <이벤트>]
+    wait   <ref> [--since-round <n>] [--timeout <초>] [--until <이벤트>]
                                 결과까지 대기 (백그라운드로 실행할 것)
+                                --since-round 는 review 가 알려준 값을 그대로
 
   <ref> 는 owner/repo#12 또는 PR URL.
 
-  데몬 종료는 여기 없습니다 — 대시보드의 종료 버튼이나
+  감시 범위는 넓히지 않습니다 — 범위는 레포 단위라 PR 하나를 부탁하는 요청이
+  그 레포의 다른 PR 까지 리뷰 대상으로 만듭니다. 범위는 사람이 정합니다.
+
+  데몬 종료도 여기 없습니다 — 대시보드의 종료 버튼이나
   \`npm run dev -- stop\` 을 쓰세요 (여러 세션이 함께 씁니다).
 `);
     process.exit(VERB && !VERBS[VERB] ? 1 : 0);
