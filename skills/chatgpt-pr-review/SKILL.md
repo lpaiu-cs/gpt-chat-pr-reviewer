@@ -1,6 +1,9 @@
 ---
 name: chatgpt-pr-review
-description: Request and monitor automated GitHub PR reviews through the local gpt-chat-pr-reviewer daemon, then handle posted threads through convergence. Use after opening a PR, after pushing review fixes, or when the user asks "review this PR", "run the reviewer", "리뷰 돌려", "리뷰 받아줘", or "리뷰어 붙여줘". A round takes 2–15 minutes, so wait without blocking other work.
+description: Request and monitor GitHub PR reviews through the local
+  gpt-chat-pr-reviewer daemon. Use only when the user explicitly invokes
+  $chatgpt-pr-review. Do not use for ordinary PR or code review performed
+  directly by the current agent.
 ---
 
 # PR 리뷰 요청

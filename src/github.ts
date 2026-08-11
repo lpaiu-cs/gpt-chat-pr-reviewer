@@ -457,6 +457,12 @@ export function getViewerLogin(): string {
 
 export type PullRequestReaction = 'eyes' | '+1';
 
+export interface PullRequestReactionRecord {
+  id: number;
+  content: string;
+  user?: { login?: string } | null;
+}
+
 /** GitHub reactions API 에 보낼 본문 (순수 함수). */
 export function buildPullRequestReactionPayload(content: PullRequestReaction): string {
   return JSON.stringify({ content });
@@ -482,6 +488,66 @@ export function addPullRequestReaction(
     ],
     { input: buildPullRequestReactionPayload(content), captureStderr: true },
   );
+}
+
+/** 조회 결과에서 현재 사용자가 남긴 특정 반응 id만 고른다. */
+export function viewerReactionIds(
+  reactions: PullRequestReactionRecord[],
+  content: PullRequestReaction,
+  viewer: string,
+): number[] {
+  const login = viewer.toLowerCase();
+  return reactions
+    .filter(
+      (reaction) =>
+        reaction.content === content && reaction.user?.login?.toLowerCase() === login,
+    )
+    .map((reaction) => reaction.id);
+}
+
+/** 현재 gh 인증 사용자가 PR에 남긴 특정 반응을 모두 제거한다. */
+export function removePullRequestReaction(
+  owner: string,
+  repo: string,
+  number: number,
+  content: PullRequestReaction,
+): void {
+  const endpoint = `repos/${owner}/${repo}/issues/${number}/reactions`;
+  const raw = gh(
+    [
+      'api',
+      endpoint,
+      '--method',
+      'GET',
+      '-f',
+      `content=${content}`,
+      '-f',
+      'per_page=100',
+      '--paginate',
+      '--slurp',
+      '-H',
+      'Accept: application/vnd.github+json',
+    ],
+    { captureStderr: true },
+  );
+  const parsed = JSON.parse(raw) as PullRequestReactionRecord[][] | PullRequestReactionRecord[];
+  const reactions = Array.isArray(parsed[0])
+    ? (parsed as PullRequestReactionRecord[][]).flat()
+    : (parsed as PullRequestReactionRecord[]);
+
+  for (const id of viewerReactionIds(reactions, content, getViewerLogin())) {
+    gh(
+      [
+        'api',
+        `${endpoint}/${id}`,
+        '--method',
+        'DELETE',
+        '-H',
+        'Accept: application/vnd.github+json',
+      ],
+      { captureStderr: true },
+    );
+  }
 }
 
 // ── Diff 파싱 ───────────────────────────────────────────────

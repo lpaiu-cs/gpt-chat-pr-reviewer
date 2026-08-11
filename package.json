@@ -39,6 +39,7 @@
     "watch": "tsx src/cli.ts watch",
     "status": "tsx src/cli.ts status",
     "smoke": "tsx scripts/smoke-machine.ts",
+    "test": "tsx --test tests/*.test.ts",
     "smoke:install": "node scripts/smoke-install-skills.mjs",
     "notify": "node scripts/notify.mjs",
     "install-skills": "node scripts/install-skills.mjs",

@@ -13,6 +13,7 @@ import {
   ghErrorMessage,
   buildReviewPayload,
   buildPullRequestReactionPayload,
+  viewerReactionIds,
   THREAD_ALIAS_CHUNK,
   type PRProbe,
 } from '../src/github.js';
@@ -243,6 +244,18 @@ const fakePR: PRInfo = {
   assert(
     buildPullRequestReactionPayload('+1') === '{"content":"+1"}',
     '리뷰 수렴 반응은 +1',
+  );
+  assert(
+    viewerReactionIds(
+      [
+        { id: 1, content: 'eyes', user: { login: 'review-bot' } },
+        { id: 2, content: 'eyes', user: { login: 'someone-else' } },
+        { id: 3, content: '+1', user: { login: 'review-bot' } },
+      ],
+      'eyes',
+      'Review-Bot',
+    ).join(',') === '1',
+    '현재 사용자의 지정 반응만 제거 대상으로 고른다',
   );
 }
 
