@@ -153,6 +153,26 @@ async function getState(ui, timeoutMs = 3_000) {
   return res.json();
 }
 
+/**
+ * 후보 하나를 확인한다 — **응답이 늦은 것과 아무도 없는 것을 구분한다.**
+ *
+ * 포트가 닫혀 있으면 연결이 즉시 거절되므로, 시간이 다 갔다는 것은 누군가
+ * 듣고 있는데 지금 바쁘다는 뜻이다. 데몬은 라운드 중 대형 DOM 을 읽어 오느라
+ * 순간적으로 응답이 밀리는데, 그 순간을 "데몬 없음" 으로 단정하면 (1) 에이전트가
+ * 멀쩡한 데몬을 죽었다고 보고하고 (2) 시작 동사는 두 번째 데몬을 띄운다.
+ * 그래서 시간 초과일 때만 넉넉한 예산으로 한 번 더 묻는다.
+ */
+async function probeState(ui) {
+  try {
+    return await getState(ui, 1_500);
+  } catch (e) {
+    // fetch 는 중단을 그대로 던지기도 하고 cause 로 감싸기도 한다 — 둘 다 본다.
+    const names = [e?.name, e?.cause?.name];
+    if (!names.some((n) => n === 'TimeoutError' || n === 'AbortError')) throw e;
+  }
+  return getState(ui, 8_000);
+}
+
 async function postIntent(ui, body) {
   const res = await fetch(`${ui}/api/intent`, {
     method: 'POST',
@@ -192,7 +212,7 @@ async function findDaemon() {
   let sawStranger = false;
   for (const ui of candidates) {
     try {
-      const s = await getState(ui, 1_500);
+      const s = await probeState(ui);
       if (!s || !s.snapshot) continue;
       if (s.snapshot.instance === want) {
         return { ui, mode: s.snapshot.mode ?? 'review', ready: s.snapshot.ready === true };
