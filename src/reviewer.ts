@@ -24,7 +24,7 @@ import {
 } from './github.js';
 import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
-import { postReviewToGitHub } from './poster.js';
+import { postReviewToGitHub, commentDigest, type LiveComment } from './poster.js';
 import { loadInstructions } from './instructions.js';
 import {
   saveResponse,
@@ -62,6 +62,12 @@ function removeReactionFromPullRequest(ctx: PRContext, content: PullRequestReact
  *
  * 우리 것이 아닌 스레드도 id 만은 knownThreadIds 에 기록한다. 그렇게 하지 않으면
  * probe 가 매번 "미지의 스레드" 로 보고 전체 동기화를 무한 반복한다.
+ *
+ * **숨긴 스레드는 추적하지 않는다.** 사람이 duplicate 등으로 숨겼다는 것은 "이건
+ * 없던 것으로 하라" 는 판정이다. 그대로 미해결로 세면 (1) 그 라운드는 전체 resolve
+ * 가 영영 성립하지 않아 응답 대기에서 나오지 못하고 (2) 다음 라운드 프롬프트가
+ * 취소된 지적을 계속 실어 나른다. id 는 knownThreadIds 에 남겨 probe 가 이걸
+ * 매번 새 스레드로 보지 않게 한다.
  */
 export function adoptThreads(
   ctx: PRContext,
@@ -76,15 +82,27 @@ export function adoptThreads(
   for (const t of threads) seen.add(t.id);
   ctx.knownThreadIds = [...seen];
 
+  const hidden = new Set(threads.filter((t) => t.isHidden).map((t) => t.id));
+  const dropped = ctx.threads.filter((r) => hidden.has(r.id));
+  if (dropped.length > 0) {
+    ctx.threads = ctx.threads.filter((r) => !hidden.has(r.id));
+    console.log(
+      chalk.dim(`  숨겨진 코멘트 ${dropped.length}건을 추적에서 제외합니다.`),
+    );
+  }
+
   for (const t of threads) {
+    if (t.isHidden) continue;
     const first = t.comments[0];
     if (!first || first.author !== viewer) continue; // 우리가 시작한 스레드만
 
-    const replied = t.comments.slice(1).some((c) => c.author !== viewer);
+    // 숨긴 답글은 응답으로 세지 않는다 — 스레드 본체와 같은 이유다.
+    const replied = t.comments.slice(1).some((c) => c.author !== viewer && !c.isHidden);
     const existing = ctx.threads.find((r) => r.id === t.id);
     if (existing) {
       existing.isResolved = t.isResolved;
       existing.authorReplied = replied;
+      existing.digest ??= commentDigest(first.body); // 구버전 컨텍스트 보정
     } else {
       ctx.threads.push({
         id: t.id,
@@ -94,6 +112,7 @@ export function adoptThreads(
         authorReplied: replied,
         round: roundForNew,
         snippet: first.body.slice(0, 80).replace(/\s+/g, ' '),
+        digest: commentDigest(first.body),
       });
     }
   }
@@ -181,7 +200,7 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
   // 5. 작성자 응답 감지 (리뷰 대상 변경 or 마지막 라운드 스레드 전체 resolve)
   if (ctx.state === 'AWAITING_AUTHOR') {
     const moved = targetChanged(ctx, data);
-    const lastRound = ctx.threads.filter((t) => t.round === ctx.round);
+    const lastRound = latestRoundThreads(ctx);
     const allResolved = lastRound.length > 0 && lastRound.every((t) => t.isResolved);
     if (moved || allResolved) {
       fire(ctx, 'AUTHOR_RESPONDED', { note: moved ?? '전체 스레드 resolve 확인' });
@@ -193,6 +212,20 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
     const moved = targetChanged(ctx, data);
     if (moved) fire(ctx, 'NEW_COMMITS', { note: `수렴 후 ${moved} — 리뷰 재개` });
   }
+}
+
+/**
+ * **아직 살아 있는 지적 중 가장 최근 라운드의 것**들.
+ *
+ * `round === ctx.round` 로 못 박으면 안 된다. 그 라운드의 지적이 전부 숨겨지면
+ * (중복 게시를 사람이 duplicate 로 숨긴 경우) 대상이 0건이 되어 "전체 resolve"
+ * 판정이 영영 성립하지 않고, PR 은 새 커밋이 오기 전까지 응답 대기에 갇힌다.
+ * 그때는 실제로 화면에 남아 있는 직전 라운드의 지적이 판정 대상이다.
+ */
+export function latestRoundThreads(ctx: PRContext): PRContext['threads'] {
+  if (ctx.threads.length === 0) return [];
+  const latest = Math.max(...ctx.threads.map((t) => t.round));
+  return ctx.threads.filter((t) => t.round === latest);
 }
 
 /**
@@ -559,6 +592,19 @@ function resolveSelfReview(ctx: PRContext): boolean {
   }
 }
 
+/**
+ * 아직 열려 있는 우리 지적 — 같은 것을 다시 올리지 않기 위한 대조 대상.
+ *
+ * 해결된 스레드는 뺀다. 작성자가 닫은 지적을 모델이 다시 든다면 그건 "아직 안
+ * 고쳐졌다" 는 재지적이라 올라가야 한다. 숨겨진 스레드는 adoptThreads 가 이미
+ * 추적에서 뺐으므로 여기 없다.
+ */
+function liveComments(ctx: PRContext): LiveComment[] {
+  return ctx.threads
+    .filter((t) => !t.isResolved)
+    .map((t) => ({ path: t.path, line: t.line, digest: t.digest }));
+}
+
 export type RoundOutcome = 'posted' | 'clean' | 'quota' | 'failed' | 'dry';
 
 export interface RunRoundOptions {
@@ -858,6 +904,7 @@ export async function runRound(
         dryRun: true,
         isSelfReview: resolveSelfReview(ctx),
         round,
+        live: liveComments(ctx),
       });
       console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
       return 'dry';
@@ -895,11 +942,12 @@ export async function runRound(
     progress.phase('posting');
     // 검토한 커밋에 고정한다. 빼면 GitHub 이 게시 시점의 최신 커밋에 리뷰를 붙여,
     // 대기하는 2~15분 사이의 push 에 **본 적 없는 APPROVE** 가 직접 달린다.
-    await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
+    const post = await postReviewToGitHub(ctx.owner, ctx.repo, ctx.prNumber, result, {
       isSelfReview: resolveSelfReview(ctx),
       commitId: reviewed.headSha,
       baseRef: reviewed.baseRef,
       round,
+      live: liveComments(ctx),
     });
 
     // 게시 직후 head SHA · 새 스레드 동기화
@@ -919,10 +967,17 @@ export async function runRound(
       console.log(chalk.yellow('  ⚠ 게시 후 스레드 동기화 실패 — 다음 sync 에서 보정됩니다.'));
     }
 
-    const n = result.comments.length;
+    // 게시한 것만 센다. 중복이라 빠진 코멘트는 화면에 이미 같은 스레드가 떠
+    // 있으므로, 그것까지 세면 "지적 누적" 이 실제 스레드 수와 어긋난다.
+    const n = post.posted ? post.inline + post.inBody : 0;
+    // 전부 중복이면 새로 전할 말이 없다 — 게시하지 않았으므로 이 라운드는 그대로
+    // 작성자 응답 대기로 돌아간다. 이미 열려 있는 지적이 그 대기의 근거다.
     const converged = result.approval === 'approve';
     fire(ctx, converged ? 'POSTED_CLEAN' : 'POSTED_COMMENTS', {
-      note: `${round}차 완료: 코멘트 ${n}개, approval=${result.approval}`,
+      note: post.posted
+        ? `${round}차 완료: 코멘트 ${n}개, approval=${result.approval}` +
+          (post.duplicates > 0 ? ` (중복 ${post.duplicates}개 제외)` : '')
+        : `${round}차 완료: 전부 이미 지적한 내용(${post.duplicates}개) — 게시하지 않음`,
       patch: {
         round,
         requestedCount: ctx.requestedCount + n,

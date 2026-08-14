@@ -80,6 +80,14 @@ export interface ThreadRecord {
   round: number;
   /** 첫 코멘트 앞부분 */
   snippet: string;
+  /**
+   * 첫 코멘트 **본문 전체**의 지문 — 같은 지적을 두 번 게시하지 않기 위한 것.
+   *
+   * snippet 으로는 판별할 수 없다 (80자까지만 남기므로 뒷부분이 다른 지적도
+   * 같아 보인다). 본문을 통째로 들고 있으면 상태 파일이 리뷰 본문만큼 커지므로
+   * 지문만 남긴다. 구버전 컨텍스트에는 없다 — 다음 동기화에서 채워진다.
+   */
+  digest?: string;
 }
 
 export interface EventRecord {

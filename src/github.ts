@@ -107,7 +107,16 @@ export interface SyncThread {
   isResolved: boolean;
   path: string;
   line: number | null;
-  comments: { author: string; body: string }[];
+  /**
+   * 사람이 **숨긴** 스레드인가 (minimize — duplicate·outdated·off-topic 등).
+   *
+   * 숨김은 "이건 없던 것으로 하라" 는 사람의 판정이다. resolve 와 달리 응답이
+   * 아니므로, 숨긴 스레드를 계속 미해결로 세면 그 라운드는 영영 응답 대기에
+   * 머문다. 코멘트 자체를 숨기는 경우와 리뷰 전체를 숨기는 경우가 모두 있어
+   * (리뷰를 숨겨도 인라인 코멘트의 isMinimized 는 false 로 남는다) 둘 다 본다.
+   */
+  isHidden: boolean;
+  comments: { author: string; body: string; isHidden: boolean }[];
 }
 
 export interface PRSyncData {
@@ -128,7 +137,9 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
       reviewThreads(first:100){
         nodes{
           id isResolved path line originalLine
-          comments(first:50){ nodes{ author{ login } body } }
+          comments(first:50){
+            nodes{ author{ login } body isMinimized pullRequestReview{ isMinimized } }
+          }
         }
       }
     }
@@ -147,16 +158,23 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
     status: pr.state,
     headSha: pr.headRefOid,
     baseRef: pr.baseRefName,
-    threads: (pr.reviewThreads?.nodes ?? []).map((n: any) => ({
-      id: n.id,
-      isResolved: n.isResolved,
-      path: n.path,
-      line: n.line ?? n.originalLine ?? null,
-      comments: (n.comments?.nodes ?? []).map((c: any) => ({
+    threads: (pr.reviewThreads?.nodes ?? []).map((n: any) => {
+      const comments = (n.comments?.nodes ?? []).map((c: any) => ({
         author: c.author?.login ?? '',
         body: c.body ?? '',
-      })),
-    })),
+        // 코멘트를 직접 숨겼거나, 그 코멘트를 담은 리뷰가 통째로 숨겨졌거나.
+        isHidden: !!c.isMinimized || !!c.pullRequestReview?.isMinimized,
+      }));
+      return {
+        id: n.id,
+        isResolved: n.isResolved,
+        path: n.path,
+        line: n.line ?? n.originalLine ?? null,
+        // 스레드를 연 코멘트가 숨겨졌으면 스레드 전체가 없던 것이다.
+        isHidden: !!comments[0]?.isHidden,
+        comments,
+      };
+    }),
   };
 }
 
