@@ -68,9 +68,24 @@ test('judgeRebind: 앵커가 직전 턴으로 물러섰으면 따라가지 않�
 
 test('judgeRebind: 판별할 화면이 없으면 유예한다', () => {
   assert.deepEqual(judgeRebind([], bound), { action: 'hold', reason: 'anchor-unknown' });
-  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2')], bound), {
+});
+
+test('judgeRebind: 같은 질문의 답이 아직 없으면 기다린다 (18차 실패 경로)', () => {
+  // 추론 중 답 노드가 지워진 화면. 우리 질문(u2)이 여전히 마지막이므로 대기다 —
+  // 여기서 실패로 접으면, 같은 화면을 두고 고정 전에는 기다리고 고정 후에는
+  // 버리는 모순이 된다.
+  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2')], bound), { action: 'wait' });
+  // 식별자가 아직 안 붙은 답 노드도 같다 — 붙으면 그때 다시 고정한다.
+  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2'), { role: 'assistant', id: null }], bound), {
+    action: 'wait',
+  });
+});
+
+test('judgeRebind: 다른 질문이 마지막이면 그 답을 기다리지 않는다', () => {
+  // 우리 질문 뒤에 다른 질문이 들어온 화면 — 그 답은 우리 것이 아니다.
+  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2'), u('u3')], bound), {
     action: 'hold',
-    reason: 'anchor-pending',
+    reason: 'turn-moved',
   });
 });
 

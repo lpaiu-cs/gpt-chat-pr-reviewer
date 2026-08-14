@@ -129,7 +129,9 @@ export interface BoundTarget {
 export type RebindDecision =
   | { action: 'keep' }
   | { action: 'rebind'; id: string }
-  | { action: 'hold'; reason: 'anchor-pending' | 'anchor-unknown' | 'turn-moved' };
+  /** 같은 질문의 답이 아직 화면에 없다 — 기다린다 (실패가 아니다). */
+  | { action: 'wait' }
+  | { action: 'hold'; reason: 'anchor-unknown' | 'turn-moved' };
 
 /**
  * 고정한 노드가 안 보일 때 **같은 질문의 답으로 다시 고정할 수 있는지** 판정한다.
@@ -148,13 +150,20 @@ export function judgeRebind(msgs: MessageRef[], bound: BoundTarget): RebindDecis
 
   const anchor = anchorAnswer(msgs);
   if (anchor.status === 'unknown') return { action: 'hold', reason: 'anchor-unknown' };
-  if (anchor.status === 'pending') return { action: 'hold', reason: 'anchor-pending' };
-  if (!anchor.id) return { action: 'hold', reason: 'anchor-unknown' };
 
   // 질문 식별자가 있으면 그것이 가장 확실하다. 없을 때만 위치로 대조한다 —
   // 뒤로 물러선 앵커는 언제나 더 작은 nth 를 내므로 오탐 방향이 안전하다.
   const sameTurn = bound.userId ? anchor.userId === bound.userId : anchor.nth === bound.nth;
-  return sameTurn ? { action: 'rebind', id: anchor.id } : { action: 'hold', reason: 'turn-moved' };
+  if (!sameTurn) return { action: 'hold', reason: 'turn-moved' };
+
+  // **우리 질문이 여전히 마지막인데 답만 없다 — 기다리는 상태다.**
+  // 추론 중에는 답 노드가 그려졌다 지워졌다 한다. 고정 전에는 이것을 정상
+  // 대기로 보면서 고정 후에만 소실로 보면, 같은 화면을 두고 판정이 갈린다.
+  // 실제로 그래서 18차가 실패했다 — 재시도(회수 경로)는 같은 화면에서 그냥
+  // 기다려 성공했다. 답이 끝내 안 나오면 응답 예산이 정확한 실패를 낸다.
+  if (anchor.status === 'pending' || !anchor.id) return { action: 'wait' };
+
+  return { action: 'rebind', id: anchor.id };
 }
 
 /** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
@@ -895,6 +904,7 @@ export class ChatGPTDriver {
     /** 앵커 판별이 계속 안 돼 전송 시점 위치로 물러섰는가. */
     let fellBack = false;
     let anchorNoted = false;
+    let redrawNoted = false;
     /** 앵커를 연속으로 못 잡은 횟수 — 위치 기반으로 물러설지 판단한다. */
     let unknowns = 0;
 
@@ -1007,6 +1017,14 @@ export class ChatGPTDriver {
         if (decision.action === 'rebind') {
           bound = { id: decision.id, userId: bound.userId, nth: bound.nth };
           console.log(chalk.dim('  응답 노드가 교체됐습니다 — 같은 질문의 답으로 다시 고정합니다.'));
+        } else if (decision.action === 'wait') {
+          // 답 노드가 잠시 사라졌다 (추론 중 다시 그리는 구간). 고정은 그대로 두고
+          // 기다린다 — 아래로 흘려보내야 생성 중 판정·정체 진단·경과 표시가 산다.
+          // 죽은 노드를 읽으면 빈 문자열이라 완료로 오인될 일도 없다.
+          if (!redrawNoted) {
+            redrawNoted = true;
+            console.log(chalk.dim('  답 노드가 다시 그려지는 중입니다 — 같은 질문이므로 기다립니다.'));
+          }
         } else if (decision.action === 'hold') {
           if (++misses >= MISS_TOLERANCE) {
             throw new Error(
