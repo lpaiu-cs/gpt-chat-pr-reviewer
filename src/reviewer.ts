@@ -155,7 +155,25 @@ export function syncPR(cfg: AppConfig, ctx: PRContext): void {
   }
   adoptThreads(ctx, data.threads, viewer, ctx.round);
   applySyncEvents(cfg, ctx, data);
+  ctx.lastFullSyncAt = new Date().toISOString();
   saveContext(cfg, ctx);
+}
+
+/**
+ * 전체 동기화를 한 번 돌 때가 됐는가.
+ *
+ * probe 는 스레드의 id·resolve 만 본다. 그래서 **본문 쪽에서 벌어지는 일**은
+ * 영영 못 본다 — 사람이 코멘트를 숨겨도, 우리가 아는 스레드만 있으면 probe 는
+ * "변화 없음" 이라 보고하고 숨김은 반영되지 않는다. 실제로 중복 리뷰를
+ * duplicate 로 숨긴 뒤에도 도구는 14건을 그대로 세고 있었다.
+ *
+ * 그래서 주기적으로 한 번은 전체를 읽는다. PR 당 1 point 짜리 조회를 10분에
+ * 한 번이므로 20개를 봐도 시간당 120 point 다 (한도 5,000).
+ */
+export function fullSyncDue(cfg: AppConfig, ctx: PRContext, now = Date.now()): boolean {
+  if (!ctx.lastFullSyncAt) return true;
+  const at = Date.parse(ctx.lastFullSyncAt);
+  return !Number.isFinite(at) || now - at >= cfg.fullSyncIntervalMs;
 }
 
 /**
@@ -284,7 +302,8 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
     baseRef: probe.baseBranch,
   });
   saveContext(cfg, ctx);
-  return needsFull;
+  // 숨김처럼 probe 가 볼 수 없는 변화는 주기적인 전체 조회로만 잡힌다.
+  return needsFull || fullSyncDue(cfg, ctx);
 }
 
 // ── 대화 세션 ───────────────────────────────────────────────

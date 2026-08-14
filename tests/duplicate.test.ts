@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { commentDigest, dropDuplicateComments } from '../src/poster.js';
-import { adoptThreads, latestRoundThreads } from '../src/reviewer.js';
-import type { PRContext, ReviewComment } from '../src/types.js';
+import { adoptThreads, latestRoundThreads, fullSyncDue } from '../src/reviewer.js';
+import type { AppConfig, PRContext, ReviewComment } from '../src/types.js';
 import type { SyncThread } from '../src/github.js';
 
 const VIEWER = 'reviewer-bot';
@@ -110,6 +110,20 @@ test('adoptThreads 는 첫 코멘트 본문의 지문을 남긴다', () => {
   const ctx = ctxWith([]);
   adoptThreads(ctx, [thread({ id: 'T1' })], VIEWER, 2);
   assert.equal(ctx.threads[0].digest, commentDigest('지적입니다'));
+});
+
+test('전체 동기화는 주기가 지나면 다시 돈다 (숨김을 보는 유일한 경로)', () => {
+  const cfg = { fullSyncIntervalMs: 600_000 } as AppConfig;
+  const now = Date.parse('2026-08-14T01:00:00.000Z');
+  const ctx = ctxWith([]);
+
+  assert.equal(fullSyncDue(cfg, ctx, now), true); // 한 번도 안 돌았다
+  ctx.lastFullSyncAt = '2026-08-14T00:55:00.000Z';
+  assert.equal(fullSyncDue(cfg, ctx, now), false); // 5분 전 — 아직
+  ctx.lastFullSyncAt = '2026-08-14T00:45:00.000Z';
+  assert.equal(fullSyncDue(cfg, ctx, now), true); // 15분 전 — 다시 돈다
+  ctx.lastFullSyncAt = '알 수 없는 값';
+  assert.equal(fullSyncDue(cfg, ctx, now), true); // 판별 불가는 도는 쪽으로
 });
 
 test('마지막 라운드가 통째로 숨겨지면 직전 라운드가 판정 대상이 된다', () => {

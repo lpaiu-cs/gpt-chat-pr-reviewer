@@ -78,6 +78,8 @@ const DEFAULT_CONFIG: AppConfig = {
   // 레포 20개면 10초 주기 probe 가 시간당 7,200 point 로 한도(5,000)를 넘는다.
   // resolve 를 기다리는 레포만 10초로 두고 나머지는 이 주기로 늦춘다.
   probeIdleIntervalMs: 60_000,
+  // 숨김처럼 probe 가 못 보는 변화의 반영 지연 상한. PR 당 1 point 짜리 조회다.
+  fullSyncIntervalMs: 10 * 60_000,
   watchRepos: [],
   dataDir: './data',
 };

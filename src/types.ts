@@ -186,6 +186,11 @@ export interface PRContext {
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
   quotaRetryAt?: string;
+  /**
+   * 마지막으로 **전체** 동기화(fetchPRSyncData)를 돈 시각 (ISO).
+   * probe 가 볼 수 없는 변화(코멘트 숨김 등)를 주기적으로 잡기 위한 기준이다.
+   */
+  lastFullSyncAt?: string;
   history: EventRecord[];
   createdAt: string;
   updatedAt: string;
@@ -302,6 +307,14 @@ export interface AppConfig {
    * 기다리는 상태다. 나머지 레포는 이 주기로 늦춘다.
    */
   probeIdleIntervalMs: number;
+  /**
+   * PR 1건의 전체 동기화 주기 (ms) — probe 가 볼 수 없는 변화를 잡는 안전망.
+   *
+   * probe 는 스레드의 id·resolve 만 본다. 사람이 코멘트를 **숨겨도** 아는
+   * 스레드만 있으면 "변화 없음" 이라 보고하므로, 숨김은 이 주기가 아니면
+   * 반영되지 않는다. PR 당 1 point 라 20개를 봐도 시간당 120 point 다.
+   */
+  fullSyncIntervalMs: number;
   /**
    * watch 대상 레포 목록 ('owner/repo') — 구버전 설정.
    * `watch.include` 가 비어 있을 때의 폴백으로만 쓰인다.
