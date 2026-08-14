@@ -86,22 +86,75 @@ export interface MessageRef {
 }
 
 export type AnswerAnchor =
-  | { status: 'ready'; id: string | null; nth: number }
-  | { status: 'pending'; nth: number }
+  | { status: 'ready'; id: string | null; userId: string | null; nth: number }
+  | { status: 'pending'; userId: string | null; nth: number }
   | { status: 'unknown' };
 
-export function anchorAnswer(msgs: MessageRef[]): AnswerAnchor {
+/**
+ * `afterUserId` 는 **전송 직전의 마지막 질문**이다. 앵커가 아직 그 질문을 가리키면
+ * 우리 질문이 화면에 그려지기 전이라는 뜻이므로 `pending` 으로 돌린다.
+ *
+ * 이 가드가 없으면 전송 후 몇 초 동안 앵커가 **직전 라운드의 답**을 가리킨다.
+ * 그 노드를 고정하면 (1) 그대로 남아 있을 때 낡은 응답을 새 응답으로 게시하고
+ * (2) 화면이 갱신되며 떨어져 나갈 때 "노드가 사라졌다" 로 라운드를 버린다.
+ * 실제 관측이 후자다 — 실패가 전부 전송 경로에서만 났고 회수 경로에서는 없었다.
+ */
+export function anchorAnswer(msgs: MessageRef[], afterUserId?: string | null): AnswerAnchor {
   let lastUser = -1;
   for (let i = 0; i < msgs.length; i++) {
     if (msgs[i].role === 'user') lastUser = i;
   }
   if (lastUser < 0) return { status: 'unknown' };
 
+  const userId = msgs[lastUser].id;
   const nth = msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
+
+  if (afterUserId && userId === afterUserId) return { status: 'pending', userId, nth };
+
   for (let i = lastUser + 1; i < msgs.length; i++) {
-    if (msgs[i].role === 'assistant') return { status: 'ready', id: msgs[i].id, nth };
+    if (msgs[i].role === 'assistant') return { status: 'ready', id: msgs[i].id, userId, nth };
   }
-  return { status: 'pending', nth };
+  return { status: 'pending', userId, nth };
+}
+
+/** 고정한 대상 — 답 노드의 식별자와, 그 답을 부른 질문. */
+export interface BoundTarget {
+  id: string;
+  /** 그 답을 부른 질문의 식별자 (없으면 위치로 대조한다). */
+  userId: string | null;
+  /** 고정 당시의 앵커 위치. */
+  nth: number;
+}
+
+export type RebindDecision =
+  | { action: 'keep' }
+  | { action: 'rebind'; id: string }
+  | { action: 'hold'; reason: 'anchor-pending' | 'anchor-unknown' | 'turn-moved' };
+
+/**
+ * 고정한 노드가 안 보일 때 **같은 질문의 답으로 다시 고정할 수 있는지** 판정한다.
+ *
+ * ChatGPT 는 전송 직후 임시 식별자로 답 노드를 그린 뒤 서버 식별자가 오면 그
+ * 노드를 갈아 끼운다. 고정을 소실로만 처리하면 정상 응답이 오는 중에 라운드를
+ * 버린다 — 최근 여덟 라운드 중 넷이 그렇게 실패했다.
+ *
+ * 갈아타는 조건은 **질문이 같을 때뿐**이다. 답이 길어져 우리 질문이 화면 밖으로
+ * 밀려나면 앵커가 직전 턴으로 물러설 수 있고, 그때 따라가면 낡은 응답을 새
+ * 응답으로 게시한다 — 이 도구에서 가장 비싼 실패다. 판별이 안 서면 hold 로
+ * 두고, 호출부가 유예 횟수만큼 기다렸다가 라운드를 접는다.
+ */
+export function judgeRebind(msgs: MessageRef[], bound: BoundTarget): RebindDecision {
+  if (msgs.some((m) => m.id === bound.id)) return { action: 'keep' };
+
+  const anchor = anchorAnswer(msgs);
+  if (anchor.status === 'unknown') return { action: 'hold', reason: 'anchor-unknown' };
+  if (anchor.status === 'pending') return { action: 'hold', reason: 'anchor-pending' };
+  if (!anchor.id) return { action: 'hold', reason: 'anchor-unknown' };
+
+  // 질문 식별자가 있으면 그것이 가장 확실하다. 없을 때만 위치로 대조한다 —
+  // 뒤로 물러선 앵커는 언제나 더 작은 nth 를 내므로 오탐 방향이 안전하다.
+  const sameTurn = bound.userId ? anchor.userId === bound.userId : anchor.nth === bound.nth;
+  return sameTurn ? { action: 'rebind', id: anchor.id } : { action: 'hold', reason: 'turn-moved' };
 }
 
 /** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
@@ -521,6 +574,12 @@ export class ChatGPTDriver {
     // 고 오인해 직전 라운드의 응답을 그대로 반환한다.
     const before = await this.countSettledMessages(p);
 
+    // ── 직전 질문의 식별자 기록 ──
+    // 전송 후 우리 질문이 화면에 그려지기까지 몇 초가 걸린다. 그 사이 "마지막
+    // 질문 뒤의 답" 은 **직전 라운드의 답**이므로, 그것을 이번 응답으로 고정하지
+    // 않도록 지금의 마지막 질문을 기억해 둔다.
+    const lastUserBefore = await this.lastUserMessageId(p);
+
     // ── 프롬프트 입력 ──
     await this.fillPrompt(p, prompt);
 
@@ -534,7 +593,19 @@ export class ChatGPTDriver {
     if (onSent) onSent(await this.waitForConversationUrl(p));
 
     // ── 응답 수집 ──
-    return this.collectResponse(p, before);
+    return this.collectResponse(p, before, lastUserBefore);
+  }
+
+  /** 화면에 그려져 있는 마지막 질문의 식별자 (없으면 null). */
+  private async lastUserMessageId(page: Page): Promise<string | null> {
+    try {
+      return await page.evaluate(() => {
+        const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
+        return els.length > 0 ? els[els.length - 1].getAttribute('data-message-id') : null;
+      });
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -785,7 +856,11 @@ export class ChatGPTDriver {
    * 어시스턴트 응답이 완전히 스트리밍 될 때까지 폴링한다.
    * 3회 연속 동일 텍스트이면 완료로 간주.
    */
-  private async collectResponse(page: Page, messageCountBefore: number): Promise<string> {
+  private async collectResponse(
+    page: Page,
+    messageCountBefore: number,
+    afterUserId: string | null = null,
+  ): Promise<string> {
     const sel = this.cfg.selectors;
     const timeout = this.cfg.responseTimeoutMs;
 
@@ -814,48 +889,60 @@ export class ChatGPTDriver {
     // 판정된 노드는 즉시 **식별자로 고정**해 DOM 이 흔들려도 같은 메시지만 읽는다.
     // 고정 후 노드가 계속 사라져 있으면 수집을 실패시킨다 — 다른 메시지를 대신
     // 읽어 게시하는 것보다 낫다.
-    let boundId: string | null = null;
-    /** 앵커가 알려준 현재 위치. null 이면 앵커 판정 불가 → 전송 시점 기준으로 물러선다. */
-    let anchorNth: number | null = null;
+    let bound: BoundTarget | null = null;
+    /** 앵커는 답 노드를 찾았는데 식별자가 없을 때 쓰는 위치. */
+    let readyNth: number | null = null;
+    /** 앵커 판별이 계속 안 돼 전송 시점 위치로 물러섰는가. */
+    let fellBack = false;
     let anchorNoted = false;
     /** 앵커를 연속으로 못 잡은 횟수 — 위치 기반으로 물러설지 판단한다. */
     let unknowns = 0;
 
-    const targetLocator = (): Locator =>
-      boundId
-        ? page.locator(`[${MESSAGE_ID_ATTR}="${boundId}"]`)
-        : page.locator(sel.assistantMessage).nth(anchorNth ?? messageCountBefore);
+    /**
+     * 지금 읽어야 할 노드. **모르면 null 이다** — 그때는 아무것도 읽지 않는다.
+     *
+     * 대상이 정해지기 전에 위치로 아무 메시지나 읽으면, 그 값이 3회 안정 관측을
+     * 통과해 직전 라운드의 답이 이번 응답으로 저장된다.
+     */
+    const targetLocator = (): Locator | null => {
+      if (bound) return page.locator(`[${MESSAGE_ID_ATTR}="${bound.id}"]`);
+      if (readyNth !== null) return page.locator(sel.assistantMessage).nth(readyNth);
+      if (fellBack) return page.locator(sel.assistantMessage).nth(messageCountBefore);
+      return null;
+    };
 
     // 셀렉터를 일반화한 형태다 (findRound 와 같은 이유) — 역할을 나눠 읽어야
     // "마지막 질문 뒤" 를 판정할 수 있다.
-    const readAnchor = async (): Promise<AnswerAnchor> => {
+    const readMessages = async (): Promise<MessageRef[] | null> => {
       try {
-        const msgs = await page.evaluate(() =>
+        return await page.evaluate(() =>
           [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
             role: el.getAttribute('data-message-author-role') ?? '',
             id: el.getAttribute('data-message-id'),
           })),
         );
-        return anchorAnswer(msgs);
       } catch {
-        return { status: 'unknown' }; // 네비게이션 중 등
+        return null; // 네비게이션 중 등
       }
     };
 
     /**
      * 아직 고정 전이면 대상을 찾아 고정한다.
      *
-     * **한 번 고정하면 다른 노드로 갈아타지 않는다.** 답이 길어져 우리 질문이
-     * 화면 밖으로 밀려나면 앵커의 "마지막 사용자 메시지" 가 한 칸 뒤로 물러설 수
-     * 있고, 그때 갈아타면 직전 라운드의 답을 새 응답으로 읽는다. 고정 전에는 그
-     * 위험이 없다 — 스트리밍 중인 답과 그 바로 위 질문은 같이 화면에 있다.
+     * 한 번 고정한 뒤에는 `judgeRebind` 만이 대상을 바꾼다 — 같은 질문의 답으로
+     * 갈아 끼우는 경우뿐이다.
      */
-    const bindTarget = async (): Promise<void> => {
-      const anchor = await readAnchor();
+    const bindTarget = (msgs: MessageRef[] | null): BoundTarget | null => {
+      const anchor: AnswerAnchor = msgs
+        ? anchorAnswer(msgs, afterUserId)
+        : { status: 'unknown' };
 
       unknowns = anchor.status === 'unknown' ? unknowns + 1 : 0;
 
-      if (anchor.status !== 'unknown') {
+      // 답 노드가 아직 없다 — 여기서 위치로 물러서면 직전 라운드의 답을 읽는다.
+      if (anchor.status === 'pending') return null;
+
+      if (anchor.status === 'ready') {
         if (!anchorNoted && anchor.nth !== messageCountBefore) {
           anchorNoted = true;
           console.log(
@@ -864,28 +951,20 @@ export class ChatGPTDriver {
             ),
           );
         }
-        anchorNth = anchor.nth;
-      }
-
-      if (boundId) return;
-
-      // 답 노드가 아직 없다 — 여기서 위치로 물러서면 직전 라운드의 답을 읽는다.
-      if (anchor.status === 'pending') return;
-
-      // 따옴표가 섞이면 셀렉터가 깨진다 — 그때는 위치 기반으로 남고 축소 방어가 맡는다.
-      if (anchor.status === 'ready') {
-        if (anchor.id && !/["\\]/.test(anchor.id)) boundId = anchor.id;
-        return;
+        // 따옴표가 섞이면 셀렉터가 깨진다 — 그때는 위치로 읽고 축소 방어가 맡는다.
+        if (anchor.id && !/["\\]/.test(anchor.id)) {
+          readyNth = null;
+          return { id: anchor.id, userId: anchor.userId, nth: anchor.nth };
+        }
+        readyNth = anchor.nth;
+        return null;
       }
 
       // 앵커 판별 불가 (셀렉터 커스터마이즈 등) — 종전대로 전송 시점 기준 위치.
       // 전송 직후 우리 질문이 아직 안 그려진 한순간도 여기로 떨어지는데, 그때
       // 물러서면 직전 라운드의 답을 고정한다. 계속 못 잡을 때만 물러선다.
-      if (unknowns < UNKNOWN_TOLERANCE) return;
-      const byIndex = page.locator(sel.assistantMessage).nth(messageCountBefore);
-      if ((await byIndex.count().catch(() => 0)) === 0) return;
-      const id = await byIndex.getAttribute(MESSAGE_ID_ATTR).catch(() => null);
-      if (id && !/["\\]/.test(id)) boundId = id;
+      if (unknowns >= UNKNOWN_TOLERANCE) fellBack = true;
+      return null;
     };
 
     // 메시지 컨테이너 전체를 읽으면 "Edit"·복사 버튼 같은 UI 텍스트가 섞인다.
@@ -894,6 +973,7 @@ export class ChatGPTDriver {
     // 앞에 있을 때 통째로 잃는다.
     const readTarget = async (): Promise<string> => {
       const target = targetLocator();
+      if (!target) return ''; // 어느 노드가 이번 답인지 아직 모른다
       const bodies = target.locator(sel.messageContent);
       if ((await bodies.count().catch(() => 0)) > 0) {
         const parts = await bodies.allInnerTexts().catch(() => [] as string[]);
@@ -916,25 +996,39 @@ export class ChatGPTDriver {
     while (Date.now() - t0 < timeout) {
       await page.waitForTimeout(3_000);
 
-      await bindTarget();
+      const msgs = await readMessages();
 
-      // 고정한 노드가 사라졌다. 화면 밖 메시지를 잠시 떼는 것은 정상 동작이라
-      // 한 번 안 보인다고 끊지 않고, 계속 안 보이면 DOM 이 통째로 갈린 것으로
-      // 본다. 위치로 물러서서 아무 메시지나 읽으면 그게 바로 낡은 응답 게시다.
-      if (boundId && (await targetLocator().count().catch(() => 0)) === 0) {
-        if (++misses >= MISS_TOLERANCE) {
-          throw new Error('수집 중이던 응답 노드가 사라졌습니다 (대화 화면이 바뀐 것으로 보입니다).');
+      if (bound) {
+        // 고정한 노드가 안 보인다. ChatGPT 가 임시 식별자로 그린 답 노드를 서버
+        // 식별자로 갈아 끼우는 구간이 여기다 — **같은 질문의 답이면 따라간다.**
+        // 확인이 안 될 때만 유예를 쓰고, 유예를 다 쓰면 라운드를 접는다. 위치로
+        // 물러서서 아무 메시지나 읽으면 그게 바로 낡은 응답 게시다.
+        const decision = judgeRebind(msgs ?? [], bound);
+        if (decision.action === 'rebind') {
+          bound = { id: decision.id, userId: bound.userId, nth: bound.nth };
+          console.log(chalk.dim('  응답 노드가 교체됐습니다 — 같은 질문의 답으로 다시 고정합니다.'));
+        } else if (decision.action === 'hold') {
+          if (++misses >= MISS_TOLERANCE) {
+            throw new Error(
+              `수집 중이던 응답 노드가 사라졌습니다 (대화 화면이 바뀐 것으로 보입니다 · ${decision.reason}).`,
+            );
+          }
+          console.log(
+            chalk.dim(`  응답 노드가 안 보입니다 (${misses}/${MISS_TOLERANCE} · ${decision.reason})`),
+          );
+          continue;
         }
-        continue;
+        misses = 0;
+      } else {
+        bound = bindTarget(msgs);
       }
-      misses = 0;
 
       const cur = await readTarget();
 
       // 식별자를 못 잡아 위치로 읽는 중이라면, **짧아진 값을 채택하지 않는다.**
       // 생성 중인 응답은 길어지기만 하므로 축소는 다른 노드를 읽었다는 신호다.
       // (경고만 하고 덮어쓰면 그 값이 3회 안정 관측을 통과해 그대로 게시된다.)
-      if (!boundId && lastText.length > 0 && cur.length < lastText.length) {
+      if (!bound && lastText.length > 0 && cur.length < lastText.length) {
         shrinks++;
         console.log(
           chalk.yellow(
@@ -1030,7 +1124,10 @@ export class ChatGPTDriver {
         lastText = '';
         // 화면을 통째로 다시 그렸다 — 고정을 풀고 새 DOM 에서 다시 앵커를 잡는다.
         // (그대로 두면 새 노드의 id 가 달라졌을 때 "사라졌다" 로 라운드를 버린다.)
-        boundId = null;
+        bound = null;
+        readyNth = null;
+        fellBack = false;
+        unknowns = 0;
         misses = 0;
         continue;
       }
