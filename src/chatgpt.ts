@@ -60,6 +60,50 @@ export function findRoundBaseline(msgs: ConversationMessage[], marker: string): 
   return msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
 }
 
+/**
+ * **이번 질문의 답이 지금 화면 어디에 있는가** (순수 함수).
+ *
+ * 마지막 사용자 메시지 뒤에 오는 첫 어시스턴트 메시지가 그 질문의 답이다.
+ * 전송 직전에 센 개수로 위치를 고정하면 안 된다 — 대화가 길어지면 ChatGPT 가
+ * 화면 밖 메시지를 떼었다 붙였다 하므로, 전송 후 어시스턴트 노드 수가 줄면
+ * 고정한 위치는 **아무 노드도 가리키지 않는다.** 실제로 그 상태로 15분을
+ * "0자" 로 기다리다 타임아웃했고(#75 6차), 같은 대화를 다시 열어 위치를 다시
+ * 계산한 복구 경로는 즉시 3,421자를 읽었다.
+ *
+ *   ready   답 노드가 있다 — id 로 고정하고, id 가 없으면 nth 로 읽는다
+ *   pending 질문은 찾았고 답 노드가 아직 없다 — 기다린다 (여기서 위치로
+ *           물러서면 직전 라운드의 답을 새 응답으로 오인한다)
+ *   unknown 사용자 메시지를 못 찾았다 (셀렉터 커스터마이즈·조회 실패) —
+ *           호출부가 종전의 전송 시점 기준으로 물러선다
+ *
+ * `nth` 는 **어시스턴트 메시지 중** 몇 번째인가다 (= 그 질문 직전까지의
+ * 어시스턴트 수). 그래서 `findRoundBaseline` 과 같은 값이고, 그대로
+ * `locator(assistantMessage).nth(...)` 에 넣을 수 있다.
+ */
+export interface MessageRef {
+  role: string;
+  id: string | null;
+}
+
+export type AnswerAnchor =
+  | { status: 'ready'; id: string | null; nth: number }
+  | { status: 'pending'; nth: number }
+  | { status: 'unknown' };
+
+export function anchorAnswer(msgs: MessageRef[]): AnswerAnchor {
+  let lastUser = -1;
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role === 'user') lastUser = i;
+  }
+  if (lastUser < 0) return { status: 'unknown' };
+
+  const nth = msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
+  for (let i = lastUser + 1; i < msgs.length; i++) {
+    if (msgs[i].role === 'assistant') return { status: 'ready', id: msgs[i].id, nth };
+  }
+  return { status: 'pending', nth };
+}
+
 /** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
 const CONVERSATION_URL_TIMEOUT_MS = 15_000;
 
@@ -91,6 +135,12 @@ const MESSAGE_ID_ATTR = 'data-message-id';
 
 /** 식별자를 못 잡았을 때, 축소 관측을 이만큼 연속으로 보면 수집 실패로 본다. */
 const SHRINK_TOLERANCE = 3;
+
+/** 고정한 노드가 이만큼 연속으로 안 보이면 화면이 갈린 것으로 본다 (가상화 유예). */
+const MISS_TOLERANCE = 3;
+
+/** 앵커를 이만큼 연속으로 못 잡으면 전송 시점 위치로 물러선다. */
+const UNKNOWN_TOLERANCE = 3;
 
 /**
  * 생성 네트워크가 이만큼 조용하면 (a) 스트림 사망 **후보**로 기록한다.
@@ -756,22 +806,85 @@ export class ChatGPTDriver {
     // 라운드가 7차의 응답을 그대로 게시했다 (관측 길이가 845자로 272초 고정되다가
     // 341자로 급감 — 스트리밍이면 있을 수 없는 변화다).
     //
-    // 위치(nth)조차 재렌더·가상화 때 다른 메시지를 가리킬 수 있으므로, 노드가 뜨는
-    // 즉시 **식별자로 고정**한다. 그 뒤로는 DOM 이 어떻게 흔들려도 같은 메시지만
-    // 읽는다. 고정 후 노드가 사라지면 그건 진짜 이상이므로 수집을 실패시킨다 —
-    // 다른 메시지를 대신 읽어 게시하는 것보다 낫다.
+    // 위치는 **매 폴링마다 화면에서 다시 판정한다** (anchorAnswer). 전송 시점의
+    // 개수(messageCountBefore)를 그대로 위치로 쓰면, 그 뒤 ChatGPT 가 화면 밖
+    // 메시지를 떼어내는 순간 그 위치는 아무것도 가리키지 않게 되고 응답이 화면에
+    // 다 나와 있는데도 "0자" 로 예산을 전부 태운다 (#75 6차 · 15분 타임아웃).
+    //
+    // 판정된 노드는 즉시 **식별자로 고정**해 DOM 이 흔들려도 같은 메시지만 읽는다.
+    // 고정 후 노드가 계속 사라져 있으면 수집을 실패시킨다 — 다른 메시지를 대신
+    // 읽어 게시하는 것보다 낫다.
     let boundId: string | null = null;
+    /** 앵커가 알려준 현재 위치. null 이면 앵커 판정 불가 → 전송 시점 기준으로 물러선다. */
+    let anchorNth: number | null = null;
+    let anchorNoted = false;
+    /** 앵커를 연속으로 못 잡은 횟수 — 위치 기반으로 물러설지 판단한다. */
+    let unknowns = 0;
+
     const targetLocator = (): Locator =>
       boundId
         ? page.locator(`[${MESSAGE_ID_ATTR}="${boundId}"]`)
-        : page.locator(sel.assistantMessage).nth(messageCountBefore);
+        : page.locator(sel.assistantMessage).nth(anchorNth ?? messageCountBefore);
 
+    // 셀렉터를 일반화한 형태다 (findRound 와 같은 이유) — 역할을 나눠 읽어야
+    // "마지막 질문 뒤" 를 판정할 수 있다.
+    const readAnchor = async (): Promise<AnswerAnchor> => {
+      try {
+        const msgs = await page.evaluate(() =>
+          [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
+            role: el.getAttribute('data-message-author-role') ?? '',
+            id: el.getAttribute('data-message-id'),
+          })),
+        );
+        return anchorAnswer(msgs);
+      } catch {
+        return { status: 'unknown' }; // 네비게이션 중 등
+      }
+    };
+
+    /**
+     * 아직 고정 전이면 대상을 찾아 고정한다.
+     *
+     * **한 번 고정하면 다른 노드로 갈아타지 않는다.** 답이 길어져 우리 질문이
+     * 화면 밖으로 밀려나면 앵커의 "마지막 사용자 메시지" 가 한 칸 뒤로 물러설 수
+     * 있고, 그때 갈아타면 직전 라운드의 답을 새 응답으로 읽는다. 고정 전에는 그
+     * 위험이 없다 — 스트리밍 중인 답과 그 바로 위 질문은 같이 화면에 있다.
+     */
     const bindTarget = async (): Promise<void> => {
+      const anchor = await readAnchor();
+
+      unknowns = anchor.status === 'unknown' ? unknowns + 1 : 0;
+
+      if (anchor.status !== 'unknown') {
+        if (!anchorNoted && anchor.nth !== messageCountBefore) {
+          anchorNoted = true;
+          console.log(
+            chalk.dim(
+              `  응답 위치가 전송 시점과 다릅니다 (${messageCountBefore} → ${anchor.nth}) — 화면 기준으로 따라갑니다.`,
+            ),
+          );
+        }
+        anchorNth = anchor.nth;
+      }
+
       if (boundId) return;
+
+      // 답 노드가 아직 없다 — 여기서 위치로 물러서면 직전 라운드의 답을 읽는다.
+      if (anchor.status === 'pending') return;
+
+      // 따옴표가 섞이면 셀렉터가 깨진다 — 그때는 위치 기반으로 남고 축소 방어가 맡는다.
+      if (anchor.status === 'ready') {
+        if (anchor.id && !/["\\]/.test(anchor.id)) boundId = anchor.id;
+        return;
+      }
+
+      // 앵커 판별 불가 (셀렉터 커스터마이즈 등) — 종전대로 전송 시점 기준 위치.
+      // 전송 직후 우리 질문이 아직 안 그려진 한순간도 여기로 떨어지는데, 그때
+      // 물러서면 직전 라운드의 답을 고정한다. 계속 못 잡을 때만 물러선다.
+      if (unknowns < UNKNOWN_TOLERANCE) return;
       const byIndex = page.locator(sel.assistantMessage).nth(messageCountBefore);
       if ((await byIndex.count().catch(() => 0)) === 0) return;
       const id = await byIndex.getAttribute(MESSAGE_ID_ATTR).catch(() => null);
-      // 따옴표가 섞이면 셀렉터가 깨진다 — 그때는 위치 기반으로 남고 축소 방어가 맡는다.
       if (id && !/["\\]/.test(id)) boundId = id;
     };
 
@@ -792,6 +905,7 @@ export class ChatGPTDriver {
     let lastText = '';
     let stable = 0;
     let shrinks = 0;
+    let misses = 0;
     let recoveries = 0;
     let lastLogAt = Date.now();
     let lastQuotaCheckAt = Date.now();
@@ -804,11 +918,16 @@ export class ChatGPTDriver {
 
       await bindTarget();
 
-      // 고정한 노드가 사라졌다 — DOM 이 통째로 갈렸다는 뜻이다. 위치로 물러서서
-      // 아무 메시지나 읽으면 그게 바로 낡은 응답 게시다.
+      // 고정한 노드가 사라졌다. 화면 밖 메시지를 잠시 떼는 것은 정상 동작이라
+      // 한 번 안 보인다고 끊지 않고, 계속 안 보이면 DOM 이 통째로 갈린 것으로
+      // 본다. 위치로 물러서서 아무 메시지나 읽으면 그게 바로 낡은 응답 게시다.
       if (boundId && (await targetLocator().count().catch(() => 0)) === 0) {
-        throw new Error('수집 중이던 응답 노드가 사라졌습니다 (대화 화면이 바뀐 것으로 보입니다).');
+        if (++misses >= MISS_TOLERANCE) {
+          throw new Error('수집 중이던 응답 노드가 사라졌습니다 (대화 화면이 바뀐 것으로 보입니다).');
+        }
+        continue;
       }
+      misses = 0;
 
       const cur = await readTarget();
 
@@ -909,6 +1028,10 @@ export class ChatGPTDriver {
         await page.waitForTimeout(6_000);
         stable = 0;
         lastText = '';
+        // 화면을 통째로 다시 그렸다 — 고정을 풀고 새 DOM 에서 다시 앵커를 잡는다.
+        // (그대로 두면 새 노드의 id 가 달라졌을 때 "사라졌다" 로 라운드를 버린다.)
+        boundId = null;
+        misses = 0;
         continue;
       }
 
