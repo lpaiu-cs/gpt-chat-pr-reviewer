@@ -155,6 +155,15 @@ export function parseIntent(body: unknown): Intent | string {
       if (!Number.isInteger(seq) || seq < 0) return 'seq 는 0 이상의 정수여야 합니다';
       return { kind, ref: b.ref.trim(), seq };
     }
+    case 'concurrency-set': {
+      // **숫자가 아닌 값을 숫자로 만들지 않는다.** `Number(null)` 은 0 이고 0 은
+      // "제한 없음" 이다 — 빠뜨린 필드가 가장 비싼 선택으로 조용히 승격된다.
+      // 상한은 두지 않는다. 0 이 이미 그보다 크고, 실제 상한은 대기열 길이다.
+      if (typeof b.value !== 'number' || !Number.isInteger(b.value) || b.value < 0) {
+        return 'value 는 0 이상의 정수여야 합니다';
+      }
+      return { kind, value: b.value };
+    }
     case 'only-set': {
       const refs = strArray(b.refs);
       if (!refs) return 'refs 배열이 필요합니다';

@@ -144,6 +144,16 @@ function parseRef(raw) {
 
 const refKey = (r) => (r.number === null ? r.slug : `${r.slug}#${r.number}`);
 
+/**
+ * 진행 중인 라운드 목록. 구버전 데몬은 객체 하나(또는 null)를 싣는다 —
+ * 붙는 쪽이 재시작 시점을 고를 수 없으므로 둘 다 받는다.
+ */
+function activeList(state) {
+  const a = state?.snapshot?.active;
+  if (!a) return [];
+  return Array.isArray(a) ? a : [a];
+}
+
 // ── HTTP ────────────────────────────────────────────────────
 
 async function getState(ui, timeoutMs = 3_000) {
@@ -419,14 +429,15 @@ async function verbStatus() {
   if (value('--pr', null) && !ref) die(`잘못된 PR 참조: ${value('--pr', null)}`);
 
   const cards = cardsFor(state, ref);
-  const active = state.snapshot?.active ?? null;
+  // 동시 실행이 가능하므로 **배열**이다. 하나만 골라 실으면 나머지가 사라진다.
+  const active = activeList(state);
 
   if (JSON_OUT) {
     console.log(JSON.stringify({ ok: true, running: true, ui, active, contexts: cards }));
     return;
   }
   console.log(`데몬 ${ui} · 범위 ${state.snapshot?.scope ?? '미설정'}`);
-  if (active) console.log(`  진행 중: ${active.key} ${active.round}차 (${active.phase})`);
+  for (const a of active) console.log(`  진행 중: ${a.key} ${a.round}차 (${a.phase})`);
   if (cards.length === 0) console.log('  추적 중인 PR 이 없습니다.');
   for (const c of cards) console.log(`  · ${describeCard(c)}`);
 }
@@ -497,10 +508,12 @@ async function resolveCard(ui, ref, key) {
     if (Date.now() >= deadline) {
       // 끝내 조회 기록을 못 봤다. 범위 밖일 가능성이 가장 크지만 **단정하지
       // 않는다** — 리뷰가 도는 동안에는 스캔 자체가 밀린다.
-      const active = state.snapshot?.active;
+      const active = activeList(state);
       die(
         repoNotWatched(key, ref.slug, state.snapshot?.control?.include ?? []) +
-          (active ? `\n  (지금 ${active.key} ${active.round}차 리뷰 중이라 스캔이 밀려 있습니다)` : ''),
+          (active.length > 0
+            ? `\n  (지금 ${active.map((a) => `${a.key} ${a.round}차`).join(', ')} 리뷰 중이라 스캔이 밀려 있습니다)`
+            : ''),
         { outOfScope: true },
       );
     }

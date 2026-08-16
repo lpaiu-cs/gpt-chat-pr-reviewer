@@ -12,6 +12,7 @@
  * 그래서 의존 방향이 reviewer → progress ← ui 로만 흐르고 순환하지 않는다.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { PRState } from './types.js';
 
@@ -145,6 +146,8 @@ export interface ControlState {
   only: string[];
   /** '지금 리뷰' 로 큐 앞으로 당겨둔 PR 참조 */
   prioritized: string[];
+  /** 동시에 돌릴 라운드 수 (0 = 제한 없음) */
+  concurrency: number;
 }
 
 export interface Snapshot {
@@ -183,7 +186,13 @@ export interface Snapshot {
   cycle: CycleInfo;
   /** 쿼터 쿨다운 해제 시각 (epoch ms) */
   quotaUntil: number | null;
-  active: ActiveReview | null;
+  /**
+   * 지금 돌고 있는 라운드들 (없으면 빈 배열).
+   *
+   * 배열인 이유는 `maxConcurrentReviews` 다. 하나로 두고 "대표 라운드" 만 실으면
+   * 나머지가 화면에서 사라져, 동시에 도는 리뷰를 관측할 방법이 없어진다.
+   */
+  active: ActiveReview[];
   queue: QueueItem[];
   contexts: ContextCard[];
 }
@@ -195,6 +204,15 @@ export interface LogLine {
   at: number;
   level: LogLevel;
   text: string;
+  /**
+   * 이 줄을 찍은 라운드의 PR key. **섞여 기록될 때만** 붙는다.
+   *
+   * 동시 실행이면 여러 라운드의 출력이 한 줄씩 번갈아 섞이고, 어느 PR 의 줄인지
+   * 를 잃으면 로그가 읽을 수 없는 것이 된다. 그래서 판정은 **기록하는 순간**에
+   * 하고 값으로 굳힌다 — 소비하는 쪽이 "지금 몇 개 도는가" 로 판단하면, 배치가
+   * 끝난 뒤 화면을 새로 열었을 때 그때의 섞임이 없던 일이 된다.
+   */
+  key?: string;
 }
 
 export type BusEvent =
@@ -250,6 +268,7 @@ function emptySnapshot(session: string): Snapshot {
       skip: [],
       only: [],
       prioritized: [],
+      concurrency: 1,
     },
     startedAt: Date.now(),
     scope: '',
@@ -266,7 +285,7 @@ function emptySnapshot(session: string): Snapshot {
       probedAt: {},
     },
     quotaUntil: null,
-    active: null,
+    active: [],
     queue: [],
     contexts: [],
   };
@@ -284,6 +303,18 @@ class ProgressBus {
   private logs: LogLine[] = [];
   private seq = 0;
   private listeners = new Set<Listener>();
+
+  /**
+   * 지금 어느 라운드 안에서 실행 중인가 (PR key).
+   *
+   * `phase`·`stream` 은 chatgpt.ts·reviewer.ts 깊은 곳에서 인자 없이 불린다.
+   * 라운드가 하나뿐일 때는 "지금 도는 그것" 으로 충분했지만, 동시에 둘이 돌면
+   * 그 호출들이 서로의 화면을 덮어쓴다. 호출부 60여 곳에 식별자를 실어 나르는
+   * 대신 실행 문맥에 담는다 — 비동기 체인을 따라 자동으로 흐른다.
+   */
+  private readonly slot = new AsyncLocalStorage<string>();
+  /** key → 진행 중인 라운드. 스냅샷의 active 배열은 이 값의 사본이다. */
+  private readonly running = new Map<string, ActiveReview>();
 
   // ── 구독 ──
 
@@ -336,7 +367,9 @@ class ProgressBus {
     if (!this.enabled) return;
     const text = stripAnsi(raw).replace(/\s+$/, '');
     if (text.trim().length === 0) return; // 터미널 여백용 빈 줄은 UI 에서 소음이다
-    const line: LogLine = { seq: ++this.seq, at: Date.now(), level: inferLevel(raw), text };
+    // 혼자 돌 때는 붙이지 않는다 — 모든 줄에 같은 꼬리표가 달릴 뿐이다.
+    const key = this.running.size > 1 ? this.slot.getStore() : undefined;
+    const line: LogLine = { seq: ++this.seq, at: Date.now(), level: inferLevel(raw), text, key };
     this.logs.push(line);
     if (this.logs.length > LOG_CAP) this.logs.splice(0, this.logs.length - LOG_CAP);
     this.emit({ type: 'log', data: line });
@@ -344,41 +377,64 @@ class ProgressBus {
 
   // ── 라운드 진행 ──
 
-  beginReview(a: Omit<ActiveReview, 'phase' | 'phaseSince' | 'startedAt'>): void {
-    if (!this.enabled) return;
+  /**
+   * 라운드 하나를 이 문맥에서 실행한다 — 시작·종료 기록과 슬롯 지정을 함께 한다.
+   *
+   * 시작/종료를 따로 부르지 않는다. 동시 실행에서는 짝이 어긋나면 끝난 라운드가
+   * 화면에 영원히 남거나 남의 라운드를 지우는데, 그 실수를 호출부가 하지 않도록
+   * 여기서 감싼다.
+   */
+  async runReview<T>(
+    a: Omit<ActiveReview, 'phase' | 'phaseSince' | 'startedAt'>,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    // UI 가 꺼져 있어도 **문맥은 연다.** 터미널 로그의 꼬리표가 이 값을 읽는다 —
+    // 대시보드 없이 돌린다고 해서 섞인 로그를 못 읽어도 되는 것은 아니다.
+    if (!this.enabled) return this.slot.run(a.key, fn);
     const now = Date.now();
-    this.snap = {
-      ...this.snap,
-      active: { ...a, startedAt: now, phase: 'conversation', phaseSince: now },
-    };
+    this.running.set(a.key, { ...a, startedAt: now, phase: 'conversation', phaseSince: now });
+    this.publishActive();
+    try {
+      return await this.slot.run(a.key, fn);
+    } finally {
+      this.running.delete(a.key);
+      this.publishActive();
+    }
+  }
+
+  /** 지금 실행 중인 라운드의 PR key (라운드 밖이면 null). */
+  currentReview(): string | null {
+    return this.slot.getStore() ?? null;
+  }
+
+  private publishActive(): void {
+    this.snap = { ...this.snap, active: [...this.running.values()] };
     this.push();
   }
 
+  /** 지금 문맥의 라운드를 갱신한다. 라운드 밖에서 불리면 아무 일도 하지 않는다. */
+  private update(fn: (a: ActiveReview) => ActiveReview | null): void {
+    if (!this.enabled) return;
+    const key = this.slot.getStore();
+    if (!key) return;
+    const cur = this.running.get(key);
+    if (!cur) return;
+    const next = fn(cur);
+    if (!next) return;
+    this.running.set(key, next);
+    this.publishActive();
+  }
+
   phase(phase: ReviewPhase): void {
-    if (!this.enabled || !this.snap.active) return;
-    if (this.snap.active.phase === phase) return;
-    this.snap = {
-      ...this.snap,
-      // 단계가 바뀌면 이전 단계의 스트리밍 관측값은 의미를 잃는다
-      active: { ...this.snap.active, phase, phaseSince: Date.now(), stream: undefined },
-    };
-    this.push();
+    // 단계가 바뀌면 이전 단계의 스트리밍 관측값은 의미를 잃는다
+    this.update((a) =>
+      a.phase === phase ? null : { ...a, phase, phaseSince: Date.now(), stream: undefined },
+    );
   }
 
   /** 응답 대기 중 스트리밍 관측값 갱신 (chatgpt.ts 의 폴링 주기마다). */
   stream(state: string, chars: number): void {
-    if (!this.enabled || !this.snap.active) return;
-    this.snap = {
-      ...this.snap,
-      active: { ...this.snap.active, stream: { state, chars, at: Date.now() } },
-    };
-    this.push();
-  }
-
-  endReview(): void {
-    if (!this.enabled) return;
-    this.snap = { ...this.snap, active: null };
-    this.push();
+    this.update((a) => ({ ...a, stream: { state, chars, at: Date.now() } }));
   }
 }
 

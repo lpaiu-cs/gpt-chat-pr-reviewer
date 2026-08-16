@@ -306,6 +306,13 @@ export class ChatGPTDriver {
   private ctx: BrowserContext | null = null;
   private page: Page | null = null;
   private readonly cfg: AppConfig;
+  /**
+   * 이 드라이버가 브라우저를 **소유**하는가 (= close 가 브라우저를 닫아도 되는가).
+   *
+   * `fork` 로 만든 드라이버는 탭만 자기 것이다. 그걸 닫으면서 컨텍스트까지 닫으면
+   * 같은 브라우저를 쓰는 다른 라운드가 통째로 죽는다.
+   */
+  private owned = true;
 
   // ── 생성 네트워크 관측 (이슈 #1) ──
   /** 생성 요청을 한 번이라도 봤는가 = 추적이 동작하는가 */
@@ -372,7 +379,34 @@ export class ChatGPTDriver {
     });
   }
 
+  /**
+   * 같은 브라우저(= 같은 로그인 프로필)에 **탭을 하나 더 열어** 드라이버를 만든다.
+   *
+   * 동시 리뷰는 라운드마다 탭이 따로 있어야 한다. 한 탭을 나눠 쓰면 한쪽이 넣은
+   * 프롬프트가 다른 쪽의 입력창에 들어가고, 전송 버튼 자리의 중지 버튼을 눌러
+   * 남의 생성을 끊는다 (`waitUntilIdle` 이 막는 사고가 정확히 그것이다).
+   *
+   * 로그인 세션은 컨텍스트가 가지므로 탭마다 다시 로그인할 필요는 없다.
+   */
+  async fork(): Promise<ChatGPTDriver> {
+    const ctx = this.ctx;
+    if (!ctx) throw new Error('Browser not launched — call launch() first');
+    const child = new ChatGPTDriver(this.cfg);
+    child.ctx = ctx;
+    child.owned = false;
+    child.page = await ctx.newPage();
+    child.trackGenerationTraffic(child.page);
+    return child;
+  }
+
   async close(): Promise<void> {
+    // 빌려 쓴 탭은 탭만 닫는다 — 브라우저는 소유자의 것이다.
+    if (!this.owned) {
+      await this.page?.close().catch(() => {});
+      this.page = null;
+      this.ctx = null;
+      return;
+    }
     if (this.ctx) {
       await this.ctx.close();
       this.ctx = null;

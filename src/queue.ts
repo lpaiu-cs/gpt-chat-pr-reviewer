@@ -105,8 +105,8 @@ export function isQueueable(ctx: PRContext): boolean {
 /**
  * 리뷰 대기열을 만든다 — REVIEW_DUE 인 것만, 우선순위 순으로.
  *
- * 브라우저 페이지가 단일 자원이라 리뷰는 직렬로만 돌 수 있다. 큐가 하는 일은
- * "동시에 여러 개" 가 아니라 "무엇을 먼저" 를 정하는 것이다.
+ * 큐가 정하는 것은 **무엇을 먼저** 다. 한 번에 몇 개를 돌릴지는 실행기가
+ * `maxConcurrentReviews` 로 정한다 (`reviewBatchSize`).
  *
  * 필터에 걸린 컨텍스트(excludedReason)는 제외한다. watch 는 애초에 넘기지 않지만,
  * `queue` 명령은 저장소를 통째로 읽으므로 여기서 한 번 더 걸러야 둘이 같은 답을 준다.
@@ -121,6 +121,21 @@ export function buildQueue(contexts: PRContext[], now = Date.now()): QueueEntry[
         Date.parse(a.waitingSince) - Date.parse(b.waitingSince) || // 오래 기다린 것 먼저
         a.ctx.prNumber - b.ctx.prNumber, // 완전한 결정성 확보
     );
+}
+
+/**
+ * 이번에 **한꺼번에** 돌릴 라운드 수 — 설정값과 대기열 길이 중 작은 쪽.
+ *
+ * 제한 없음은 **정확히 `0`** 이다. 음수·NaN 같은 값은 1(순차)로 접는다.
+ * 설정 파일은 런타임 검증 없이 병합되는 사람의 손글씨이고, `-1` 을 무제한으로
+ * 읽으면 오타 하나가 대기열 전체를 한꺼번에 돌려 ChatGPT 한도와 브라우저를
+ * 통째로 태운다. 모르는 값의 기본 방향은 **덜 쓰는 쪽**이다.
+ */
+export function reviewBatchSize(limit: number, queued: number): number {
+  if (queued <= 0) return 0;
+  if (limit === 0) return queued; // 제한 없음
+  if (!Number.isFinite(limit) || limit < 1) return 1;
+  return Math.min(Math.floor(limit), queued);
 }
 
 // ── 쿼터 게이트 ─────────────────────────────────────────────

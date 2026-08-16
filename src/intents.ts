@@ -32,6 +32,14 @@ export type Intent =
   | { kind: 'pause' }
   | { kind: 'resume' }
   /**
+   * 동시에 돌릴 라운드 수 (`0` = 제한 없음).
+   *
+   * 다음 사이클부터 적용된다 — 진행 중인 배치를 늘리거나 줄이지 않는다.
+   * 줄이는 쪽이든 늘리는 쪽이든 도는 라운드에 끼어들면 그 라운드가 쓰던 탭을
+   * 뺏거나 중간에 새 탭을 밀어 넣게 된다.
+   */
+  | { kind: 'concurrency-set'; value: number }
+  /**
    * 데몬 종료. **`INTENT_KINDS` 에 없다 — `/api/intent` 로는 들어올 수 없다.**
    * 전용 엔드포인트(`/api/shutdown`)만 만들 수 있다. 이유는 아래 참고.
    */
@@ -60,6 +68,7 @@ export const INTENT_KINDS: Intent['kind'][] = [
   'review-now',
   'pause',
   'resume',
+  'concurrency-set',
 ];
 
 class IntentQueue {
