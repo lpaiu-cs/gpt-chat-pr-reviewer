@@ -293,6 +293,10 @@ const fakePR: PRInfo = {
       { id: 'T1', path: 'a.ts', line: 1, isResolved: false, authorReplied: false, round: 1, snippet: 'x' },
       { id: 'T2', path: 'b.ts', line: 2, isResolved: false, authorReplied: false, round: 1, snippet: 'y' },
     ];
+    // 방금 전체 동기화를 마친 상태로 둔다. 그러지 않으면 아래 판정들이 probe 가
+    // 아니라 **주기 만료**(fullSyncIntervalMs) 때문에 전체 동기화를 요구하게 되어,
+    // 정작 보려던 "probe 만으로 충분한가" 를 못 본다.
+    c.lastFullSyncAt = new Date().toISOString();
     return c;
   };
 
@@ -340,6 +344,15 @@ const fakePR: PRInfo = {
     threads: [{ id: 'T1', isResolved: false }, { id: 'T2', isResolved: false }],
   }));
   assert(!noFull, 'probe: 알던 스레드만 있으면 전체 동기화 불필요');
+
+  // 다만 **주기가 지나면** 알던 스레드만 있어도 전체 동기화를 요구해야 한다 —
+  // 코멘트 숨김처럼 probe 가 볼 수 없는 변화를 잡는 유일한 경로다.
+  const c6b = awaiting();
+  c6b.lastFullSyncAt = new Date(Date.now() - cfg.fullSyncIntervalMs - 1_000).toISOString();
+  const dueFull = syncPRFromProbe(cfg, c6b, probeOf(c6b, {
+    threads: [{ id: 'T1', isResolved: false }, { id: 'T2', isResolved: false }],
+  }));
+  assert(dueFull, 'probe: 전체 동기화 주기가 지나면 알던 스레드만 있어도 요구');
 
   // 리뷰 지적 [P1]: 남의 스레드가 매 tick 전체 동기화를 유발하면 안 된다.
   // adoptThreads 가 소유자와 무관하게 id 를 기록하므로 두 번째 tick 부터는 조용해야 한다.
@@ -1532,37 +1545,59 @@ const fakePR: PRInfo = {
   assert(logs.length === 1, '공백뿐인 줄은 UI 로그에 쌓지 않는다');
   assert(logs[0].seq === 1 && logs[0].level === 'ok', 'seq 는 1부터, 레벨은 추론값');
 
-  // 라운드 수명: begin → phase → stream → end
-  progress.beginReview({
-    key: 'o/r#8', title: 't', url: 'u', round: 3, reasonLabel: '작성자 응답', dryRun: false,
-  });
-  assert(progress.state().snapshot.active?.phase === 'conversation', '시작 단계는 conversation');
+  // 라운드 수명: runReview 안에서 phase → stream, 끝나면 스스로 걷힌다
+  const one = (k: string) => progress.state().snapshot.active.find((a) => a.key === k);
+  await progress.runReview(
+    { key: 'o/r#8', title: 't', url: 'u', round: 3, reasonLabel: '작성자 응답', dryRun: false },
+    async () => {
+      assert(one('o/r#8')?.phase === 'conversation', '시작 단계는 conversation');
 
-  progress.phase('waiting');
-  const waitingSince = progress.state().snapshot.active!.phaseSince;
-  progress.stream('생성 중', 1200);
-  assert(progress.state().snapshot.active?.stream?.chars === 1200, '스트리밍 관측값 기록');
+      progress.phase('waiting');
+      const waitingSince = one('o/r#8')!.phaseSince;
+      progress.stream('생성 중', 1200);
+      assert(one('o/r#8')?.stream?.chars === 1200, '스트리밍 관측값 기록');
 
-  progress.phase('waiting'); // 같은 단계 재진입
-  assert(
-    progress.state().snapshot.active!.phaseSince === waitingSince,
-    '같은 단계면 경과 타이머를 되감지 않는다',
+      progress.phase('waiting'); // 같은 단계 재진입
+      assert(one('o/r#8')!.phaseSince === waitingSince, '같은 단계면 경과 타이머를 되감지 않는다');
+      assert(one('o/r#8')?.stream?.chars === 1200, '같은 단계면 관측값도 유지');
+
+      progress.phase('parsing');
+      assert(
+        one('o/r#8')?.stream === undefined,
+        '단계가 바뀌면 이전 스트리밍 값은 버린다 (다음 단계의 수치로 오해된다)',
+      );
+      assert(progress.currentReview() === 'o/r#8', '실행 문맥이 어느 라운드인지 안다');
+    },
   );
-  assert(progress.state().snapshot.active?.stream?.chars === 1200, '같은 단계면 관측값도 유지');
+  assert(progress.state().snapshot.active.length === 0, 'runReview 가 끝나면 표시도 걷힌다');
 
-  progress.phase('parsing');
-  assert(
-    progress.state().snapshot.active?.stream === undefined,
-    '단계가 바뀌면 이전 스트리밍 값은 버린다 (다음 단계의 수치로 오해된다)',
-  );
+  // 동시 실행: 두 라운드의 기록이 서로를 덮어쓰지 않아야 한다.
+  await Promise.all([
+    progress.runReview(
+      { key: 'o/r#1', title: 'a', url: 'u', round: 1, reasonLabel: '신규', dryRun: false },
+      async () => {
+        progress.phase('waiting');
+        progress.stream('생성 중', 10);
+        await new Promise((r) => setTimeout(r, 20));
+        assert(one('o/r#1')?.stream?.chars === 10, '내 관측값은 내 라운드에만 남는다');
+        assert(one('o/r#2')?.phase === 'posting', '다른 라운드는 자기 단계를 유지한다');
+      },
+    ),
+    progress.runReview(
+      { key: 'o/r#2', title: 'b', url: 'u', round: 1, reasonLabel: '신규', dryRun: false },
+      async () => {
+        progress.phase('posting');
+        await new Promise((r) => setTimeout(r, 30));
+      },
+    ),
+  ]);
+  assert(progress.state().snapshot.active.length === 0, '둘 다 끝나면 남지 않는다');
 
-  progress.endReview();
-  assert(progress.state().snapshot.active === null, 'endReview 가 진행 중 표시를 걷는다');
-
-  // phase/stream 은 active 가 없으면 조용히 무시돼야 한다 — 스캔 중 호출될 수 있다.
+  // phase/stream 은 라운드 밖에서 조용히 무시돼야 한다 — 스캔 중 호출될 수 있다.
   progress.phase('posting');
   progress.stream('생성 중', 5);
-  assert(progress.state().snapshot.active === null, '진행 중 라운드가 없으면 단계 기록은 무시');
+  assert(progress.state().snapshot.active.length === 0, '진행 중 라운드가 없으면 단계 기록은 무시');
+  assert(progress.currentReview() === null, '라운드 밖에서는 문맥이 비어 있다');
 
   progress.enabled = false;
 }

@@ -24,7 +24,7 @@ import chalk from 'chalk';
 import { loadConfig, initConfig, ensureDataDir, patchConfigFile } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
 import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage } from './github.js';
-import { syncPR, syncPRFromProbe, runRound } from './reviewer.js';
+import { syncPR, syncPRFromProbe, runRound, type RoundOutcome } from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
@@ -47,6 +47,7 @@ import {
   buildQueue,
   formatWaiting,
   quotaGateUntil,
+  reviewBatchSize,
   QUEUE_REASON_LABELS,
   type QueueEntry,
 } from './queue.js';
@@ -517,6 +518,7 @@ program
         skip: [...(scope.filters?.skip ?? [])],
         only: [...(scope.filters?.only ?? [])],
         prioritized: [...prioritized],
+        concurrency: cfg.maxConcurrentReviews,
       });
     };
 
@@ -669,6 +671,21 @@ program
             console.log(chalk.cyan(`    감시 범위 변경: include=${it.include.join(',') || '(없음)'}`));
             break;
           }
+          case 'concurrency-set': {
+            if (cfg.maxConcurrentReviews === it.value) break;
+            cfg.maxConcurrentReviews = it.value;
+            const how = it.value === 0 ? '제한 없음 (대기열 전체)' : `${it.value}건`;
+            console.log(chalk.cyan(`    동시 리뷰 수: ${how} — 다음 사이클부터 적용됩니다.`));
+            try {
+              patchConfigFile({ maxConcurrentReviews: it.value });
+            } catch (e) {
+              console.log(
+                chalk.red(`  ✗ 설정 저장 실패: ${e instanceof Error ? e.message : String(e)}`),
+              );
+              console.log(chalk.dim('    메모리에는 적용됐지만 watch 를 재시작하면 되돌아갑니다.'));
+            }
+            break;
+          }
           case 'stop':
             if (!stopRequested) {
               console.log(chalk.magenta('    ■ 종료 요청 — 정리하고 나갑니다.'));
@@ -763,6 +780,28 @@ program
       }
       publishControl();
     };
+
+    /** 지금 배치에서 동시에 도는 라운드 수 — 터미널 로그에 꼬리표를 달지 판단한다. */
+    let batchSize = 1;
+
+    // ── 터미널 로그 꼬리표 ──
+    // 동시에 둘 이상 돌면 여러 라운드의 출력이 한 줄씩 번갈아 섞여서, 어느 PR 의
+    // 줄인지 알 수 없으면 로그가 통째로 쓸모없어진다. 순차 실행(기본)일 때는
+    // 붙이지 않는다 — 평소 화면을 바꾸지 않기 위해서다.
+    //
+    // **대시보드 미러(mirrorConsole)보다 먼저 감싼다.** 그래야 미러가 받는 텍스트는
+    // 꼬리표 없는 원본이고, UI 는 LogLine.key 로 자기 방식대로 표시할 수 있다.
+    // 되돌리지 않는다 — 이 감싸기의 수명은 watch 프로세스 자체다.
+    const rawLog = console.log;
+    const rawErr = console.error;
+    const withTag = (args: unknown[]): unknown[] => {
+      if (batchSize <= 1) return args;
+      const key = progress.currentReview();
+      if (!key) return args;
+      return [chalk.dim(`[${key.split('/').pop()}]`), ...args];
+    };
+    console.log = (...args: unknown[]): void => rawLog(...withTag(args));
+    console.error = (...args: unknown[]): void => rawErr(...withTag(args));
 
     // ── 관측 대시보드 ──
     // 브라우저를 띄우기 **전에** 켠다. 로그인 안내나 launch 실패도 대시보드
@@ -1132,6 +1171,57 @@ program
       publishControl();
     };
 
+    /**
+     * 이 슬롯이 쓸 탭 (슬롯 0 = 처음 띄운 탭).
+     *
+     * 동시에 도는 라운드는 **탭이 서로 달라야 한다.** 한 탭을 나눠 쓰면 한쪽이
+     * 넣은 프롬프트가 다른 쪽 입력창에 들어가고, 전송 버튼 자리의 중지 버튼을
+     * 눌러 남의 생성을 끊는다. 한 번 연 탭은 닫지 않고 재사용한다 — 동시 실행
+     * 수를 줄여도 남는 탭은 그냥 놀 뿐이고, 여닫는 비용이 더 크다.
+     */
+    const extraTabs: ChatGPTDriver[] = [];
+    const leaseTab = async (slot: number): Promise<ChatGPTDriver | null> => {
+      if (!driver || slot === 0) return driver;
+      while (extraTabs.length < slot) extraTabs.push(await driver.fork());
+      return extraTabs[slot - 1];
+    };
+
+    /** 큐 1건 실행 — 헤더 출력부터 라운드 종료까지. */
+    const runQueued = async (
+      entry: QueueEntry,
+      index: number,
+      total: number,
+      tab: ChatGPTDriver | null,
+    ): Promise<RoundOutcome> => {
+      const { ctx, reason } = entry;
+      console.log(
+        chalk.bold(`\n  🔍 ${ctx.owner}/${ctx.repo}#${ctx.prNumber}`) +
+          chalk.dim(`  [${QUEUE_REASON_LABELS[reason]}]`) +
+          (total > 1 ? chalk.dim(`  대기열 ${index + 1}/${total}`) : ''),
+      );
+      try {
+        return await progress.runReview(
+          {
+            key: ctxKey(ctx),
+            title: ctx.title,
+            url: ctx.prUrl,
+            round: ctx.round + 1,
+            reasonLabel: QUEUE_REASON_LABELS[reason],
+            dryRun: opts.dryRun,
+          },
+          () => runRound(cfg, tab, ctx, { dryRun: opts.dryRun }),
+        );
+      } catch (e) {
+        // runRound 는 스스로 던지지 않도록 만들어져 있다. 그래도 새어 나오면
+        // **여기서 멈춘다** — 같이 도는 라운드들의 뒤처리(큐 갱신·쿼터 판정)까지
+        // 함께 날아가면, 화면에는 끝난 것으로 보이는데 상태만 어긋난다.
+        console.error(
+          chalk.red(`  ✗ 라운드가 예외로 끝났습니다: ${e instanceof Error ? e.message : String(e)}`),
+        );
+        return 'failed';
+      }
+    };
+
     const loop = async (drain: boolean): Promise<boolean> => {
       // 사이클 시작 시점에 카운터를 비운다. 레포 탐색·probe 뿐 아니라 폴백 전체
       // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
@@ -1198,51 +1288,45 @@ program
       }
 
       let reviewRan = false;
-      for (let i = 0; i < queue.length; i++) {
-        const { ctx, reason } = queue[i];
-        console.log(
-          chalk.bold(`\n  🔍 ${ctx.owner}/${ctx.repo}#${ctx.prNumber}`) +
-            chalk.dim(`  [${QUEUE_REASON_LABELS[reason]}]`) +
-            (queue.length > 1 ? chalk.dim(`  대기열 ${i + 1}/${queue.length}`) : ''),
+      for (let i = 0; i < queue.length; ) {
+        // 이번에 한꺼번에 돌릴 만큼 끊는다. 기본 1 — 순차 처리다.
+        const batch = queue.slice(i, i + reviewBatchSize(cfg.maxConcurrentReviews, queue.length - i));
+
+        // 탭은 **시작 전에** 순서대로 빌린다. 실행 중에 빌리면 두 슬롯이 같은
+        // 순간에 같은 탭을 만들려 들어 어느 쪽이 어느 탭을 받았는지 흐려진다.
+        const tabs: (ChatGPTDriver | null)[] = [];
+        for (let slot = 0; slot < batch.length; slot++) tabs.push(await leaseTab(slot));
+
+        batchSize = batch.length; // 1보다 크면 로그에 어느 PR 의 줄인지 꼬리표가 붙는다
+        const outcomes = await Promise.all(
+          batch.map((entry, slot) => runQueued(entry, i + slot, queue.length, tabs[slot])),
         );
-        progress.beginReview({
-          key: ctxKey(ctx),
-          title: ctx.title,
-          url: ctx.prUrl,
-          round: ctx.round + 1,
-          reasonLabel: QUEUE_REASON_LABELS[reason],
-          dryRun: opts.dryRun,
-        });
-        let outcome;
-        try {
-          outcome = await runRound(cfg, driver, ctx, { dryRun: opts.dryRun });
-        } finally {
-          // runRound 는 스스로 던지지 않도록 만들어져 있지만, 만약 새어 나오면
-          // 대시보드가 끝난 리뷰를 영원히 "진행 중" 으로 붙잡고 있게 된다.
-          progress.endReview();
+        batchSize = 1;
+        i += batch.length;
+
+        for (const entry of batch) {
+          reported.set(ctxKey(entry.ctx), ctxSignature(entry.ctx));
+          // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
+          prioritized.delete(parsePRRef(ctxKey(entry.ctx)) ?? '');
         }
-        reported.set(ctxKey(ctx), ctxSignature(ctx));
-        // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
-        prioritized.delete(parsePRRef(ctxKey(ctx)) ?? '');
         publishControl();
         reviewRan = true;
         publish(seen, buildQueue(eligible), openCount, quotaUntil);
 
-        if (outcome === 'quota') {
+        if (outcomes.includes('quota')) {
           // 한도는 계정 단위라 남은 큐도 지금은 못 돈다. 버리지 않고 미룬다.
           quotaUntil = Date.now() + cfg.quotaCooldownMs;
           quotaNotified = Date.now();
           progress.patch({ quotaUntil });
-          const left = queue.length - i - 1;
           console.log(
             chalk.yellow(
-              `\n  ⚠ 쿼터 한도 도달 — 남은 큐 ${left}건을 보존하고 ` +
+              `\n  ⚠ 쿼터 한도 도달 — 남은 큐 ${queue.length - i}건을 보존하고 ` +
                 `${new Date(quotaUntil).toLocaleString('ko-KR')} 이후 재개합니다.`,
             ),
           );
           break;
         }
-        if (!drain) break; // 한 건만 돌리고 즉시 재스캔
+        if (!drain) break; // 한 배치만 돌리고 즉시 재스캔
       }
 
       // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.
