@@ -679,11 +679,10 @@ function addLog(l) {
   lastSeq = l.seq;
   const div = document.createElement('div');
   div.className = 'log lv-' + l.level;
-  // 동시에 여러 라운드가 돌면 출력이 한 줄씩 섞인다 — 어느 PR 의 줄인지 표시한다.
-  // 한 건만 돌 때는 붙이지 않는다 (모든 줄에 같은 꼬리표가 달릴 뿐이다).
-  const from = l.key && actives().length > 1
-    ? '<b class="log-key">' + esc(l.key.split('/').pop()) + '</b>'
-    : '';
+  // 꼬리표를 붙일지는 **기록한 쪽이 이미 판단했다** (섞여 기록된 줄에만 key 가
+  // 있다). 여기서 "지금 몇 개 도는가" 를 다시 보면, 배치가 끝난 뒤 새로고침하거나
+  // SSE 가 재연결될 때 링 버퍼로 되돌아온 과거 로그의 출처가 통째로 사라진다.
+  const from = l.key ? '<b class="log-key">' + esc(l.key.split('/').pop()) + '</b>' : '';
   div.innerHTML = '<time>' + clock(l.at) + '</time>' + from + '<span>' + esc(l.text) + '</span>';
   logwrap.appendChild(div);
   while (logwrap.childElementCount > 600) logwrap.removeChild(logwrap.firstChild);

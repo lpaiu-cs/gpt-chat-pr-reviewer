@@ -1581,6 +1581,7 @@ const fakePR: PRInfo = {
         await new Promise((r) => setTimeout(r, 20));
         assert(one('o/r#1')?.stream?.chars === 10, '내 관측값은 내 라운드에만 남는다');
         assert(one('o/r#2')?.phase === 'posting', '다른 라운드는 자기 단계를 유지한다');
+        progress.log('  섞여 기록되는 줄');
       },
     ),
     progress.runReview(
@@ -1592,6 +1593,19 @@ const fakePR: PRInfo = {
     ),
   ]);
   assert(progress.state().snapshot.active.length === 0, '둘 다 끝나면 남지 않는다');
+
+  // 꼬리표 판정은 **기록하는 순간**에 값으로 굳어야 한다. 보는 쪽이 "지금 몇 개
+  // 도는가" 로 판단하면, 배치가 끝난 뒤(지금이 그 시점이다) 링 버퍼를 다시
+  // 흘려보낼 때 그때의 섞임이 없던 일이 된다.
+  const mixed = progress.state().logs.find((l) => l.text.includes('섞여 기록되는 줄'));
+  assert(mixed?.key === 'o/r#1', '동시에 돌 때 찍힌 줄은 어느 라운드인지 남긴다');
+
+  await progress.runReview(
+    { key: 'o/r#3', title: 'c', url: 'u', round: 1, reasonLabel: '신규', dryRun: false },
+    async () => progress.log('  혼자 도는 줄'),
+  );
+  const alone = progress.state().logs.find((l) => l.text.includes('혼자 도는 줄'));
+  assert(alone && alone.key === undefined, '혼자 돌 때는 꼬리표를 붙이지 않는다');
 
   // phase/stream 은 라운드 밖에서 조용히 무시돼야 한다 — 스캔 중 호출될 수 있다.
   progress.phase('posting');

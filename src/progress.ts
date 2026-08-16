@@ -205,10 +205,12 @@ export interface LogLine {
   level: LogLevel;
   text: string;
   /**
-   * 이 줄을 찍은 라운드의 PR key (라운드 밖에서 찍혔으면 없음).
+   * 이 줄을 찍은 라운드의 PR key. **섞여 기록될 때만** 붙는다.
    *
-   * 동시 실행이면 여러 라운드의 출력이 한 줄씩 번갈아 섞인다. 어느 PR 의 줄인지
-   * 를 잃으면 로그가 읽을 수 없는 것이 되므로, 출력 시점의 라운드를 함께 남긴다.
+   * 동시 실행이면 여러 라운드의 출력이 한 줄씩 번갈아 섞이고, 어느 PR 의 줄인지
+   * 를 잃으면 로그가 읽을 수 없는 것이 된다. 그래서 판정은 **기록하는 순간**에
+   * 하고 값으로 굳힌다 — 소비하는 쪽이 "지금 몇 개 도는가" 로 판단하면, 배치가
+   * 끝난 뒤 화면을 새로 열었을 때 그때의 섞임이 없던 일이 된다.
    */
   key?: string;
 }
@@ -365,7 +367,8 @@ class ProgressBus {
     if (!this.enabled) return;
     const text = stripAnsi(raw).replace(/\s+$/, '');
     if (text.trim().length === 0) return; // 터미널 여백용 빈 줄은 UI 에서 소음이다
-    const key = this.slot.getStore();
+    // 혼자 돌 때는 붙이지 않는다 — 모든 줄에 같은 꼬리표가 달릴 뿐이다.
+    const key = this.running.size > 1 ? this.slot.getStore() : undefined;
     const line: LogLine = { seq: ++this.seq, at: Date.now(), level: inferLevel(raw), text, key };
     this.logs.push(line);
     if (this.logs.length > LOG_CAP) this.logs.splice(0, this.logs.length - LOG_CAP);
