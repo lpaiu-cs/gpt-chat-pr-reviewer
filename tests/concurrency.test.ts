@@ -29,7 +29,10 @@ test('손으로 고친 이상한 값은 순차로 접는다', () => {
   assert.equal(reviewBatchSize(Number.NaN, 5), 1);
   assert.equal(reviewBatchSize(Number.POSITIVE_INFINITY, 5), 1);
   assert.equal(reviewBatchSize(2.7, 5), 2); // 소수는 내린다
-  assert.equal(reviewBatchSize(-3, 5), 5); // 음수는 0 과 같이 제한 없음
+  // 제한 없음은 정확히 0 뿐이다. `-1` 오타가 대기열 전체를 한꺼번에 돌리면,
+  // 그 한 글자가 ChatGPT 한도와 브라우저를 통째로 태운다.
+  assert.equal(reviewBatchSize(-1, 5), 1);
+  assert.equal(reviewBatchSize(-3.5, 5), 1);
 });
 
 // ── 의도 검증 ──────────────────────────────────────────────

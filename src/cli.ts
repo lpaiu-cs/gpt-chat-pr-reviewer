@@ -1176,14 +1176,20 @@ program
      *
      * 동시에 도는 라운드는 **탭이 서로 달라야 한다.** 한 탭을 나눠 쓰면 한쪽이
      * 넣은 프롬프트가 다른 쪽 입력창에 들어가고, 전송 버튼 자리의 중지 버튼을
-     * 눌러 남의 생성을 끊는다. 한 번 연 탭은 닫지 않고 재사용한다 — 동시 실행
-     * 수를 줄여도 남는 탭은 그냥 놀 뿐이고, 여닫는 비용이 더 크다.
+     * 눌러 남의 생성을 끊는다.
+     *
+     * 빌린 탭은 **배치가 끝나면 반납한다**(`releaseTabs`). 들고 있으면 제한 없음으로
+     * 한 번 크게 돌린 뒤 수십 개가 데몬이 죽을 때까지 살아남아 메모리를 붙잡는다.
+     * 다시 여는 값은 수백 ms 인데 라운드는 2~25분이라, 재사용해서 아낄 것이 없다.
      */
     const extraTabs: ChatGPTDriver[] = [];
     const leaseTab = async (slot: number): Promise<ChatGPTDriver | null> => {
       if (!driver || slot === 0) return driver;
       while (extraTabs.length < slot) extraTabs.push(await driver.fork());
       return extraTabs[slot - 1];
+    };
+    const releaseTabs = async (): Promise<void> => {
+      while (extraTabs.length > 0) await extraTabs.pop()?.close();
     };
 
     /** 큐 1건 실행 — 헤더 출력부터 라운드 종료까지. */
@@ -1298,10 +1304,15 @@ program
         for (let slot = 0; slot < batch.length; slot++) tabs.push(await leaseTab(slot));
 
         batchSize = batch.length; // 1보다 크면 로그에 어느 PR 의 줄인지 꼬리표가 붙는다
-        const outcomes = await Promise.all(
-          batch.map((entry, slot) => runQueued(entry, i + slot, queue.length, tabs[slot])),
-        );
-        batchSize = 1;
+        let outcomes: RoundOutcome[];
+        try {
+          outcomes = await Promise.all(
+            batch.map((entry, slot) => runQueued(entry, i + slot, queue.length, tabs[slot])),
+          );
+        } finally {
+          batchSize = 1;
+          await releaseTabs(); // 유휴 탭을 남기지 않는다 (다음 배치가 다시 연다)
+        }
         i += batch.length;
 
         for (const entry of batch) {

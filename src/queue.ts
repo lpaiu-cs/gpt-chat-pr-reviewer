@@ -126,16 +126,16 @@ export function buildQueue(contexts: PRContext[], now = Date.now()): QueueEntry[
 /**
  * 이번에 **한꺼번에** 돌릴 라운드 수 — 설정값과 대기열 길이 중 작은 쪽.
  *
- * `limit` 가 0 이하면 제한 없음(대기열 전체)이다. 소수·NaN 같은 값은 1 로
- * 접는다 — 설정 파일은 사람이 손으로 고치는 곳이고, 여기서 이상한 값이 그대로
- * 흘러가면 탭이 몇 개 열릴지 아무도 모르게 된다.
+ * 제한 없음은 **정확히 `0`** 이다. 음수·NaN 같은 값은 1(순차)로 접는다.
+ * 설정 파일은 런타임 검증 없이 병합되는 사람의 손글씨이고, `-1` 을 무제한으로
+ * 읽으면 오타 하나가 대기열 전체를 한꺼번에 돌려 ChatGPT 한도와 브라우저를
+ * 통째로 태운다. 모르는 값의 기본 방향은 **덜 쓰는 쪽**이다.
  */
 export function reviewBatchSize(limit: number, queued: number): number {
   if (queued <= 0) return 0;
-  if (!Number.isFinite(limit)) return 1;
-  const n = Math.floor(limit);
-  if (n <= 0) return queued; // 제한 없음
-  return Math.min(n, queued);
+  if (limit === 0) return queued; // 제한 없음
+  if (!Number.isFinite(limit) || limit < 1) return 1;
+  return Math.min(Math.floor(limit), queued);
 }
 
 // ── 쿼터 게이트 ─────────────────────────────────────────────

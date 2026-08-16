@@ -118,6 +118,7 @@
   #logwrap { max-height:min(38vh,420px); overflow-y:auto; padding:.5rem 0; }
   .log { display:flex; gap:.6rem; padding:.06rem .85rem; font-family:var(--mono); font-size:.755rem; line-height:1.55; }
   .log time { color:var(--faint); flex:none; }
+  .log-key { color:var(--accent); flex:none; font-weight:600; }
   .log span { white-space:pre-wrap; word-break:break-word; }
   .lv-error span{color:var(--err)} .lv-warn span{color:var(--warn)} .lv-ok span{color:var(--ok)}
   .lv-dim span{color:var(--dim)} .lv-info span{color:var(--fg)}
@@ -678,7 +679,12 @@ function addLog(l) {
   lastSeq = l.seq;
   const div = document.createElement('div');
   div.className = 'log lv-' + l.level;
-  div.innerHTML = '<time>' + clock(l.at) + '</time><span>' + esc(l.text) + '</span>';
+  // 동시에 여러 라운드가 돌면 출력이 한 줄씩 섞인다 — 어느 PR 의 줄인지 표시한다.
+  // 한 건만 돌 때는 붙이지 않는다 (모든 줄에 같은 꼬리표가 달릴 뿐이다).
+  const from = l.key && actives().length > 1
+    ? '<b class="log-key">' + esc(l.key.split('/').pop()) + '</b>'
+    : '';
+  div.innerHTML = '<time>' + clock(l.at) + '</time>' + from + '<span>' + esc(l.text) + '</span>';
   logwrap.appendChild(div);
   while (logwrap.childElementCount > 600) logwrap.removeChild(logwrap.firstChild);
   if (following) logwrap.scrollTop = logwrap.scrollHeight;
