@@ -4,6 +4,7 @@ import {
   anchorAnswer,
   findRoundBaseline,
   judgeRebind,
+  judgeRevival,
   judgeStuckButton,
   type MessageRef,
 } from '../src/chatgpt.js';
@@ -161,4 +162,32 @@ test('judgeStuckButton: 토큰 간격 정도의 정지로는 끊지 않는다', 
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 30_000 }), false);
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 119_999 }), false);
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 120_000 }), true);
+});
+
+// 죽은 브라우저 되살리기 (#109 의 별개 증상)
+//
+// 사람이 Chrome 창을 닫자 page.goto 가 "Target page, context or browser has
+// been closed" 로 실패했고, launch() 는 기동 때 한 번뿐이라 그 뒤 모든
+// 재시도가 같은 오류로 죽었다. 복구는 하되, 범위를 최소로 잡는다.
+
+test('judgeRevival: 멀짱하면 그대로 쓴다', () => {
+  assert.equal(judgeRevival({ ctxAlive: true, pageAlive: true, owned: true }), 'ok');
+  assert.equal(judgeRevival({ ctxAlive: true, pageAlive: true, owned: false }), 'ok');
+});
+
+test('judgeRevival: 탭만 죽었으면 탭만 다시 연다', () => {
+  // 동시 리뷰가 한 컨텍스트를 나눠 쓰므로, 여기서 컨텍스트를 다시
+  // 띄우면 형제 라운드가 모두 죽는다.
+  assert.equal(judgeRevival({ ctxAlive: true, pageAlive: false, owned: true }), 'reopen-tab');
+  assert.equal(judgeRevival({ ctxAlive: true, pageAlive: false, owned: false }), 'reopen-tab');
+});
+
+test('judgeRevival: 브라우저까지 죽었고 소유자면 다시 띄운다', () => {
+  assert.equal(judgeRevival({ ctxAlive: false, pageAlive: false, owned: true }), 'relaunch');
+});
+
+test('judgeRevival: 빌려 쓴 브라우저는 내가 다시 띄우지 않는다', () => {
+  // fork 된 드라이버는 탭만 자기 것이다 — 남의 브라우저를 다시 띄울
+  // 권한이 없으므로 분명히 실패해야 한다.
+  assert.equal(judgeRevival({ ctxAlive: false, pageAlive: false, owned: false }), 'give-up');
 });

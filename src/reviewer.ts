@@ -907,6 +907,11 @@ export async function runRound(
   const round = ctx.round + 1;
   const instructions = loadInstructions(cfg, opts.instructionsFile);
 
+  // 창이 닫혔거나 크래시했으면 여기서 되살린다. 이 한 줄이 없으면 죽은 페이지
+  // 핸들이 계속 재사용되어, 사람이 데몬을 재기동할 때까지 모든 라운드가
+  // "Target page, context or browser has been closed" 로 실패한다 (#109).
+  if (driver) await driver.ensureAlive();
+
   console.log(chalk.bold(`\n  📋 ${ctx.title}`));
   console.log(chalk.dim(`     ${ctx.prUrl}  (${round}차 리뷰${opts.dryRun ? ' · dry-run' : ''})`));
 
