@@ -310,6 +310,36 @@ export function judgeStuckButton(
   return s.idleMs >= settleMs;
 }
 
+/** 복구 판정에 쓰는 신호들. */
+export interface BrowserLiveness {
+  /** 컨텍스트(= 브라우저)가 살아 있는가 */
+  ctxAlive: boolean;
+  /** 이 드라이버의 탭이 살아 있는가 */
+  pageAlive: boolean;
+  /** 이 드라이버가 브라우저를 소유하는가 (fork 는 아니다) */
+  owned: boolean;
+}
+
+/** 무엇을 되살려야 하는가. */
+export type Revival =
+  | 'ok' // 그대로 쓴다
+  | 'reopen-tab' // 브라우저는 살아 있다 — 탭만 다시 열면 된다
+  | 'relaunch' // 브라우저까지 죽었고 내가 소유자다
+  | 'give-up'; // 빌려 쓴 브라우저가 죽었다 — 내가 다시 띄울 것이 아니다
+
+/**
+ * 지금 들고 있는 브라우저로 계속 일할 수 있는지 판정한다 (순수 함수).
+ *
+ * 복구는 **최소 범위**여야 한다. 동시 리뷰는 한 컨텍스트를 여러 탭이 나눠
+ * 쓰므로(`fork`), 탭 하나 죽었다고 컨텍스트를 다시 띄우면 형제 라운드를
+ * 모두 죽인다. 빌려 쓴 드라이버는 남의 브라우저를 다시 띄울 권한도 없다.
+ */
+export function judgeRevival(s: BrowserLiveness): Revival {
+  if (s.ctxAlive && s.pageAlive) return 'ok';
+  if (s.ctxAlive) return 'reopen-tab';
+  return s.owned ? 'relaunch' : 'give-up';
+}
+
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
 const SETTLE_STABLE_READS = 3;
 const SETTLE_POLL_MS = 500;
@@ -394,6 +424,74 @@ export class ChatGPTDriver {
     });
     this.page = this.ctx.pages()[0] ?? (await this.ctx.newPage());
     this.trackGenerationTraffic(this.page);
+  }
+
+  /**
+   * 이 드라이버로 계속 일할 수 있게 만든다. 필요하면 탭만, 최소한으로 되살린다.
+   *
+   * 관측(#109): 사람이 Chrome 창을 닫자 `page.goto` 가 "Target page, context
+   * or browser has been closed" 로 실패했고, launch() 는 데몬 기동 때 한 번
+   * 뿐이라 그 뒤 **모든 라운드가 같은 오류로** 죽었다. 한 번의 실패는 어쩌
+   * 수 없지만 그 영속성은 회복 경로가 없어서 생긴 별개의 결함이다.
+   *
+   * **복구 범위를 최소로 잡는다.** 동시 리뷰는 한 컨텍스트를 여러 탭이
+   * 나눠 쓰므로(`fork`), 탭 하나 죽었다고 컨텍스트를 다시 띄우면 **형제
+   * 라운드를 모두 죽인다** — close() 가 빌려 쓴 탭만 닫는 것과 같은 이유다.
+   *
+   *  - 탭만 죽었고 브라우저는 살아 있다 → 같은 컨텍스트에 탭만 다시 열는다.
+   *  - 브라우저까지 죽었고 이 드라이버가 소유자다 → 다시 띄운다.
+   *  - 브라우저까지 죽었는데 빌려 쓴 드라이버다 → 남의 브라우저를 다시
+   *    띄울 권한이 없다. 소유자가 처리할 일이므로 분명히 실패시킨다.
+   *
+   * 로그인은 persistent profile 에 남으므로 다시 띄워도 그대로 이어진다.
+   *
+   * @returns 되살렸으면 true (살아 있었으면 false)
+   */
+  async ensureAlive(): Promise<boolean> {
+    const ctxAlive = this.ctx !== null && (this.ctx.browser()?.isConnected() ?? true);
+    const pageAlive = this.page !== null && !this.page.isClosed();
+    const plan = judgeRevival({ ctxAlive, pageAlive, owned: this.owned });
+    if (plan === 'ok') return false;
+
+    // 새 페이지는 아직 아무 트래픽도 보지 못했다. 관측을 물려주면 다음
+    // 라운드가 근거 없이 "생성 요청 없음" 을 믿게 된다 (judgeStuckButton 의 전제).
+    const resetTraffic = (): void => {
+      this.sawGeneration = false;
+      this.netInFlight = 0;
+      this.lastNetAt = 0;
+    };
+
+    if (plan === 'reopen-tab' && this.ctx) {
+      console.log(chalk.yellow('  ⚠ 탭이 닫혔 있습니다 — 같은 브라우저에 탭만 다시 엽니다.'));
+      this.page = await this.ctx.newPage();
+      this.trackGenerationTraffic(this.page);
+      resetTraffic();
+      await this.navigateToChatGPT();
+      return true;
+    }
+
+    if (plan === 'give-up') {
+      throw new Error(
+        '빌려 쓴 브라우저가 닫혔습니다 — 소유자가 아니므로 다시 띄우지 않습니다.',
+      );
+    }
+
+    console.log(
+      chalk.yellow('  ⚠ 브라우저가 닫혔 있습니다 — 다시 띄우니다 (로그인은 프로필에 남아 있습니다).'),
+    );
+    // 죽은 컨텍스트는 닫기도 실패할 수 있다 — 실패해도 새로 띄우는 걸 막지 않는다.
+    try {
+      await this.ctx?.close();
+    } catch {
+      /* 이미 죽었다 */
+    }
+    this.ctx = null;
+    this.page = null;
+    resetTraffic();
+
+    await this.launch();
+    await this.navigateToChatGPT();
+    return true;
   }
 
   /**
