@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { anchorAnswer, findRoundBaseline, judgeRebind, type MessageRef } from '../src/chatgpt.js';
+import {
+  anchorAnswer,
+  findRoundBaseline,
+  judgeRebind,
+  judgeStuckButton,
+  type MessageRef,
+} from '../src/chatgpt.js';
 
 const u = (id: string): MessageRef => ({ role: 'user', id });
 const a = (id: string): MessageRef => ({ role: 'assistant', id });
@@ -113,4 +119,42 @@ test('anchorAnswer 의 nth 는 findRoundBaseline 과 같은 기준이다', () =>
   const anchor = anchorAnswer(msgs);
   assert.equal(anchor.status, 'ready');
   assert.equal(baseline, anchor.status === 'ready' ? anchor.nth : -1);
+});
+
+// ── 중지 버튼 고장 판정 (#109) ────────────────────────────────────────────
+//
+// 관측: 응답은 392초에 1,014자로 완성됐는데 stop-button 이 visible·enabled 로
+// DOM 에 남아 완료 조건이 성립하지 않았고, 25분 예산을 태운 뒤 완성된 리뷰를
+// 버렸다. 아래는 그 경로를 끊되, 이슈 #1(조기 절단)을 되살리지 않는다는 계약이다.
+
+/** 관측된 그 순간의 신호 — 텍스트는 완성됐고 생성 요청은 이미 끝나 있었다. */
+const stuck = {
+  sawGeneration: true,
+  inFlight: 0,
+  stableMs: 18 * 60_000,
+  textLength: 1_014,
+};
+
+test('judgeStuckButton: 완성된 응답이 오래 멎어 있고 생성 요청이 없으면 고장으로 본다', () => {
+  assert.equal(judgeStuckButton(stuck), true);
+});
+
+test('judgeStuckButton: 아직 아무것도 안 나온 추론 구간은 절대 끊지 않는다', () => {
+  // 오래 걸리는 추론은 여기서 0자로 머무른다 — 이슈 #1 이 경계한 바로 그 구간.
+  assert.equal(judgeStuckButton({ ...stuck, textLength: 0 }), false);
+});
+
+test('judgeStuckButton: 생성 요청이 열려 있으면 진짜 만드는 중이다', () => {
+  assert.equal(judgeStuckButton({ ...stuck, inFlight: 1 }), false);
+});
+
+test('judgeStuckButton: 생성 트래픽을 한 번도 못 봤으면 근거가 없어 끊지 않는다', () => {
+  assert.equal(judgeStuckButton({ ...stuck, sawGeneration: false }), false);
+});
+
+test('judgeStuckButton: 토큰 간격 정도의 정지로는 끊지 않는다', () => {
+  assert.equal(judgeStuckButton({ ...stuck, stableMs: 30_000 }), false);
+  // 임계 직전/직후의 경계
+  assert.equal(judgeStuckButton({ ...stuck, stableMs: 119_999 }), false);
+  assert.equal(judgeStuckButton({ ...stuck, stableMs: 120_000 }), true);
 });

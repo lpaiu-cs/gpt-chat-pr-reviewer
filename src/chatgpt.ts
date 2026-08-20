@@ -257,6 +257,52 @@ export function classifyStall(
   return s.quietMs >= quietLimitMs ? 'network-quiet' : 'generating';
 }
 
+/**
+ * 중지 버튼이 안 사라지는데 다른 근거가 전부 "끝났다" 일 때, 이만큼 화면이
+ * 멎어 있으면 버튼을 고장으로 본다.
+ *
+ * 관측(#109, 1차 리뷰): 응답은 392초에 1,014자로 완성됐고 그 뒤 18분 동안
+ * 한 글자도 변하지 않았는데, `data-testid="stop-button"` 이 visible·enabled
+ * 로 DOM 에 남아 완료 조건(`!streaming`)이 영원히 성립하지 않았다. 25분
+ * 예산을 전부 태우고 **완성된 리뷰를 버린 뒤** 라운드를 실패로 접었다.
+ * 사람이 브라우저에서 본 답은 정상이었다.
+ *
+ * 정상 스트리밍의 토큰 간격과는 비교가 안 되는 길이로 잡는다.
+ */
+const STUCK_BUTTON_SETTLE_MS = 120_000;
+
+/** 중지 버튼 고장 판정에 쓰는 신호들. */
+export interface StuckButtonSignals {
+  /** 생성 요청을 한 번이라도 관측했는가 (= 네트워크 추적이 동작하는가) */
+  sawGeneration: boolean;
+  /** 지금 진행 중인 생성 요청 수 */
+  inFlight: number;
+  /** 화면 텍스트가 마지막으로 바뀐 뒤 흐른 시간 */
+  stableMs: number;
+  /** 지금까지 읽은 응답 길이 */
+  textLength: number;
+}
+
+/**
+ * 중지 버튼이 **고장 났다고 인정할지** 판정한다 (순수 함수).
+ *
+ * `classifyStall` 과 달리 이건 관측이 아니라 판정이다. 그래서 조건을 넷 다
+ * 요구한다 — 하나라도 빠지면 이슈 #1 이 경계한 조기 절단이 된다:
+ *
+ *  - `textLength > 0`: 아직 아무것도 안 나온 추론 구간은 절대 끊지 않는다.
+ *    오래 걸리는 추론은 여기서 0자로 머무르므로 이 조건 하나로 걸러진다.
+ *  - `inFlight === 0`: 생성 POST 가 열려 있으면 진짜 만드는 중이다.
+ *  - `sawGeneration`: 네트워크 패턴을 한 번도 못 봤다면 근거가 없는 것이고,
+ *    근거 없는 절단은 하지 않는다 (`untracked` 와 같은 태도).
+ *  - `stableMs` 가 임계 이상: 토큰 간격으로는 설명되지 않는 정지.
+ */
+export function judgeStuckButton(s: StuckButtonSignals): boolean {
+  if (s.textLength <= 0) return false;
+  if (!s.sawGeneration) return false;
+  if (s.inFlight > 0) return false;
+  return s.stableMs >= STUCK_BUTTON_SETTLE_MS;
+}
+
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
 const SETTLE_STABLE_READS = 3;
 const SETTLE_POLL_MS = 500;
@@ -1156,6 +1202,31 @@ export class ChatGPTDriver {
         return lastText;
       }
 
+      // 중지 버튼이 끝내 안 사라지는 경우의 완료 (#109).
+      //
+      // 버튼은 종전대로 1차 권위다 — 위 조건이 성립하면 여기까지 오지 않는다.
+      // 다만 버튼 하나가 유일한 권위이면, 그것이 DOM 에 남는 순간 완료가 영원히
+      // 성립하지 않아 완성된 응답을 통째로 버린다. 다른 근거가 모두 "끝났다" 를
+      // 가리킬 때만 버튼을 고장으로 인정한다 (판정 근거는 judgeStuckButton).
+      if (
+        streaming &&
+        judgeStuckButton({
+          sawGeneration: this.sawGeneration,
+          inFlight: this.netInFlight,
+          stableMs: Date.now() - lastChangeAt,
+          textLength: lastText.trim().length,
+        })
+      ) {
+        console.log(
+          chalk.yellow(
+            `  ⚠ 중지 버튼이 ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 남아 있는데 ` +
+              '생성 요청은 없고 화면도 멎었습니다 — 버튼 고장으로 보고 완료 처리합니다.',
+          ),
+        );
+        console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
+        return lastText;
+      }
+
       // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
       // 대화를 새로고침하면 완성본을 가져올 수 있다.
       if (!streaming && (await this.hasInterruptedBanner(page))) {
@@ -1233,7 +1304,23 @@ export class ChatGPTDriver {
     console.log(chalk.yellow('  ⚠ 이전 응답이 아직 생성 중입니다 — 끊지 않도록 기다립니다.'));
     progress.phase('waiting');
     const deadline = Date.now() + this.cfg.responseTimeoutMs;
+    const since = Date.now();
     while (await this.isStreaming(page)) {
+      // 여기도 버튼이 유일한 탈출 조건이라, 버튼이 DOM 에 남으면 예산을 통째로
+      // 태우고 **다음 라운드까지** 못 보낸다 (#109 는 이 경로로 재발했다).
+      // 남의 생성을 끊지 않는다는 목적은 그대로 두고, 생성 요청이 하나도 없는
+      // 채로 오래 버티는 경우에만 고장으로 인정한다 — 진짜 생성 중이면
+      // inFlight 가 1 이상이라 여기에 걸리지 않는다.
+      if (
+        this.sawGeneration &&
+        this.netInFlight === 0 &&
+        Date.now() - since >= STUCK_BUTTON_SETTLE_MS
+      ) {
+        console.log(
+          chalk.yellow('  ⚠ 중지 버튼만 남고 생성 요청이 없습니다 — 버튼 고장으로 보고 전송을 계속합니다.'),
+        );
+        return;
+      }
       if (Date.now() > deadline) {
         throw new ResponseTimeoutError(
           '이전 응답이 계속 생성 중이라 전송을 보류했습니다 — 끊지 않기 위해 라운드를 넘깁니다.',
