@@ -540,6 +540,13 @@ export class ChatGPTDriver {
    * 로그인 세션은 컨텍스트가 가지므로 탭마다 다시 로그인할 필요는 없다.
    */
   async fork(): Promise<ChatGPTDriver> {
+    // 복구를 **탭 임대보다 먼저** 한다. watch 루프는 runRound 들을 부르기 전에
+    // 배치의 탭을 전부 임대하므로, 브라우저가 닫힌 뒤에는 여기서 죽은 ctx 의
+    // newPage() 가 먼저 터진다. 그러면 소유 드라이버가 runRound 에서 복구할 기회를
+    // 얻기 전에 배치 전체가 시작도 못 하고, 다음 사이클도 같은 ctx 에서 다시
+    // fork 하여 데몬 재시작 전까지 반복 실패한다 — 이 PR 이 없애려는 바로 그
+    // 영속 고착이다. 여기서 먼저 되살리면 탭을 빌리는 모든 경로가 보호된다.
+    await this.ensureAlive();
     const ctx = this.ctx;
     if (!ctx) throw new Error('Browser not launched — call launch() first');
     const child = new ChatGPTDriver(this.cfg);
