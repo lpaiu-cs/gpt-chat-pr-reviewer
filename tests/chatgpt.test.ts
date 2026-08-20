@@ -121,40 +121,44 @@ test('anchorAnswer 의 nth 는 findRoundBaseline 과 같은 기준이다', () =>
   assert.equal(baseline, anchor.status === 'ready' ? anchor.nth : -1);
 });
 
-// ── 중지 버튼 고장 판정 (#109) ────────────────────────────────────────────
+// 중지 버튼 고장 판정 (#109)
 //
 // 관측: 응답은 392초에 1,014자로 완성됐는데 stop-button 이 visible·enabled 로
 // DOM 에 남아 완료 조건이 성립하지 않았고, 25분 예산을 태운 뒤 완성된 리뷰를
 // 버렸다. 아래는 그 경로를 끊되, 이슈 #1(조기 절단)을 되살리지 않는다는 계약이다.
+// collectResponse 와 waitUntilIdle 이 같은 조건을 쓴다.
 
-/** 관측된 그 순간의 신호 — 텍스트는 완성됐고 생성 요청은 이미 끝나 있었다. */
+/** 관측된 그 순간의 신호 — 생성은 끝났고 네트워크도 오래 조용했다. */
 const stuck = {
   sawGeneration: true,
   inFlight: 0,
-  stableMs: 18 * 60_000,
-  textLength: 1_014,
+  quietMs: 10 * 60_000,
+  idleMs: 18 * 60_000,
 };
 
-test('judgeStuckButton: 완성된 응답이 오래 멎어 있고 생성 요청이 없으면 고장으로 본다', () => {
+test('judgeStuckButton: 생성이 끝나고 네트워크도 조용한 채 오래 멎었으면 고장으로 본다', () => {
   assert.equal(judgeStuckButton(stuck), true);
-});
-
-test('judgeStuckButton: 아직 아무것도 안 나온 추론 구간은 절대 끊지 않는다', () => {
-  // 오래 걸리는 추론은 여기서 0자로 머무른다 — 이슈 #1 이 경계한 바로 그 구간.
-  assert.equal(judgeStuckButton({ ...stuck, textLength: 0 }), false);
 });
 
 test('judgeStuckButton: 생성 요청이 열려 있으면 진짜 만드는 중이다', () => {
   assert.equal(judgeStuckButton({ ...stuck, inFlight: 1 }), false);
 });
 
-test('judgeStuckButton: 생성 트래픽을 한 번도 못 봤으면 근거가 없어 끊지 않는다', () => {
+test('judgeStuckButton: WebSocket 으로 흐르는 생성은 끊지 않는다', () => {
+  // POST 가 닫힌 뒤에도 프레임이 오는 구간이 있다. 프레임이 오면 lastNetAt 이
+  // 갱신되므로 quietMs 가 작고, 그때는 부분 응답을 완성본으로 게시하면 안 된다.
+  assert.equal(judgeStuckButton({ ...stuck, quietMs: 5_000 }), false);
+  assert.equal(judgeStuckButton({ ...stuck, quietMs: 179_999 }), false);
+  assert.equal(judgeStuckButton({ ...stuck, quietMs: 180_000 }), true);
+});
+
+test('judgeStuckButton: 이번 라운드의 생성을 못 봤으면 근거가 없어 끊지 않는다', () => {
+  // sawGeneration 은 전송 직전에 초기화된다 — 지난 라운드의 관측은 근거가 아니다.
   assert.equal(judgeStuckButton({ ...stuck, sawGeneration: false }), false);
 });
 
 test('judgeStuckButton: 토큰 간격 정도의 정지로는 끊지 않는다', () => {
-  assert.equal(judgeStuckButton({ ...stuck, stableMs: 30_000 }), false);
-  // 임계 직전/직후의 경계
-  assert.equal(judgeStuckButton({ ...stuck, stableMs: 119_999 }), false);
-  assert.equal(judgeStuckButton({ ...stuck, stableMs: 120_000 }), true);
+  assert.equal(judgeStuckButton({ ...stuck, idleMs: 30_000 }), false);
+  assert.equal(judgeStuckButton({ ...stuck, idleMs: 119_999 }), false);
+  assert.equal(judgeStuckButton({ ...stuck, idleMs: 120_000 }), true);
 });

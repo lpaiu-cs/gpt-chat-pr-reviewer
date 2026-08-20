@@ -273,34 +273,41 @@ const STUCK_BUTTON_SETTLE_MS = 120_000;
 
 /** 중지 버튼 고장 판정에 쓰는 신호들. */
 export interface StuckButtonSignals {
-  /** 생성 요청을 한 번이라도 관측했는가 (= 네트워크 추적이 동작하는가) */
+  /** 이번 라운드의 생성 요청을 관측했는가 (전송 직전에 초기화된다) */
   sawGeneration: boolean;
   /** 지금 진행 중인 생성 요청 수 */
   inFlight: number;
-  /** 화면 텍스트가 마지막으로 바뀐 뒤 흐른 시간 */
-  stableMs: number;
-  /** 지금까지 읽은 응답 길이 */
-  textLength: number;
+  /** 생성 네트워크(POST · WebSocket 프레임)가 마지막으로 움직인 뒤 흘러간 시간 */
+  quietMs: number;
+  /** 화면이 멈춰 있는 시간 (수집: 텍스트 불변 · 대기: 기다린 시간) */
+  idleMs: number;
 }
 
 /**
- * 중지 버튼이 **고장 났다고 인정할지** 판정한다 (순수 함수).
+ * 중지 버튼이 **어떤 살아 있는 생성에도 받침되지 않는가** — 순수 함수.
  *
- * `classifyStall` 과 달리 이건 관측이 아니라 판정이다. 그래서 조건을 넷 다
- * 요구한다 — 하나라도 빠지면 이슈 #1 이 경계한 조기 절단이 된다:
+ * `collectResponse` 와 `waitUntilIdle` 이 **같은 조건**을 쓴다. 둘 다 버튼 하나를
+ * 유일한 권위로 삼다가, 버튼이 DOM 에 남는 순간 예산을 통째로 태운다.
  *
- *  - `textLength > 0`: 아직 아무것도 안 나온 추론 구간은 절대 끊지 않는다.
- *    오래 걸리는 추론은 여기서 0자로 머무르므로 이 조건 하나로 걸러진다.
+ * 네 조건을 모두 요구한다 — 하나라도 빼면 이슈 #1 이 경계한 조기 절단이 된다:
+ *
+ *  - `sawGeneration`: **이번 라운드의** 생성 요청을 봤는가. 드라이버 수명 동안
+ *    유지되는 값이면 지난 라운드의 관측을 근거로 쓰게 되므로, 전송 직전에
+ *    초기화해 이번 생성으로 스코프한다.
  *  - `inFlight === 0`: 생성 POST 가 열려 있으면 진짜 만드는 중이다.
- *  - `sawGeneration`: 네트워크 패턴을 한 번도 못 봤다면 근거가 없는 것이고,
- *    근거 없는 절단은 하지 않는다 (`untracked` 와 같은 태도).
- *  - `stableMs` 가 임계 이상: 토큰 간격으로는 설명되지 않는 정지.
+ *  - `quietMs`: POST 가 닫힌 뒤에도 **WebSocket 으로 흘르는 구간**이 있다. 프레임이
+ *    오면 lastNetAt 이 갱신되므로, 네트워크가 오래 조용해야만 끝난 것으로 본다.
+ *  - `idleMs`: 토큰 간격으로는 설명되지 않는 정지.
  */
-export function judgeStuckButton(s: StuckButtonSignals): boolean {
-  if (s.textLength <= 0) return false;
+export function judgeStuckButton(
+  s: StuckButtonSignals,
+  quietLimitMs: number = STREAM_QUIET_LIMIT_MS,
+  settleMs: number = STUCK_BUTTON_SETTLE_MS,
+): boolean {
   if (!s.sawGeneration) return false;
   if (s.inFlight > 0) return false;
-  return s.stableMs >= STUCK_BUTTON_SETTLE_MS;
+  if (s.quietMs < quietLimitMs) return false;
+  return s.idleMs >= settleMs;
 }
 
 /** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
@@ -673,6 +680,9 @@ export class ChatGPTDriver {
     await this.fillPrompt(p, prompt);
 
     // ── 전송 ──
+    // 이번 라운드의 생성만 근거로 쓴다. 이 값이 드라이버 수명 동안 남아 있으면
+    // 지난 라운드에서 본 요청을 "지금 관측되는 생성" 의 근거로 삼게 된다.
+    this.sawGeneration = false;
     await this.clickSend(p);
 
     // ── 대화 주소 확보 ──
@@ -1210,11 +1220,12 @@ export class ChatGPTDriver {
       // 가리킬 때만 버튼을 고장으로 인정한다 (판정 근거는 judgeStuckButton).
       if (
         streaming &&
+        lastText.trim().length > 0 &&
         judgeStuckButton({
           sawGeneration: this.sawGeneration,
           inFlight: this.netInFlight,
-          stableMs: Date.now() - lastChangeAt,
-          textLength: lastText.trim().length,
+          quietMs: this.lastNetAt ? Date.now() - this.lastNetAt : Number.POSITIVE_INFINITY,
+          idleMs: Date.now() - lastChangeAt,
         })
       ) {
         console.log(
@@ -1312,9 +1323,12 @@ export class ChatGPTDriver {
       // 채로 오래 버티는 경우에만 고장으로 인정한다 — 진짜 생성 중이면
       // inFlight 가 1 이상이라 여기에 걸리지 않는다.
       if (
-        this.sawGeneration &&
-        this.netInFlight === 0 &&
-        Date.now() - since >= STUCK_BUTTON_SETTLE_MS
+        judgeStuckButton({
+          sawGeneration: this.sawGeneration,
+          inFlight: this.netInFlight,
+          quietMs: this.lastNetAt ? Date.now() - this.lastNetAt : Number.POSITIVE_INFINITY,
+          idleMs: Date.now() - since,
+        })
       ) {
         console.log(
           chalk.yellow('  ⚠ 중지 버튼만 남고 생성 요청이 없습니다 — 버튼 고장으로 보고 전송을 계속합니다.'),
