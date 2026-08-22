@@ -10,10 +10,42 @@ import type { PRInfo, DiffHunk, ReviewComment } from './types.js';
 
 // ── PR 식별 ─────────────────────────────────────────────────
 
+/** 현재 디렉터리가 속한 레포의 'owner/repo' 슬러그. */
+export function currentRepoSlug(): string {
+  return gh(['repo', 'view', '--json', 'owner,name', '-q', '.owner.login+"/"+.name']).trim();
+}
+
 /**
  * 사용자 입력(URL / owner/repo#N / 단순 숫자)을 파싱하여
  * { owner, repo, number } 를 반환한다.
+ *
+ * 단순 숫자는 "현재 디렉터리의 레포" 를 뜻하는데, 그 조회는 I/O 다. 파싱과
+ * 조회를 섞으면 이 함수를 테스트할 수 없으므로 해석기를 주입받는다 —
+ * 기본값이 실제 gh 호출이고, 호출부는 건드리지 않는다.
  */
+export function parsePRInput(
+  input: string,
+  resolveCurrentRepo: () => string = currentRepoSlug,
+): { owner: string; repo: string; number: number } {
+  // https://github.com/owner/repo/pull/123
+  const urlRe = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/;
+  const urlMatch = input.match(urlRe);
+  if (urlMatch) return { owner: urlMatch[1], repo: urlMatch[2], number: +urlMatch[3] };
+
+  // owner/repo#123
+  const shortRe = /^([^/]+)\/([^#]+)#(\d+)$/;
+  const shortMatch = input.match(shortRe);
+  if (shortMatch) return { owner: shortMatch[1], repo: shortMatch[2], number: +shortMatch[3] };
+
+  // 단순 숫자 (현재 디렉터리가 gh repo 일 때)
+  if (/^\d+$/.test(input.trim())) {
+    const [owner, repo] = resolveCurrentRepo().split('/');
+    return { owner, repo, number: +input.trim() };
+  }
+
+  throw new Error(`PR 식별 불가: "${input}"\n  URL · owner/repo#number · PR번호 중 하나를 입력해주세요.`);
+}
+
 /**
  * gh 실행 게이트웨이 — **모든** gh 호출은 여기를 지난다.
  *
@@ -54,27 +86,6 @@ function gh(
     }
     throw e;
   }
-}
-
-export function parsePRInput(input: string): { owner: string; repo: string; number: number } {
-  // https://github.com/owner/repo/pull/123
-  const urlRe = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/;
-  const urlMatch = input.match(urlRe);
-  if (urlMatch) return { owner: urlMatch[1], repo: urlMatch[2], number: +urlMatch[3] };
-
-  // owner/repo#123
-  const shortRe = /^([^/]+)\/([^#]+)#(\d+)$/;
-  const shortMatch = input.match(shortRe);
-  if (shortMatch) return { owner: shortMatch[1], repo: shortMatch[2], number: +shortMatch[3] };
-
-  // 단순 숫자 (현재 디렉터리가 gh repo 일 때)
-  if (/^\d+$/.test(input.trim())) {
-    const info = gh(['repo', 'view', '--json', 'owner,name', '-q', '.owner.login+"/"+.name']).trim();
-    const [owner, repo] = info.split('/');
-    return { owner, repo, number: +input.trim() };
-  }
-
-  throw new Error(`PR 식별 불가: "${input}"\n  URL · owner/repo#number · PR번호 중 하나를 입력해주세요.`);
 }
 
 // ── PR 정보 ─────────────────────────────────────────────────
