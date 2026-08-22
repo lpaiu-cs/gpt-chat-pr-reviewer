@@ -1395,20 +1395,21 @@ program
       return scaled;
     };
 
-    // --once 는 "1회 스캔" 이므로 그 스캔에서 나온 큐를 끝까지 소진한다.
-    // 예외 처리는 이후 사이클(timer 경로)과 같다 — 놓치면 첫 사이클의 실패만
-    // 프로세스 전체를 죽이는 비대칭이 된다.
-    try {
-      await loop(opts.once);
-    } catch (e) {
-      console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
-    }
-
+    // --once 는 1회 스캔이므로 그 스캔에서 나온 큐를 끝까지 소진한다.
+    // --once는 다음 사이클이 없어 실패를 삼키면 exit 0으로 정상 종료되어
+    // cron/CI가 감지할 수 없으므로 예외를 그대로 흘린다. 반복 watch에서만
+    // 다음 사이클로 복구하기 위해 예외를 소비한다.
     if (opts.once) {
+      await loop(true);
       await driver?.close();
       await ui?.close();
       releaseLock();
       return;
+    }
+    try {
+      await loop(false);
+    } catch (e) {
+      console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
     }
 
     // 사이클이 끝난 뒤에 다음 스캔을 예약한다.

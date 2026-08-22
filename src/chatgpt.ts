@@ -952,13 +952,22 @@ export class ChatGPTDriver {
     return last;
   }
 
-  /** 화면 하단 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
+  /** 화면 크롬 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
   private async detectQuotaLimit(page: Page): Promise<string | null> {
-    const body = await page
-      .locator('body')
-      .innerText()
+    // 사용자 프롬프트/PR diff에 쿼터 문구가 들어 있어도 오인하지 않도록
+    // 메시지 영역을 제외한 UI 크롬 텍스트만 검사한다.
+    const tail = await page
+      .evaluate(() => {
+        try {
+          const clone = document.body.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll('[data-message-author-role]').forEach((el) => el.remove());
+          const t = (clone as any).innerText ?? '';
+          return t.slice(-4000);
+        } catch {
+          return (document.body.innerText ?? '').slice(-4000);
+        }
+      })
       .catch(() => '');
-    const tail = body.slice(-4_000); // 최근 화면 영역만 검사
     for (const re of QUOTA_PATTERNS) {
       const m = tail.match(re);
       if (m) return m[0];
