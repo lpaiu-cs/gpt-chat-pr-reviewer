@@ -794,6 +794,7 @@ export class ChatGPTDriver {
     // 질문 뒤의 답" 은 **직전 라운드의 답**이므로, 그것을 이번 응답으로 고정하지
     // 않도록 지금의 마지막 질문을 기억해 둔다.
     const lastUserBefore = await this.lastUserMessageId(p);
+    const beforeUserCount = await this.countUserMessages(p);
 
     // ── 프롬프트 입력 ──
     await this.fillPrompt(p, prompt);
@@ -810,7 +811,7 @@ export class ChatGPTDriver {
     // 붙어 수집 루프가 예산(responseTimeoutMs, 기본 15분)을 전부 태운 뒤
     // 타임아웃으로 접힌다. 몇 초짜리 검증으로 그 비용을 줄인다 — 실패 시에는
     // pendingSend 기록(onSent) 전이라 상태도 깨끗하다.
-    if (!(await this.verifyPromptSent(p, lastUserBefore))) {
+    if (!(await this.verifyPromptSent(p, lastUserBefore, beforeUserCount))) {
       throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
     }
 
@@ -836,25 +837,44 @@ export class ChatGPTDriver {
     }
   }
 
+  private async countUserMessages(page: Page): Promise<number> {
+    try {
+      return await page.evaluate(
+        () => document.querySelectorAll('[data-message-author-role="user"]').length,
+      );
+    } catch {
+      return 0;
+    }
+  }
+
   /**
    * 프롬프트가 실제로 전송됐는지 — 우리 질문 노드가 화면에 새로 그려졌는지 본다.
    *
-   * 직전 마지막 질문(lastUserIdBefore) 뒤에 user 메시지가 하나 더 붙을 때까지
-   * 짧게 폴링한다. 새 대화(직전 질문 없음)에서는 user 메시지가 하나라도
-   * 그려지면 성공이다. 판정이 실패해도 게시 방향으로는 안전하다 — 여기서 통과를
-   * 못 하면 전송 실패로 접고, 못 본 채 진행하던 종전 동작은 예산 소진뿐이다.
+   * `data-message-id`가 있는 user 노드면 ID 뒤에 새 노드가 붙었는지로 판정하고,
+   * ID가 없는 노드(ID 없는 대화 상태)나 ID를 찾지 못한 경우엔 전송 전 user
+   * 메시지 개수보다 늘어났는지로 판정한다. ID만 보고 "새 대화"로 오인하면
+   * 기존 user 노드가 그대로 존재해도 전송 성공으로 착각해 직전 라운드 응답을
+   * 현재 라운드 응답으로 고정할 수 있다.
    */
-  private async verifyPromptSent(page: Page, lastUserIdBefore: string | null): Promise<boolean> {
+  private async verifyPromptSent(
+    page: Page,
+    lastUserIdBefore: string | null,
+    beforeCount: number,
+  ): Promise<boolean> {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
       const sent = await page
-        .evaluate((prevId) => {
-          const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
-          const idx = prevId
-            ? els.findIndex((el) => el.getAttribute('data-message-id') === prevId)
-            : -1;
-          return idx + 1 < els.length;
-        }, lastUserIdBefore)
+        .evaluate(
+          ({ prevId, before }) => {
+            const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
+            if (prevId) {
+              const idx = els.findIndex((el) => el.getAttribute('data-message-id') === prevId);
+              if (idx !== -1) return idx + 1 < els.length;
+            }
+            return els.length > before;
+          },
+          { prevId: lastUserIdBefore, before: beforeCount },
+        )
         .catch(() => false);
       if (sent) return true;
       await page.waitForTimeout(500);
@@ -954,15 +974,33 @@ export class ChatGPTDriver {
 
   /** 화면 크롬 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
   private async detectQuotaLimit(page: Page): Promise<string | null> {
-    // 사용자 프롬프트/PR diff에 쿼터 문구가 들어 있어도 오인하지 않도록
-    // 메시지 영역을 제외한 UI 크롬 텍스트만 검사한다.
+    // 사용자 프롬프트/PR diff에 쿼터 문구가 있어도 오인하지 않도록 메시지
+    // 영역을 제외하고, detached clone의 innerText가 숨김/script 텍스트까지
+    // 포함하는 문제를 피하기 위해 live DOM에서 표시 중인 텍스트만 수집한다.
     const tail = await page
       .evaluate(() => {
         try {
-          const clone = document.body.cloneNode(true) as HTMLElement;
-          clone.querySelectorAll('[data-message-author-role]').forEach((el) => el.remove());
-          const t = (clone as any).innerText ?? '';
-          return t.slice(-4000);
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          let out = '';
+          let node: Text | null;
+          while ((node = walker.nextNode() as Text | null)) {
+            const raw = node.nodeValue;
+            if (!raw || !raw.trim()) continue;
+            const el = node.parentElement as HTMLElement | null;
+            if (!el) continue;
+            if (el.closest('[data-message-author-role]')) continue;
+            if (el.closest('script, style, noscript, template')) continue;
+            if (el.closest('[hidden]')) continue;
+            try {
+              const cs = window.getComputedStyle(el);
+              if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+            } catch {
+              /* getComputedStyle 실패 시 보이는 것으로 간주 */
+            }
+            out += raw + ' ';
+            if (out.length > 5000) break;
+          }
+          return out.slice(-4000);
         } catch {
           return (document.body.innerText ?? '').slice(-4000);
         }
