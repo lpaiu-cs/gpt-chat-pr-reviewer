@@ -340,7 +340,13 @@ export function judgeRevival(s: BrowserLiveness): Revival {
   return s.owned ? 'relaunch' : 'give-up';
 }
 
-/** 기존 메시지 렌더링이 끝났다고 인정할 연속 동일 관측 횟수·간격·최대 대기. */
+/**
+ * "안정됐다" 고 인정할 연속 동일 관측 횟수.
+ *
+ * countSettledMessages(기존 메시지 개수 확정)와 collectResponse 의 완료 판정이
+ * 같은 값을 쓴다 — 두 판정은 관측 간격만 다를 뿐 "몇 번 같아야 믿는가" 는
+ * 같은 질문이다. 값이 갈리면 한쪽만 민감도가 달라져 사고 재현이 어려워진다.
+ */
 const SETTLE_STABLE_READS = 3;
 const SETTLE_POLL_MS = 500;
 const SETTLE_MAX_MS = 15_000;
@@ -373,13 +379,21 @@ export function parseConversationUrl(raw: string): string | null {
   return `${u.origin}${u.pathname}`; // 쿼리·프래그먼트는 버린다
 }
 
-/** 화면 텍스트에서 쿼터/한도 안내를 감지하기 위한 패턴. */
+/**
+ * 화면 텍스트에서 쿼터/한도 안내를 감지하기 위한 패턴.
+ *
+ * **정밀 쪽으로 기운다.** 이 판정은 계정 전체를 3시간 쿨다운에 넣으므로 오탐
+ * 비용이 크다 — 일시적 서버 오류 토스트("Too many requests", "Try again
+ * later")가 여기 걸리면 몇 분이면 풀릴 오류가 3시간 대기가 된다. 반대로 놓치면
+ * 라운드 한 번이 타임아웃으로 실패하고 재시도되니 값싸다. 그래서 "한도"·"cap"
+ * 같은 한도 어휘가 직접 나오는 문구만 남기고, 재시도 권유만 있는 문구는 버린다.
+ */
 const QUOTA_PATTERNS: RegExp[] = [
-  /reached (?:your|the)[^.]{0,40}limit/i,
-  /message (?:cap|limit)/i,
-  /usage cap/i,
-  /too many (?:requests|messages)/i,
-  /try again (?:later|in|after)/i,
+  /(?:hit|reached) (?:your|our|the)[^.]{0,60}(?:cap|limit)/i,
+  /\b(?:message|usage) cap\b/i,
+  /\bmaximum number of messages\b/i,
+  /\bmessages? per \d+\s*(?:hours?|시간)/i,
+  /try again (?:in|at) [^.]{0,40}(?:hour|시간)/i,
   /한도에 도달/,
   /사용량 한도/,
   /메시지 한도/,
@@ -780,6 +794,7 @@ export class ChatGPTDriver {
     // 질문 뒤의 답" 은 **직전 라운드의 답**이므로, 그것을 이번 응답으로 고정하지
     // 않도록 지금의 마지막 질문을 기억해 둔다.
     const lastUserBefore = await this.lastUserMessageId(p);
+    const beforeUserCount = await this.countUserMessages(p);
 
     // ── 프롬프트 입력 ──
     await this.fillPrompt(p, prompt);
@@ -789,6 +804,16 @@ export class ChatGPTDriver {
     // 지난 라운드에서 본 요청을 "지금 관측되는 생성" 의 근거로 삼게 된다.
     this.sawGeneration = false;
     await this.clickSend(p);
+
+    // ── 전송 성공 검증 ──
+    // clickSend 는 버튼 후보를 모두 놓치면 Enter 로 전송하는데, 그 성공 여부는
+    // 확인하지 않고 돌아온다. 전송이 실제로 안 됐으면 우리 질문 노드가 영영 안
+    // 붙어 수집 루프가 예산(responseTimeoutMs, 기본 15분)을 전부 태운 뒤
+    // 타임아웃으로 접힌다. 몇 초짜리 검증으로 그 비용을 줄인다 — 실패 시에는
+    // pendingSend 기록(onSent) 전이라 상태도 깨끗하다.
+    if (!(await this.verifyPromptSent(p, lastUserBefore, beforeUserCount))) {
+      throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
+    }
 
     // ── 대화 주소 확보 ──
     // **응답을 기다리기 전에** 알린다. 대기 구간이 2~15분이라 그 사이에 프로세스가
@@ -812,26 +837,51 @@ export class ChatGPTDriver {
     }
   }
 
-  /**
-   * 이미 보낸 프롬프트의 응답을 기다린다 (재전송 없이).
-   *
-   * 복귀했더니 그 라운드 질문은 이미 가 있고 답만 없는 경우에 쓴다.
-   */
-  async collectPending(): Promise<string> {
-    const p = this.requirePage();
-    return this.collectResponse(p, await this.countSettledMessages(p));
+  private async countUserMessages(page: Page): Promise<number> {
+    try {
+      return await page.evaluate(
+        () => document.querySelectorAll('[data-message-author-role="user"]').length,
+      );
+    } catch {
+      return 0;
+    }
   }
 
   /**
-   * 이 대화에 그 라운드 질문이 이미 있는지, 답까지 나왔는지 본다.
+   * 프롬프트가 실제로 전송됐는지 — 우리 질문 노드가 화면에 새로 그려졌는지 본다.
    *
-   *   answered — 답이 있다. 다시 묻지 말고 그대로 쓴다.
-   *   pending  — 질문만 있고 답이 없다. 다시 묻지 말고 기다린다.
-   *   absent   — 그 라운드 질문이 없다. 새로 보내야 한다.
-   *
-   * 판별 실패는 전부 absent 로 떨어뜨린다 — 잘못 answered 로 보면 낡은 응답을
-   * 게시하게 되고, 그건 다시 묻는 것보다 훨씬 나쁘다.
+   * `data-message-id`가 있는 user 노드면 ID 뒤에 새 노드가 붙었는지로 판정하고,
+   * ID가 없는 노드(ID 없는 대화 상태)나 ID를 찾지 못한 경우엔 전송 전 user
+   * 메시지 개수보다 늘어났는지로 판정한다. ID만 보고 "새 대화"로 오인하면
+   * 기존 user 노드가 그대로 존재해도 전송 성공으로 착각해 직전 라운드 응답을
+   * 현재 라운드 응답으로 고정할 수 있다.
    */
+  private async verifyPromptSent(
+    page: Page,
+    lastUserIdBefore: string | null,
+    beforeCount: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const sent = await page
+        .evaluate(
+          ({ prevId, before }) => {
+            const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
+            if (prevId) {
+              const idx = els.findIndex((el) => el.getAttribute('data-message-id') === prevId);
+              if (idx !== -1) return idx + 1 < els.length;
+            }
+            return els.length > before;
+          },
+          { prevId: lastUserIdBefore, before: beforeCount },
+        )
+        .catch(() => false);
+      if (sent) return true;
+      await page.waitForTimeout(500);
+    }
+    return false;
+  }
+
   /**
    * 이 대화에 그 라운드 질문이 이미 있는지 본다.
    *
@@ -922,13 +972,50 @@ export class ChatGPTDriver {
     return last;
   }
 
-  /** 화면 하단 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
+  /** 화면 크롬 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
   private async detectQuotaLimit(page: Page): Promise<string | null> {
-    const body = await page
-      .locator('body')
-      .innerText()
+    // 사용자 프롬프트/PR diff에 쿼터 문구가 있어도 오인하지 않도록 메시지
+    // 영역을 제외하고, detached clone의 innerText가 숨김/script 텍스트까지
+    // 포함하는 문제를 피하기 위해 live DOM에서 표시 중인 텍스트만 수집한다.
+    const tail = await page
+      .evaluate(() => {
+        try {
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          let out = '';
+          let node: Text | null;
+          while ((node = walker.nextNode() as Text | null)) {
+            const raw = node.nodeValue;
+            if (!raw || !raw.trim()) continue;
+            const el = node.parentElement as HTMLElement | null;
+            if (!el) continue;
+            if (el.closest('[data-message-author-role]')) continue;
+            if (el.closest('script, style, noscript, template')) continue;
+            // 조상까지 포함해 실제 표시 여부를 판정한다 — 직접 부모는 보여도
+            // 상위 패널이 display:none/visibility:hidden/opacity:0이면 숨김이고,
+            // getComputedStyle(el)만 보면 이 경우를 놓쳐 숨김 한도 문구를 수집한다.
+            let hidden = false;
+            for (let cur: HTMLElement | null = el; cur && cur !== document.body; cur = cur.parentElement) {
+              if (cur.hasAttribute('hidden')) { hidden = true; break; }
+              try {
+                const cs = window.getComputedStyle(cur);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') {
+                  hidden = true;
+                  break;
+                }
+              } catch {
+                /* getComputedStyle 실패 시 보이는 것으로 간주 */
+              }
+            }
+            if (hidden) continue;
+            out += raw + ' ';
+            if (out.length > 5000) break;
+          }
+          return out.slice(-4000);
+        } catch {
+          return (document.body.innerText ?? '').slice(-4000);
+        }
+      })
       .catch(() => '');
-    const tail = body.slice(-4_000); // 최근 화면 영역만 검사
     for (const re of QUOTA_PATTERNS) {
       const m = tail.match(re);
       if (m) return m[0];
@@ -1312,7 +1399,7 @@ export class ChatGPTDriver {
       progress.stream(phase, lastText.length);
 
       // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일
-      if (!streaming && lastText.trim().length > 0 && stable >= 3) {
+      if (!streaming && lastText.trim().length > 0 && stable >= SETTLE_STABLE_READS) {
         console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
         return lastText;
       }

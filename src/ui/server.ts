@@ -80,7 +80,10 @@ function rejectsHost(req: IncomingMessage): string | null {
   const raw = String(req.headers.host ?? '');
   // IPv6 리터럴([::1]:4478)과 포트를 떼어낸다.
   const name = raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.replace(/:\d+$/, '');
-  const ok = name === '127.0.0.1' || name === 'localhost' || name === '[::1]';
+  // 바인딩이 127.0.0.1 전용이므로 허용집합도 그에 맞춘다. [::1] 을 허용해 두면
+  // 나중에 듀얼스택으로 바뀔 때 GET 만 열리고 POST 는 Origin 검사에 막히는
+  // 반쪽 상태가 된다 — 허용집합은 Origin 쪽과 한 세트로 유지한다.
+  const ok = name === '127.0.0.1' || name === 'localhost';
   return ok ? null : `허용되지 않은 Host: ${raw || '(없음)'}`;
 }
 
@@ -259,6 +262,16 @@ async function handle(
       json(res, 403, { ok: false, error: denied });
       return;
     }
+
+    // URL 을 **본문보다 먼저** 판별한다. 본문부터 읽으면 존재하지 않는 경로에
+    // 깨진 JSON 을 보낸 요청이 404 가 아니라 400 으로 답해 상태코드가 거짓말을 한다.
+    const known =
+      url === '/api/intent' || url === '/api/instructions' || url === '/api/shutdown';
+    if (!known) {
+      json(res, 404, { ok: false, error: 'not found' });
+      return;
+    }
+
     try {
       const body = await readJson(req);
 
@@ -301,18 +314,13 @@ async function handle(
        * 제어와 같은 완충 지대에 넣고, 루프가 **라운드가 돌지 않는 지점**에서
        * 꺼내 스스로 정리하고 나간다.
        */
-      if (url === '/api/shutdown') {
-        const pending = intents.push({ kind: 'stop' });
-        progress.control({ pendingIntents: pending });
-        json(res, 202, { ok: true, pending });
-        return;
-      }
+      // 여기로 왔다는 건 위의 판별에서 나머지 두 경로가 아니었다는 뜻이다.
+      const pending = intents.push({ kind: 'stop' });
+      progress.control({ pendingIntents: pending });
+      json(res, 202, { ok: true, pending });
     } catch (e) {
       json(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
-      return;
     }
-
-    json(res, 404, { ok: false, error: 'not found' });
     return;
   }
 

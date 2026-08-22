@@ -209,10 +209,6 @@ export interface ChatGPTSelectors {
   assistantMessage: string;
   /** 어시스턴트 메시지 안의 본문(마크다운) 영역 */
   messageContent: string;
-  /** 새 대화 시작 링크/버튼 */
-  newChatButton: string;
-  /** 로그인 완료 판별용 요소 */
-  loggedInIndicator: string;
 }
 
 // ── 감시 범위 ───────────────────────────────────────────────

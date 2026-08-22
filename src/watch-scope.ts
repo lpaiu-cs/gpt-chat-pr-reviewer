@@ -132,7 +132,18 @@ export interface DiscoveryResult {
   truncated: boolean;
   /** 이번 탐색이 쓴 GraphQL point */
   cost: number;
+  /**
+   * 이 모드에서 펼칠 수 없어 무시한 include 패턴 (repos 의 글롭 / account 의
+   * 소유자 불명). 경고는 호출부가 출력한다 — 탐색은 주기적으로 반복되므로
+   * 여기서 찍으면 같은 경고가 매 갱신마다 다시 나온다.
+   */
+  unsupported: string[];
+  /** owner/repo 형식이 아니어서 probe 하지 않은 리터럴 (repos 모드). */
+  invalidSlugs: string[];
 }
+
+/** GitHub 레포 슬러그의 최소 형식 — 'owner/repo'. 대소문자는 구분하지 않는다. */
+const REPO_SLUG = /^[^/\s]+\/[^/\s]+$/;
 
 /**
  * 감시 대상 레포 목록을 구한다.
@@ -146,34 +157,30 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
   if (scope.mode === 'repos') {
     // 글롭은 검색 없이 펼칠 수 없다. 조용히 버리면 감시 대상이 통째로 빠진다.
     // 판정은 unsupportedPatterns 하나로만 한다 — UI 검증과 갈라지면 안 된다.
-    const globs = unsupportedPatterns('repos', scope.include);
-    if (globs.length > 0) {
-      console.log(
-        chalk.yellow(
-          `  ⚠ repos 모드에서는 글롭을 펼칠 수 없습니다 — 무시: ${globs.join(', ')}`,
-        ),
-      );
-      console.log(chalk.dim('    글롭을 쓰려면 watch.mode 를 "account" 로 바꾸세요.'));
-    }
+    const unsupported = unsupportedPatterns('repos', scope.include);
+    // 'owner/' · 'owner/repo/extra' 같은 기형 리터럴을 그대로 probe 하면 매번
+    // 실패한다. 형식이 맞는 것만 대상에 넣고, 나머지는 호출부가 알린다.
     const literal = scope.include.filter((p) => !p.includes('*'));
+    const invalidSlugs = literal.filter((s) => !REPO_SLUG.test(s));
     return {
-      repos: literal.filter((s) => matchesScope(s, [], exclude)),
+      repos: literal
+        .filter((s) => !invalidSlugs.includes(s))
+        .filter((s) => matchesScope(s, [], exclude)),
       partial: false,
       truncated: false,
       cost: 0,
+      unsupported,
+      invalidSlugs,
     };
   }
 
   const queries: string[] = [];
+  let unsupported: string[] = [];
   if (scope.mode === 'review-requested') {
     queries.push('is:pr is:open archived:false review-requested:@me');
   } else {
     const { owners, skipped } = ownersFromPatterns(scope.include);
-    if (skipped.length > 0) {
-      console.log(
-        chalk.yellow(`  ⚠ 소유자를 특정할 수 없는 패턴은 검색할 수 없습니다 — 무시: ${skipped.join(', ')}`),
-      );
-    }
+    unsupported = skipped;
     for (const o of owners) queries.push(`is:pr is:open archived:false org:${o}`);
   }
 
@@ -192,8 +199,11 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
       r.repos.forEach((s) => found.add(s));
       if (byPR) {
         for (const { slug, number } of r.prs) {
-          if (!targets.has(slug)) targets.set(slug, new Set());
-          targets.get(slug)!.add(number);
+          // 키를 소문자로 접는다 — 조회(admitsNewPR)도 같은 규칙으로 접으므로
+          // 검색 결과의 정규 케이싱과 스캔 리스트의 케이스가 어긋나도 매치된다.
+          const key = slug.toLowerCase();
+          if (!targets.has(key)) targets.set(key, new Set());
+          targets.get(key)!.add(number);
         }
       }
       truncated ||= r.truncated;
@@ -213,6 +223,8 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
     partial,
     truncated,
     cost,
+    unsupported,
+    invalidSlugs: [],
   };
 }
 
@@ -251,6 +263,10 @@ export interface RepoSource {
  * 한다. 여기서 무제한으로 넘기면, 리뷰를 게시해 요청이 해제된 뒤에도 기존
  * 컨텍스트 때문에 레포가 스캔에 남아 그 레포의 다른 열린 PR 이 전부 대상이 된다.
  *
+ * 조회 키도 소문자로 접는다. 키는 검색 결과의 정규 케이싱에서, 조회값은 스캔
+ * 리스트 출발이라 어긋날 수 있다 — 목록만 정규화하고 조회를 방치하면 그 레포의
+ * 새 추적이 통째로 거부된다 (passesRefFilters 의 조회 키 정규화와 같은 처방).
+ *
  * cli 가 이 판정을 복제하지 않도록 여기서 한 번만 정의한다.
  */
 export function admitsNewPR(
@@ -259,7 +275,7 @@ export function admitsNewPR(
   number: number,
 ): boolean {
   if (!targets) return true; // account/repos 모드 — 제한 없음
-  return (targets.get(slug) ?? new Set<number>()).has(number);
+  return (targets.get(slug.toLowerCase()) ?? new Set<number>()).has(number);
 }
 
 /**
@@ -280,7 +296,7 @@ export function nextRepoCache(
   return [...new Set([...cached, ...result.repos])].sort();
 }
 
-/** 두 허용 목록을 합친다 (둘 다 없으면 undefined = 제한 없음). */
+/** 두 허용 목록을 합친다 (둘 다 없으면 undefined = 제한 없음). 키는 소문자로 접는다. */
 function mergeTargets(
   a: Map<string, Set<number>> | undefined,
   b: Map<string, Set<number>> | undefined,
@@ -289,9 +305,10 @@ function mergeTargets(
   if (!b) return a;
   const out = new Map<string, Set<number>>();
   for (const [slug, nums] of [...a, ...b]) {
-    const set = out.get(slug) ?? new Set<number>();
+    const key = slug.toLowerCase();
+    const set = out.get(key) ?? new Set<number>();
     nums.forEach((n) => set.add(n));
-    out.set(slug, set);
+    out.set(key, set);
   }
   return out;
 }
@@ -306,6 +323,17 @@ function mergeTargets(
 export function createRepoSource(scope: WatchScope): RepoSource {
   const interval = scope.discoveryIntervalMs ?? DEFAULT_DISCOVERY_INTERVAL_MS;
   let cached: string[] = [];
+  /**
+   * 이미 출력한 경고 기록. 탐색은 discoveryIntervalMs 주기로 계속 반복되므로
+   * 같은 내용의 경고를 매번 다시 찍으면 로그가 스팸이 된다 — 같은 문구는 한 번만.
+   * reset() 으로 지운다: 범위가 바뀌면 새 범위의 무시 항목은 다시 알려야 한다.
+   */
+  const warned = new Set<string>();
+  const warnOnce = (line: string): void => {
+    if (warned.has(line)) return;
+    warned.add(line);
+    console.log(line);
+  };
   const source: RepoSource = {
     truncated: false,
     lastAt: 0,
@@ -314,6 +342,7 @@ export function createRepoSource(scope: WatchScope): RepoSource {
       source.targets = undefined;
       source.truncated = false;
       source.lastAt = 0;
+      warned.clear();
     },
     list() {
       const stale = Date.now() - source.lastAt >= interval;
@@ -324,6 +353,20 @@ export function createRepoSource(scope: WatchScope): RepoSource {
       source.truncated = r.truncated;
       // 실패한 범위의 허용 목록까지 지워지면 그 PR 들이 추적 대상에서 빠진다.
       source.targets = r.partial ? mergeTargets(source.targets, r.targets) : r.targets;
+
+      if (r.unsupported.length > 0) {
+        warnOnce(
+          chalk.yellow(`  ⚠ 이 모드에서 펼칠 수 없는 패턴은 무시합니다 — ${r.unsupported.join(', ')}`),
+        );
+        warnOnce(chalk.dim('    글롭을 쓰려면 watch.mode 를 "account" 로 바꾸세요.'));
+      }
+      if (r.invalidSlugs.length > 0) {
+        warnOnce(
+          chalk.yellow(
+            `  ⚠ owner/repo 형식이 아니어서 probe 하지 않습니다 — 무시: ${r.invalidSlugs.join(', ')}`,
+          ),
+        );
+      }
 
       const next = nextRepoCache(cached, r);
       const added = next.filter((s) => !cached.includes(s));

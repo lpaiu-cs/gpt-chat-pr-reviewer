@@ -134,8 +134,16 @@ export function loadLatestResponse(
     .filter((f) => f.startsWith(prefix) && f.endsWith('.txt'))
     .map((f) => {
       const fp = path.join(dir, f);
-      return { path: fp, mtime: statSync(fp).mtimeMs };
+      try {
+        return { path: fp, mtime: statSync(fp).mtimeMs };
+      } catch {
+        // readdir 과 stat 사이에 사라졌다 — 읽을 수 없는 후보는 최신이 될 수
+        // 없으므로 0 이 아니라 후보에서 뺀다 (responseTimesForRound 의 0 은
+        // "시각 비교에서 무해" 여서 가능한 표기다).
+        return null;
+      }
     })
+    .filter((c): c is { path: string; mtime: number } => c !== null)
     .sort((a, b) => b.mtime - a.mtime);
 
   if (candidates.length === 0) return null;

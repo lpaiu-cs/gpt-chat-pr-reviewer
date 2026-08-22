@@ -4,6 +4,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import chalk from 'chalk';
 import type { AppConfig } from './types.js';
 
 // HTML 주석은 프롬프트에서 제거된다 — 파일 사용법 설명이 GPT 에게 전달되지 않도록.
@@ -54,7 +55,17 @@ export function saveInstructions(cfg: AppConfig, body: string): string {
 /** 지침 내용을 읽는다 — HTML 주석은 제거된다 (없으면 빈 문자열). */
 export function loadInstructions(cfg: AppConfig, overridePath?: string): string {
   const f = overridePath ?? cfg.customInstructionsFile;
-  if (!existsSync(f)) return '';
+  if (!existsSync(f)) {
+    // 기본 파일이 없는 것은 정상(빈 지침)이다. 반면 **명시적으로 준 경로**가
+    // 없으면 조용히 빈 지침으로 리뷰하면 안 된다 — 사용자는 그 지침이 적용됐다고
+    // 믿고 리뷰 결과를 읽게 된다. 오타 경로는 여기서 알린다.
+    if (overridePath) {
+      console.log(
+        chalk.yellow(`  ⚠ 지침 파일을 찾지 못했습니다: ${f} — 지침 없이 진행합니다.`),
+      );
+    }
+    return '';
+  }
   return readFileSync(f, 'utf-8')
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/\n{3,}/g, '\n\n')
