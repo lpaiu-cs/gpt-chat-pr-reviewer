@@ -990,13 +990,23 @@ export class ChatGPTDriver {
             if (!el) continue;
             if (el.closest('[data-message-author-role]')) continue;
             if (el.closest('script, style, noscript, template')) continue;
-            if (el.closest('[hidden]')) continue;
-            try {
-              const cs = window.getComputedStyle(el);
-              if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
-            } catch {
-              /* getComputedStyle 실패 시 보이는 것으로 간주 */
+            // 조상까지 포함해 실제 표시 여부를 판정한다 — 직접 부모는 보여도
+            // 상위 패널이 display:none/visibility:hidden/opacity:0이면 숨김이고,
+            // getComputedStyle(el)만 보면 이 경우를 놓쳐 숨김 한도 문구를 수집한다.
+            let hidden = false;
+            for (let cur: HTMLElement | null = el; cur && cur !== document.body; cur = cur.parentElement) {
+              if (cur.hasAttribute('hidden')) { hidden = true; break; }
+              try {
+                const cs = window.getComputedStyle(cur);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') {
+                  hidden = true;
+                  break;
+                }
+              } catch {
+                /* getComputedStyle 실패 시 보이는 것으로 간주 */
+              }
             }
+            if (hidden) continue;
             out += raw + ' ';
             if (out.length > 5000) break;
           }
