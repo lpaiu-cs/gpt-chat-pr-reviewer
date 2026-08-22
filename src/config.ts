@@ -11,8 +11,6 @@ const DEFAULT_SELECTORS: ChatGPTSelectors = {
   stopButton: 'button[data-testid="stop-button"], button[aria-label*="Stop"]',
   assistantMessage: '[data-message-author-role="assistant"]',
   messageContent: '.markdown',
-  newChatButton: 'a[data-discover="true"]',
-  loggedInIndicator: '#prompt-textarea',
 };
 
 // ── 기본 프롬프트 ───────────────────────────────────────────
@@ -100,7 +98,16 @@ export function loadConfig(configPath?: string): AppConfig {
   const file = configPath ?? CONFIG_FILE;
   if (existsSync(file)) {
     const raw = readFileSync(file, 'utf-8');
-    const user: Partial<AppConfig> = JSON.parse(raw);
+    let user: Partial<AppConfig>;
+    try {
+      user = JSON.parse(raw);
+    } catch {
+      // patchConfigFile 과 같은 실패 철학 — 깨진 파일을 조용히 무시하면
+      // 기본값으로 돌아가 사용자 설정이 사라진 것처럼 동작한다.
+      throw new Error(
+        `${file} 을 읽을 수 없습니다 (JSON 형식 오류) — 파일을 고치거나 지운 뒤 init 으로 다시 만들어주세요.`,
+      );
+    }
     return {
       ...DEFAULT_CONFIG,
       ...user,
