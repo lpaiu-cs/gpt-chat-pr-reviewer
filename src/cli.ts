@@ -541,6 +541,31 @@ program
         : undefined;
     };
 
+    /**
+     * scope-set 의도의 의미 검증 — 서버의 즉시 피드백(hooks.validate)과 루프의
+     * 실제 적용(applyIntents)이 **같은 판정**을 쓰게 한다. 복제하면 갈라졌을 때
+     * "UI 는 받아주고 백엔드는 조용히 버리는" 조합이 생긴다.
+     * @returns 통과면 null, 아니면 사람이 읽을 거절 사유
+     */
+    const rejectScopeSet = (include: string[]): string | null => {
+      // 빈 include 는 "감시 중지" 가 아니다. matchesScope 는 빈 목록을
+      // **전부 허용**으로 읽으므로(review-requested 가 그렇게 쓴다) 오히려
+      // 추적 중인 컨텍스트가 전부 lingering 으로 되살아나 계속 리뷰된다.
+      if (include.length === 0 && scope.mode !== 'review-requested') {
+        return `${scope.mode} 모드에서는 include 를 비울 수 없습니다 — 감시를 멈추려면 일시정지를 쓰세요.`;
+      }
+      // 탐색이 펼칠 수 없는 패턴은 저장해봐야 조용히 아무것도 발견하지 못한다.
+      // lingering 컨텍스트가 남아 있으면 그 실패가 한동안 가려진다.
+      // discoverRepos 와 같은 판정(unsupportedPatterns)을 쓴다.
+      const bad = unsupportedPatterns(scope.mode, include);
+      if (bad.length > 0) {
+        return scope.mode === 'repos'
+          ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
+          : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
+      }
+      return null;
+    };
+
     publishControl(); // 첫 스캔 전에도 현재 필터·일시정지 상태가 화면에 보이게
 
     /** 바뀐 감시 범위를 설정 파일에 남긴다 (바뀐 키만 패치 — config.ts 참고). */
@@ -641,23 +666,10 @@ program
             break;
           }
           case 'scope-set': {
-            // 빈 include 는 "감시 중지" 가 아니다. matchesScope 는 빈 목록을
-            // **전부 허용**으로 읽으므로(review-requested 가 그렇게 쓴다) 오히려
-            // 추적 중인 컨텍스트가 전부 lingering 으로 되살아나 계속 리뷰된다.
-            // 멈추려면 일시정지를 쓴다. review-requested 는 빈 include 가 정상이다.
-            if (it.include.length === 0 && scope.mode !== 'review-requested') {
-              console.log(
-                chalk.yellow(`  ⚠ ${scope.mode} 모드에서는 include 를 비울 수 없습니다 — 무시합니다.`),
-              );
-              break;
-            }
-            // 탐색이 펼칠 수 없는 패턴은 저장해봐야 조용히 아무것도 발견하지
-            // 못한다. lingering 컨텍스트가 남아 있으면 그 실패가 한동안 가려진다.
-            const bad = unsupportedPatterns(scope.mode, it.include);
-            if (bad.length > 0) {
-              console.log(
-                chalk.yellow(`  ⚠ ${scope.mode} 모드가 펼칠 수 없는 패턴 — 무시합니다: ${bad.join(', ')}`),
-              );
+            // 판정은 rejectScopeSet 하나 — hooks.validate 와 갈라지지 않는다.
+            const rejected = rejectScopeSet(it.include);
+            if (rejected) {
+              console.log(chalk.yellow(`  ⚠ ${rejected} — 무시합니다.`));
               break;
             }
             scope.include = it.include;
@@ -852,20 +864,8 @@ program
                 const bad = intent.refs.map(badRef).filter(Boolean);
                 return bad.length > 0 ? bad.join(' / ') : null;
               }
-              case 'scope-set': {
-                if (intent.include.length === 0 && scope.mode !== 'review-requested') {
-                  return `${scope.mode} 모드에서는 include 를 비울 수 없습니다. 감시를 멈추려면 '일시정지' 를 쓰세요.`;
-                }
-                // discoverRepos 와 **같은 판정**을 쓴다 (unsupportedPatterns).
-                // 갈라지면 UI 는 받아주고 백엔드는 조용히 버린다.
-                const bad = unsupportedPatterns(scope.mode, intent.include);
-                if (bad.length > 0) {
-                  return scope.mode === 'repos'
-                    ? `repos 모드는 글롭을 펼칠 수 없습니다: ${bad.join(', ')} — mode 를 account 로 바꾸거나 'owner/repo' 를 그대로 적으세요.`
-                    : `소유자 자리에 글롭을 쓸 수 없습니다: ${bad.join(', ')} — 검색이 'org:<owner>' 단위입니다.`;
-                }
-                return null;
-              }
+              case 'scope-set':
+                return rejectScopeSet(intent.include);
               default:
                 return null;
             }
@@ -977,6 +977,11 @@ program
       const discovered = repoSource.list();
       const all = listContexts(cfg);
 
+      // GitHub 슬러그는 대소문자를 구분하지 않는다. 컨텍스트에 낡은 케이싱이
+      // 남아 있으면 정확한 문자열 비교로는 "발견 목록에 없다" 고 오판해 같은
+      // 레포가 두 번 들어가 주기마다 probe 를 두 번 쓴다 — 키를 접어서 본다.
+      const discoveredKeys = new Set(discovered.map((s) => s.toLowerCase()));
+
       // 검색은 "열린 PR 이 있는 레포" 만 돌려준다. 어떤 레포의 마지막 PR 이 닫히면
       // 그 레포가 목록에서 사라지고, 추적 중이던 컨텍스트는 PR_CLOSED 를 못 받아
       // AWAITING_AUTHOR 같은 상태로 영원히 남는다. 아직 살아있는 컨텍스트가 있는
@@ -986,7 +991,9 @@ program
           all.filter((c) => c.state !== 'CLOSED').map((c) => `${c.owner}/${c.repo}`),
         ),
       ].filter(
-        (s) => !discovered.includes(s) && matchesScope(s, scope.include, scope.exclude ?? []),
+        (s) =>
+          !discoveredKeys.has(s.toLowerCase()) &&
+          matchesScope(s, scope.include, scope.exclude ?? []),
       );
 
       const repos = [...discovered, ...lingering];
@@ -1000,7 +1007,9 @@ program
 
       for (const repoSlug of repos) {
         const tracked = all.filter(
-          (c) => `${c.owner}/${c.repo}` === repoSlug && c.state !== 'CLOSED',
+          (c) =>
+            `${c.owner}/${c.repo}`.toLowerCase() === repoSlug.toLowerCase() &&
+            c.state !== 'CLOSED',
         );
 
         // resolve 감지가 필요한 PR = AWAITING_AUTHOR.
@@ -1387,7 +1396,13 @@ program
     };
 
     // --once 는 "1회 스캔" 이므로 그 스캔에서 나온 큐를 끝까지 소진한다.
-    await loop(opts.once);
+    // 예외 처리는 이후 사이클(timer 경로)과 같다 — 놓치면 첫 사이클의 실패만
+    // 프로세스 전체를 죽이는 비대칭이 된다.
+    try {
+      await loop(opts.once);
+    } catch (e) {
+      console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
+    }
 
     if (opts.once) {
       await driver?.close();
