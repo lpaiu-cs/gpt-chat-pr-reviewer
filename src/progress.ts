@@ -178,6 +178,13 @@ export interface Snapshot {
    * 비용을 쓰기 전에 붙는 쪽이 이 값을 본다.
    */
   ready: boolean;
+  /**
+   * 라운드 진행 단계의 어휘 — [키, 표시 라벨] 쌍 (진행 순서대로).
+   *
+   * 대시보드가 자기 사본을 들고 있으면 reviewer 쪽에 단계가 추가돼도 화면이
+   * 따라오지 못한다. 단계 어휘의 근원은 이 버스(PHASE_LABELS) 하나여야 한다.
+   */
+  phases: [string, string][];
   control: ControlState;
   startedAt: number;
   scope: string;
@@ -259,6 +266,7 @@ function emptySnapshot(session: string): Snapshot {
     instance: null,
     mode: 'review',
     ready: false,
+    phases: Object.entries(PHASE_LABELS),
     control: {
       mode: '',
       paused: false,

@@ -293,21 +293,19 @@
 <script>
 'use strict';
 
-const PHASES = [
-  ['conversation', '대화 준비'],
-  ['prompt',       '프롬프트 전송'],
-  ['waiting',      '응답 대기'],
-  ['parsing',      '응답 파싱'],
-  ['posting',      '리뷰 게시'],
-  ['syncing',      '스레드 동기화'],
-];
-
 let snap = null;
 let following = true;
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
   ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+
+/**
+ * 라운드 진행 단계 어휘 — 스냅샷이 유일한 근원이다.
+ * 여기 자기 사본을 들고 있으면 서버 쪽에 단계가 추가돼도 화면이 따라오지 못한다.
+ * 첫 스냅샷 전에는 actives 도 비어 있으므로 이 폴백은 사실상 도달하지 않는다.
+ */
+const phaseList = () => (snap && snap.phases) || [];
 
 /** 경과 시간 — 초 단위까지 보여야 "멈춘 게 아니다" 가 전달된다. */
 function dur(ms) {
@@ -342,10 +340,11 @@ function renderActive() {
   el.className = '';
 
   el.innerHTML = list.map((a, n) => {
-    const at = PHASES.findIndex((p) => p[0] === a.phase);
-    const steps = PHASES.map(([k, label], i) =>
+    const phases = phaseList();
+    const at = phases.findIndex((p) => p[0] === a.phase);
+    const steps = phases.map(([, label], i) =>
       '<div class="step ' + (i < at ? 'done' : i === at ? 'now' : '') + '">' +
-        '<i></i><span>' + label + '</span></div>').join('');
+        '<i></i><span>' + esc(label) + '</span></div>').join('');
     return '<div class="act' + (n > 0 ? ' act-more' : '') + '">' +
       '<div class="act-top">' +
         '<a class="act-key" href="' + esc(a.url) + '" target="_blank" rel="noopener">' + esc(a.key) + '</a>' +
@@ -357,7 +356,7 @@ function renderActive() {
       '<div class="steps">' + steps + '</div>' +
       '<div class="act-live">' +
         '<span class="elapsed" id="a-elapsed-' + n + '">—</span>' +
-        '<span class="lbl">' + esc(PHASES[at] ? PHASES[at][1] : a.phase) + '</span>' +
+        '<span class="lbl">' + esc(phases[at] ? phases[at][1] : a.phase) + '</span>' +
         '<span class="lbl" id="a-total-' + n + '"></span>' +
         '<span class="stream" id="a-stream-' + n + '"></span>' +
       '</div>' +
