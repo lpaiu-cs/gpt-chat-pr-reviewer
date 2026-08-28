@@ -168,7 +168,31 @@
   .btn.pending, #lbl-conc.pending, .tag.pending {
     border-style: dashed; border-color: var(--warn);
   }
-  .btn.pending::after, .tag.pending::after { content: " ·대기"; opacity: .75; font-size: .9em; }
+  /*
+   * **표시는 움직여야 한다.**
+   *
+   * 점선과 '대기' 글자는 정적이라 "눌리긴 한 건가" 가 남는다 — 라운드가 도는
+   * 동안은 반영까지 2~15분이 걸리는데, 그 사이 화면이 멎어 보이면 사용자는
+   * 조작이 먹지 않았다고 읽고 다시 누른다 (동시 리뷰 수를 세 번 연달아 바꾼
+   * 기록이 그것이었다). 돌아가는 링은 "받았고 처리 중" 을 계속 말해준다.
+   *
+   * `currentColor` 를 쓰므로 파란 버튼 위(흰 글씨)든 평소 배경이든 그대로 보인다.
+   */
+  .btn.pending::after, .tag.pending::after {
+    content: "";
+    display: inline-block; flex: none;
+    width: .78em; height: .78em; margin-left: .4em; vertical-align: -.12em;
+    border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%;
+    opacity: .85;
+    animation: spin 1s linear infinite; /* 대기가 길 수 있다 — 빠른 회전은 오래 보면 거슬린다 */
+  }
+  /* 라벨이 이미 flex gap 으로 띄운다 — 여기서 또 띄우면 넓어진다 */
+  #lbl-conc.pending::after { margin-left: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* 회전을 원치 않는 사용자에게는 멈춘 링으로 남는다 (표시 자체는 유지). */
+  @media (prefers-reduced-motion: reduce) {
+    .btn.pending::after, .tag.pending::after { animation: none; }
+  }
   .acts { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .4rem; }
 
   /* only 가 걸려 있으면 나머지가 전부 멈추므로 눈에 띄어야 한다 */
