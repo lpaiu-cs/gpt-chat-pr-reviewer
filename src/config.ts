@@ -71,7 +71,10 @@ const DEFAULT_CONFIG: AppConfig = {
   customInstructionsFile: './instructions.md',
   quotaCooldownMs: 3 * 60 * 60_000, // 3시간
   maxAutoRetries: 2,
-  maxTurnsPerConversation: 5, // 전송마다 diff 가 대화에 쌓이므로 무한 연장은 불가
+  // 전송마다 diff 가 대화에 쌓이므로 무한 연장은 불가하다. 다만 회전은 공짜가 아니다 — 새 대화는
+  // 이전 지적을 스니펫으로만 받으므로 같은 곳을 다시 집거나 고친 맥락을 놓친다.
+  // 실측 라운드 하나의 diff 는 수십 KB 이라 10회까지는 한도 안에 들어간다.
+  maxTurnsPerConversation: 10,
   // 순차 처리 (ChatGPT 한도를 아껴 쓴다). 2·5·0(제한 없음) 으로 올릴 수 있다.
   maxConcurrentReviews: 1,
   watchIntervalMs: 10_000, // 10초 — 스캔 1회 = 레포당 1 point 이므로 부담이 없다

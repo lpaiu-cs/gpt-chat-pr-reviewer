@@ -966,14 +966,39 @@ program
     };
 
     /**
+     * 이벤트 루프에 한 틱을 돌려준다 — 대시보드가 숨 쉬는 자리다.
+     *
+     * `github.ts` 의 모든 호출은 `execFileSync` 다. 한 번이 **스레드를 통째로**
+     * 0.5초씩 붙잡고(실측 431~561ms), 레포를 연달아 훑는 동안 그게 이어 붙는다.
+     * UI 서버는 같은 루프에 업혀 있어서(ui/server.ts 헤더 참고) 그 동안 요청을
+     * 받지도 답하지도 못한다 — 실측으로 레포 3개짜리 스캔 중에 누른 버튼은
+     * 1,906ms 만에 응답했다 (한산할 때는 3ms). 사람은 그걸 "버튼이 안 먹는다"
+     * 로 겪는다.
+     *
+     * 사이에 한 틱을 넘겨주면 밀린 요청이 그 틈에 처리되어 최악 지연이
+     * **gh 호출 한 번**으로 줄어든다. 스캔이 느려지지는 않는다 — 넘겨주는 것은
+     * 이미 대기 중인 콜백뿐이고, 그동안 새 사이클이 끼어들지도 않는다
+     * (다음 사이클은 `loop` 가 끝난 뒤에야 예약된다). 의도 큐도 안전하다 —
+     * HTTP 핸들러는 큐에 쌓기만 하고, 배수는 여전히 사이클 시작점에서만 한다.
+     */
+    const breathe = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+    /**
      * 스캔 — 감시 범위의 모든 레포를 동기화하고, 리뷰 후보 컨텍스트를 모은다.
      * 여기서는 리뷰를 실행하지 않는다. 실행 순서는 큐가 정한다.
+     *
+     * **GitHub 을 부를 때마다 루프를 놓아준다** (`breathe`). 이유는 그 함수 주석에 있다.
      */
-    const scan = (): { eligible: PRContext[]; openCount: number; seen: PRContext[] } => {
+    const scan = async (): Promise<{
+      eligible: PRContext[];
+      openCount: number;
+      seen: PRContext[];
+    }> => {
       progress.cycle({ scanning: true });
       // 한 스캔 안에서는 같은 시각을 쓴다 — 레포마다 now 가 달라지면 주기 판정이
       // 미세하게 어긋나 어떤 레포는 매번 한 박자씩 밀린다.
       const now = Date.now();
+      await breathe(); // 탐색도 gh 호출이다 (캐시가 만료됐을 때만 나가지만)
       const discovered = repoSource.list();
       const all = listContexts(cfg);
 
@@ -1050,6 +1075,7 @@ program
 
         let probe;
         try {
+          await breathe(); // 이 호출이 0.5초 동안 루프를 붙잡는다 — 그 전에 밀린 요청을 처리한다
           probe = fetchRepoProbe(repoSlug, needThreads);
         } catch {
           console.log(chalk.yellow(`  ⚠ ${repoSlug} probe 실패 — 건너뜁니다.`));
@@ -1072,6 +1098,7 @@ program
         // 추적 중이지만 열린 목록에 없는 PR → 닫힘 확인 (여기서만 개별 조회)
         for (const c of tracked) {
           if (!probe.prs.some((p) => p.number === c.prNumber)) {
+            await breathe();
             syncPR(cfg, c);
             reportIfChanged(c);
             seen.push(c);
@@ -1110,7 +1137,10 @@ program
           const needsFull = syncPRFromProbe(cfg, ctx, pr);
 
           // 2단계: 모르는 스레드가 생겼을 때만 전체 동기화
-          if (needsFull) syncPR(cfg, ctx);
+          if (needsFull) {
+            await breathe();
+            syncPR(cfg, ctx);
+          }
 
           reportIfChanged(ctx);
           seen.push(ctx);
@@ -1250,7 +1280,7 @@ program
       // 더 기다리게 되고, 그 라운드는 어차피 버려질 수도 있다.
       if (stopRequested) return false;
 
-      const { eligible, openCount, seen } = scan();
+      const { eligible, openCount, seen } = await scan();
 
       // '지금 리뷰' 로 지목된 PR 을 맨 앞으로. sort 는 안정적이므로 그 안에서는
       // buildQueue 가 매긴 원래 우선순위가 그대로 유지된다.
