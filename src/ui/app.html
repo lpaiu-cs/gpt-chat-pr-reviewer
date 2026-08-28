@@ -20,6 +20,13 @@
       --mag:#8250df; --cyan:#1b7c83;
     }
   }
+  /*
+   * 네이티브 컨트롤이 페이지 테마를 따라가게 한다.
+   *
+   * 선택창의 열린 목록은 브라우저가 **자기 표면**에 그리므로 페이지 배경이
+   * 적용되지 않는다. 이게 없으면 다크 모드에서도 팝업만 흰 바탕으로 뜬다.
+   */
+  :root { color-scheme: light dark; }
   * { box-sizing:border-box; }
   body {
     margin:0; background:var(--bg); color:var(--fg);
@@ -144,6 +151,13 @@
   }
   #lbl-conc.on { background: var(--accent); border-color: var(--accent); color: #fff; }
   #lbl-conc.on select { background: transparent; border-color: rgba(255,255,255,.5); color: #fff; }
+  /*
+   * **열린 목록은 색을 따로 정한다.** 닫힌 선택창은 파란 버튼 위에 얹혀 있어
+   * 흰 글씨가 맞지만, 항목이 그 색을 물려받으면 흰 팝업 위 흰 글씨가 되어
+   * 통째로 안 보인다 (실측: option color #fff · background transparent —
+   * 배경이 투명이라 팝업 표면 색이 그대로 비친다).
+   */
+  #lbl-conc select option { color: var(--fg); background: var(--panel); }
   /*
    * 요청은 했지만 루프가 아직 적용하지 않은 컨트롤.
    *
