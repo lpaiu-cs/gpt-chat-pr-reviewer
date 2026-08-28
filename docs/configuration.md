@@ -89,7 +89,7 @@ npm run dev -- init
 | `probeIdleIntervalMs` | `60000` | 즉시 응답을 기다리지 않는 레포의 폴링 간격 |
 | `quotaCooldownMs` | `10800000` | ChatGPT 한도 도달 후 대기 시간 |
 | `maxAutoRetries` | `2` | 실패한 리뷰의 자동 재시도 횟수 |
-| `maxTurnsPerConversation` | `5` | 한 ChatGPT 대화에서 보낼 최대 프롬프트 수 |
+| `maxTurnsPerConversation` | `10` | 한 ChatGPT 대화에서 보낼 최대 프롬프트 수 |
 | `headless` | `false` | Chrome 헤드리스 실행 |
 | `browserChannel` | `chrome` | Playwright 브라우저 채널 |
 | `selectors` | — | ChatGPT UI 셀렉터 오버라이드 |
