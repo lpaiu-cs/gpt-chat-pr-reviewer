@@ -169,13 +169,41 @@ export function judgeRebind(msgs: MessageRef[], bound: BoundTarget): RebindDecis
 /** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
 const CONVERSATION_URL_TIMEOUT_MS = 15_000;
 
-/** 스트림이 끊겼을 때 ChatGPT 가 표시하는 안내 문구. */
+/**
+ * 스트림이 끊겼을 때 ChatGPT 가 **화면 크롬에** 표시하는 안내 문구.
+ *
+ * **배너 고유 문구만 넣는다.** 한때 `/연결이 (중단|끊)/`·`/완전한 (답변|응답)을
+ * 기다/` 가 있었는데, 둘 다 배너가 아니라 평범한 한국어 기술 산문이다. 리뷰
+ * 본문이 그런 표현을 쓰면(네트워크·스트리밍 코드를 리뷰하면 흔하다) 그 문장은
+ * 대화에 영구히 남아 새로고침해도 사라지지 않는다 — 복구 3회가 전부 즉시 매치해
+ * 라운드가 통째로 버려지고, 재시도도 같은 자리에서 같은 이유로 죽는다.
+ * 실제로 그렇게 두 PR 이 24회 연속 실패했다 (`pelican-music#29`·`osk-system#14`).
+ *
+ * 그 사고의 1차 방어선은 검사 범위(`uiTextTail` — 메시지 영역 제외)이고,
+ * 이 목록은 2차 방어선이다. 둘 다 필요하다: 범위만 좁히면 배너를 흉내 낸
+ * 토스트에 여전히 걸리고, 패턴만 조이면 다음에 추가되는 문구가 또 본문을 짚는다.
+ */
 const INTERRUPT_PATTERNS: RegExp[] = [
   /connection interrupted/i,
   /waiting for the complete answer/i,
-  /연결이 (중단|끊)/,
-  /완전한 (답변|응답)을 기다/,
+  /연결이 중단되었습니다/,
+  /완전한 답변을 기다리는 중/,
 ];
+
+/**
+ * 화면 크롬 텍스트에서 중단 안내를 찾는다 (없으면 null).
+ *
+ * 매치한 문자열을 그대로 돌려준다 — 무엇이 걸렸는지 로그에 남지 않으면, 오탐이
+ * 났을 때 그 사실조차 알 수 없다. 실제로 위 사고에서 원인을 짚는 데 걸린 시간의
+ * 대부분이 "무엇이 매치됐는가" 를 되짚는 데 들었다.
+ */
+export function matchInterrupt(uiText: string): string | null {
+  for (const re of INTERRUPT_PATTERNS) {
+    const m = uiText.match(re);
+    if (m) return m[0];
+  }
+  return null;
+}
 
 /** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
 const MAX_RELOAD_RECOVERIES = 3;
@@ -972,12 +1000,20 @@ export class ChatGPTDriver {
     return last;
   }
 
-  /** 화면 크롬 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
-  private async detectQuotaLimit(page: Page): Promise<string | null> {
-    // 사용자 프롬프트/PR diff에 쿼터 문구가 있어도 오인하지 않도록 메시지
-    // 영역을 제외하고, detached clone의 innerText가 숨김/script 텍스트까지
-    // 포함하는 문제를 피하기 위해 live DOM에서 표시 중인 텍스트만 수집한다.
-    const tail = await page
+  /**
+   * **화면 크롬 텍스트** 끝부분 — 대화 메시지를 뺀, 지금 보이는 UI 글자만.
+   *
+   * 화면 안내(쿼터 한도·연결 중단)를 찾는 모든 판정이 이걸 쓴다. `body.innerText`
+   * 를 그대로 쓰면 안 된다 — 거기에는 **어시스턴트가 쓴 리뷰 본문과 우리가 보낸
+   * PR diff** 가 같이 들어 있어서, 안내 문구와 대화 내용을 구분할 수단이 없다.
+   * 대화 내용은 새로고침해도 남으므로 한 번 오탐이 나면 영구 고착이 된다.
+   *
+   * 쿼터 감지가 먼저 이 방식으로 고쳐졌는데 연결 중단 감지에는 반영되지 않아
+   * 같은 사고가 그쪽에서 재발했다. 그래서 수집을 하나로 합친다 — 갈라져 있으면
+   * 다음 판정이 또 `body.innerText` 로 시작한다.
+   */
+  private async uiTextTail(page: Page): Promise<string> {
+    return page
       .evaluate(() => {
         try {
           const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -1016,6 +1052,11 @@ export class ChatGPTDriver {
         }
       })
       .catch(() => '');
+  }
+
+  /** 화면 크롬 텍스트에서 쿼터 한도 안내를 탐지한다 (없으면 null). */
+  private async detectQuotaLimit(page: Page): Promise<string | null> {
+    const tail = await this.uiTextTail(page);
     for (const re of QUOTA_PATTERNS) {
       const m = tail.match(re);
       if (m) return m[0];
@@ -1432,16 +1473,20 @@ export class ChatGPTDriver {
 
       // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
       // 대화를 새로고침하면 완성본을 가져올 수 있다.
-      if (!streaming && (await this.hasInterruptedBanner(page))) {
+      const interrupt = streaming ? null : await this.interruptedBanner(page);
+      if (interrupt) {
         if (recoveries >= MAX_RELOAD_RECOVERIES) {
+          // **무엇이 걸렸는지 남긴다.** 이게 없으면 오탐일 때 원인을 짚을 수 없다.
           throw new Error(
-            `연결 중단이 반복됩니다 (${recoveries}회 복구 시도). 브라우저 창에서 상태를 확인하세요.`,
+            `연결 중단이 반복됩니다 (${recoveries}회 복구 시도 · 감지 문구 "${interrupt}"). ` +
+              '브라우저 창에서 상태를 확인하세요.',
           );
         }
         recoveries++;
         console.log(
           chalk.yellow(
-            `  ⚠ 연결 중단 감지 — 대화를 새로고침해 완성된 응답을 가져옵니다 (${recoveries}/${MAX_RELOAD_RECOVERIES})`,
+            `  ⚠ 연결 중단 감지 ("${interrupt}") — 대화를 새로고침해 완성된 응답을 가져옵니다 ` +
+              `(${recoveries}/${MAX_RELOAD_RECOVERIES})`,
           ),
         );
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
@@ -1582,12 +1627,14 @@ export class ChatGPTDriver {
     }
   }
 
-  /** "Connection interrupted" 배너 감지. */
-  private async hasInterruptedBanner(page: Page): Promise<boolean> {
-    const body = await page
-      .locator('body')
-      .innerText()
-      .catch(() => '');
-    return INTERRUPT_PATTERNS.some((re) => re.test(body.slice(-4_000)));
+  /**
+   * "Connection interrupted" 배너 감지 — 걸린 문구를 돌려준다 (없으면 null).
+   *
+   * 쿼터 감지와 **같은 수집**(`uiTextTail`)을 쓴다. 대화 메시지를 포함해서 보면
+   * 리뷰 본문의 한 문장이 배너로 오인되고, 그 문장은 새로고침해도 남으므로
+   * 복구 시도가 전부 즉시 실패한다 (INTERRUPT_PATTERNS 주석 참고).
+   */
+  private async interruptedBanner(page: Page): Promise<string | null> {
+    return matchInterrupt(await this.uiTextTail(page));
   }
 }
