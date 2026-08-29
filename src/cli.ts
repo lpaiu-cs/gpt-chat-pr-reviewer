@@ -24,7 +24,13 @@ import chalk from 'chalk';
 import { loadConfig, initConfig, ensureDataDir, patchConfigFile } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
 import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage } from './github.js';
-import { syncPR, syncPRFromProbe, runRound, type RoundOutcome } from './reviewer.js';
+import {
+  absorbReviewedMerge,
+  syncPR,
+  syncPRFromProbe,
+  runRound,
+  type RoundOutcome,
+} from './reviewer.js';
 import { fire, canFire, toMermaid, STATE_LABELS, NEXT_ACTION_HINTS } from './state/machine.js';
 import { createContext, loadContext, saveContext, listContexts } from './state/store.js';
 import { ensureInstructionsFile, readInstructionsRaw, saveInstructions } from './instructions.js';
@@ -1135,6 +1141,15 @@ program
           // watch 와 같은 답을 낼 수 있어야 한다.
           if (verdict.ok) delete ctx.excludedReason;
           else ctx.excludedReason = verdict.reason;
+
+          // 스택 PR 의 베이스 머지는 새 코드가 아니다 — head 만 옮기고 라운드를
+          // 열지 않는다. **전이 판정보다 먼저** 해야 한다: syncPRFromProbe 가
+          // head 차이를 보고 AUTHOR_RESPONDED 를 발화해 버리면 이미 늦다.
+          // 조건에 안 맞으면 GitHub 을 부르지도 않는다 (absorbReviewedMerge 참고).
+          if (ctx.headShaAtLastReview && pr.headSha !== ctx.headShaAtLastReview) {
+            await breathe(); // 부모 조회가 나갈 수 있다 — 대시보드를 멈춰 세우지 않는다
+            absorbReviewedMerge(cfg, ctx, pr.headSha);
+          }
 
           // 1단계: probe 만으로 전이 판정 (API 추가 호출 없음)
           const needsFull = syncPRFromProbe(cfg, ctx, pr);
