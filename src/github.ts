@@ -498,6 +498,26 @@ export function fetchCommitParents(owner: string, repo: string, sha: string): st
   }
 }
 
+/**
+ * 이 PR 을 **GitHub 이 머지하며 만든 커밋** (머지되지 않았으면 null).
+ *
+ * `merged` 를 반드시 함께 본다. 열린 PR 의 `merge_commit_sha` 는 GitHub 이
+ * 미리 계산해 둔 **테스트 머지** 커밋이라 실제 머지 결과가 아니다
+ * (실측: 열린 PR 33 이 merged=false 인데도 sha 를 갖고 있었다).
+ */
+export function fetchMergeCommit(owner: string, repo: string, number: number): string | null {
+  try {
+    const raw = gh(
+      ['api', `repos/${owner}/${repo}/pulls/${number}`, '-q', '[.merged, .merge_commit_sha] | @tsv'],
+      { captureStderr: true },
+    );
+    const [merged, sha] = raw.trim().split('\t');
+    return merged === 'true' && sha ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 현재 gh 인증 계정의 로그인 아이디 (캐시됨). */
 export function getViewerLogin(): string {
   if (!viewerLoginCache) {
