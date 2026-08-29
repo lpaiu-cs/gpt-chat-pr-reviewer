@@ -474,6 +474,30 @@ export function searchPRRepos(searchQuery: string): RepoSearchResult {
 
 let viewerLoginCache: string | null = null;
 
+/**
+ * 커밋의 부모 SHA 들 — 머지 커밋이면 2개, 보통 커밋이면 1개. 조회 실패면 null.
+ *
+ * GraphQL 이 아니라 REST 다. 이 조회는 head 가 움직인 컨텍스트에서만, 그것도
+ * 머지 여부를 가릴 때만 나가므로 주기 비용(레포당 1 point)에 얹히지 않는다.
+ *
+ * 실패를 null 로 떨어뜨린다 — 부모를 모르면 "머지인지 아닌지 모른다" 이고,
+ * 모를 때의 기본 방향은 **평소대로 재리뷰**다 (absorbsReviewedMerge 참고).
+ */
+export function fetchCommitParents(owner: string, repo: string, sha: string): string[] | null {
+  try {
+    const raw = gh(['api', `repos/${owner}/${repo}/commits/${sha}`, '-q', '.parents[].sha'], {
+      captureStderr: true, // 10초 주기 경로다 — 부분 실패 메시지로 로그를 덮지 않는다
+    });
+    const parents = raw
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return parents.length > 0 ? parents : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 현재 gh 인증 계정의 로그인 아이디 (캐시됨). */
 export function getViewerLogin(): string {
   if (!viewerLoginCache) {

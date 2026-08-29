@@ -10,7 +10,7 @@
 import chalk from 'chalk';
 import type { AppConfig, PRContext, ReviewResult } from './types.js';
 import { fire } from './state/machine.js';
-import { saveContext } from './state/store.js';
+import { listContexts, saveContext } from './state/store.js';
 import {
   fetchPRSyncData,
   getViewerLogin,
@@ -21,6 +21,7 @@ import {
   type PullRequestReaction,
   type SyncThread,
   type PRProbe,
+  fetchCommitParents,
 } from './github.js';
 import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
@@ -244,6 +245,102 @@ export function latestRoundThreads(ctx: PRContext): PRContext['threads'] {
   if (ctx.threads.length === 0) return [];
   const latest = Math.max(...ctx.threads.map((t) => t.round));
   return ctx.threads.filter((t) => t.round === latest);
+}
+
+/**
+ * 이 머지 커밋이 **이미 검토한 것만** 합친 것인가 (순수 함수).
+ *
+ * 스택 PR 에서 베이스를 머지하면 그 위 PR 의 head 가 머지 커밋으로 옮겨간다.
+ * head 가 달라졌으니 평소 판정은 "새 커밋" 으로 보고 라운드를 한 번 더 여는데,
+ * **들어온 코드는 방금 그 베이스 PR 에서 우리가 리뷰하고 수렴시킨 바로 그것**이다.
+ * 실측: `sleep-management#2` 가 13:28 에 approve 로 수렴하고 13:30 에 `#1` 로
+ * 머지되자, `#1` 이 13:35 에 자기가 7분 전 approve 한 코드를 다시 리뷰했다.
+ *
+ * 머지 커밋의 부모 두 개가 그 판정의 근거다.
+ *
+ *  - `parents[0]` = 머지 전 이쪽 브랜치 tip. 우리가 검토한 head 와 같아야 한다
+ *    → 이 PR 쪽에는 새 작업이 없다.
+ *  - `parents[1]` = 들어온 브랜치 tip. 검토를 마친 어떤 컨텍스트의 head 여야 한다
+ *    → 들어온 코드는 이미 봤다.
+ *
+ * **둘 다** 맞을 때만 흡수한다. 한쪽만 보면 새 코드를 놓친다:
+ *
+ *  - `main` 을 브랜치에 머지 → parents[1] 이 main tip 이라 어느 검토 head 와도
+ *    안 맞는다 → 평소대로 재리뷰
+ *  - 리뷰한 적 없는 브랜치 머지 → 마찬가지 → 재리뷰
+ *  - 머지 후 작성자가 커밋을 더 얹음 → head 가 머지 커밋이 아니다 → 재리뷰
+ *  - 리뷰가 도는 중에 머지가 들어옴 → parents[0] 이 검토 head 와 다르다 → 재리뷰
+ *
+ * 즉 틀리는 방향이 **"한 번 더 리뷰한다"** 쪽이다. 미검토 코드를 검토 완료로
+ * 기록하는 방향으로는 틀리지 않는다 — 이 판정이 지켜야 할 것이 그것이다.
+ */
+export function absorbsReviewedMerge(m: {
+  /** 새 head 의 부모들 (머지가 아니면 1개, 모르면 null) */
+  parents: string[] | null;
+  /** 이 PR 이 마지막으로 검토한 head */
+  lastReviewedHead: string | null;
+  /** 검토를 마친 head 들 — CONVERGED·CLOSED 컨텍스트의 headShaAtLastReview */
+  reviewedHeads: ReadonlySet<string>;
+}): boolean {
+  // 부모를 모르면(조회 실패) 판정하지 않는다 — 모를 때는 평소대로 재리뷰한다.
+  if (!m.parents || m.parents.length !== 2) return false;
+  if (!m.lastReviewedHead) return false;
+  if (m.parents[0] !== m.lastReviewedHead) return false;
+  return m.reviewedHeads.has(m.parents[1]);
+}
+
+/** 검토를 마친 head 들. 아직 리뷰가 안 끝난 컨텍스트는 근거가 될 수 없다. */
+function reviewedHeads(cfg: AppConfig): Set<string> {
+  const out = new Set<string>();
+  for (const c of listContexts(cfg)) {
+    // 수렴했거나 그대로 닫힌(머지 포함) 것만. AWAITING_AUTHOR 는 지적이 아직
+    // 남아 있다는 뜻이라 "검토를 마쳤다" 고 볼 수 없다.
+    if (c.state !== 'CONVERGED' && c.state !== 'CLOSED') continue;
+    if (c.headShaAtLastReview) out.add(c.headShaAtLastReview);
+  }
+  return out;
+}
+
+/**
+ * head 가 **이미 검토한 것만 합친 머지 커밋**으로 옮겨갔으면, 라운드를 열지 않고
+ * 검토 head 만 그 머지 커밋으로 당긴다.
+ *
+ * `applySyncEvents` 안에 두지 않는다 — 그 함수는 "GitHub API 를 호출하지 않는다"
+ * 가 계약이고, 그래야 probe 경로와 전체 동기화 경로가 같은 판정을 공유한다.
+ * 그래서 조회는 여기서 하고, 판정은 순수 함수(`absorbsReviewedMerge`)로 뺐다.
+ *
+ * 비싼 것부터 미룬다: 상태·head 비교(공짜) → 부모 조회(REST 1회) → 컨텍스트
+ * 전체 읽기(디스크). 앞에서 걸러지면 뒤는 아예 하지 않는다.
+ *
+ * @returns 흡수했으면 true (호출자는 그대로 진행하면 된다 — 이제 head 가 같다)
+ */
+export function absorbReviewedMerge(
+  cfg: AppConfig,
+  ctx: PRContext,
+  headSha: string | null | undefined,
+): boolean {
+  // 재리뷰 트리거가 head 인 상태에서만 의미가 있다.
+  if (ctx.state !== 'AWAITING_AUTHOR' && ctx.state !== 'CONVERGED') return false;
+  if (!headSha || !ctx.headShaAtLastReview || headSha === ctx.headShaAtLastReview) return false;
+
+  const parents = fetchCommitParents(ctx.owner, ctx.repo, headSha);
+  // parents[0] 부터 본다 — 여기서 걸리면 컨텍스트를 통째로 읽지 않아도 된다.
+  if (!parents || parents.length !== 2 || parents[0] !== ctx.headShaAtLastReview) return false;
+
+  if (!absorbsReviewedMerge({ parents, lastReviewedHead: ctx.headShaAtLastReview, reviewedHeads: reviewedHeads(cfg) })) {
+    return false;
+  }
+
+  console.log(
+    chalk.dim(
+      `    ${ctx.owner}/${ctx.repo}#${ctx.prNumber} 이미 검토한 PR 이 머지됐습니다 ` +
+        `(${parents[1].slice(0, 8)}) — 재리뷰하지 않고 검토 지점만 옮깁니다.`,
+    ),
+  );
+  // 상태 전이가 아니다 — "무엇을 검토했는가" 의 기록만 앞으로 당긴다.
+  ctx.headShaAtLastReview = headSha;
+  saveContext(cfg, ctx);
+  return true;
 }
 
 /**
