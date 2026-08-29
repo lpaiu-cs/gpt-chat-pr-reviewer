@@ -998,6 +998,9 @@ program
       // 한 스캔 안에서는 같은 시각을 쓴다 — 레포마다 now 가 달라지면 주기 판정이
       // 미세하게 어긋나 어떤 레포는 매번 한 박자씩 밀린다.
       const now = Date.now();
+      // 이번 스캔에서 처음 본 PR 은 모두 이 시각으로 기록한다 — 큐 순서가 probe
+      // 반환 순서(번호 내림차순)에 끌려가지 않게 한다 (createContext 주석 참고).
+      const scanAt = new Date(now).toISOString();
       await breathe(); // 탐색도 gh 호출이다 (캐시가 만료됐을 때만 나가지만)
       const discovered = repoSource.list();
       const all = listContexts(cfg);
@@ -1126,7 +1129,7 @@ program
           const admitted = verdict.ok && admitsNewPR(repoSource.targets, repoSlug, pr.number);
           if (!existing && !admitted) continue;
 
-          const ctx = existing ?? createContext(pr);
+          const ctx = existing ?? createContext(pr, scanAt);
           ctx.title = pr.title;
           // 필터 판정을 컨텍스트에 남긴다 — queue 명령이 GitHub 을 다시 부르지 않고도
           // watch 와 같은 답을 낼 수 있어야 한다.

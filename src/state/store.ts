@@ -21,8 +21,22 @@ function fileFor(cfg: AppConfig, owner: string, repo: string, num: number): stri
 
 // ── CRUD ────────────────────────────────────────────────────
 
-export function createContext(pr: PRInfo): PRContext {
-  const now = new Date().toISOString();
+/**
+ * @param at 이 PR 을 **처음 본 시각** (ISO). 생략하면 지금.
+ *
+ * **한 스캔에서 발견한 PR 들은 같은 값을 받아야 한다.** 큐는 같은 티어 안에서
+ * 대기 시각이 이른 것을 먼저 돌리는데(`buildQueue` — 오래 기다린 것 먼저),
+ * 신규 컨텍스트의 대기 시각은 이 `createdAt` 이다. PR 마다 시각을 따로 찍으면
+ * 스캔 한 번 안의 밀리초 차이가 곧 처리 순서가 되고, probe 는 GitHub 이 주는
+ * 순서(최근 갱신 순 ≈ 번호 내림차순)로 돌기 때문에 **번호가 큰 것부터** 처리된다.
+ * 실측: 데몬을 새로 띄우자 3.2초 안에 만들어진 7건이 #7 → #1 로 거꾸로 돌았다.
+ *
+ * 같은 값을 주면 동점이 되어 다음 기준(PR 번호 오름차순)이 순서를 정한다 —
+ * 번호가 작을수록 먼저 열린 PR 이므로 그게 사람이 기대하는 순서다.
+ * scan 이 레포별 주기 판정에 스캔 단위 `now` 를 쓰는 것과 같은 이유다.
+ */
+export function createContext(pr: PRInfo, at?: string): PRContext {
+  const now = at ?? new Date().toISOString();
   return {
     prUrl: pr.url,
     owner: pr.owner,
