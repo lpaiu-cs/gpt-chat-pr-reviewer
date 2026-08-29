@@ -97,6 +97,11 @@ export function toQueueEntry(ctx: PRContext, now = Date.now()): QueueEntry {
   };
 }
 
+/** 정렬용 레포 키. GitHub 슬러그는 대소문자를 구분하지 않으므로 접어서 비교한다. */
+function repoKey(ctx: PRContext): string {
+  return `${ctx.owner}/${ctx.repo}`.toLowerCase();
+}
+
 /** 큐에 오를 자격 — REVIEW_DUE 이면서 감시 필터에 걸리지 않은 것. */
 export function isQueueable(ctx: PRContext): boolean {
   return ctx.state === 'REVIEW_DUE' && !ctx.excludedReason;
@@ -119,7 +124,13 @@ export function buildQueue(contexts: PRContext[], now = Date.now()): QueueEntry[
       (a, b) =>
         a.tier - b.tier ||
         Date.parse(a.waitingSince) - Date.parse(b.waitingSince) || // 오래 기다린 것 먼저
-        a.ctx.prNumber - b.ctx.prNumber, // 완전한 결정성 확보
+        // ── 동점의 기준 ──
+        // 한 스캔에서 함께 발견한 PR 들은 대기 시각이 같으므로(createContext 주석)
+        // 실제 순서를 여기서 정한다. 그냥 결정성만 확보하는 자리가 아니다.
+        // 레포로 먼저 묶는다 — 번호만으로 줄 세우면 레포 A#1, B#1, A#2 처럼
+        // 번갈아 나와 화면과 로그에서 진행 상황을 따라가기 어렵다.
+        repoKey(a.ctx).localeCompare(repoKey(b.ctx)) ||
+        a.ctx.prNumber - b.ctx.prNumber, // 번호가 작을수록 먼저 열린 PR 이다
     );
 }
 

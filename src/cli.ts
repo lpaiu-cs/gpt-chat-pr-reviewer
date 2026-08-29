@@ -998,6 +998,9 @@ program
       // 한 스캔 안에서는 같은 시각을 쓴다 — 레포마다 now 가 달라지면 주기 판정이
       // 미세하게 어긋나 어떤 레포는 매번 한 박자씩 밀린다.
       const now = Date.now();
+      // 이번 스캔에서 처음 본 PR 은 모두 이 시각으로 기록한다 — 큐 순서가 probe
+      // 반환 순서(번호 내림차순)에 끌려가지 않게 한다 (createContext 주석 참고).
+      const scanAt = new Date(now).toISOString();
       await breathe(); // 탐색도 gh 호출이다 (캐시가 만료됐을 때만 나가지만)
       const discovered = repoSource.list();
       const all = listContexts(cfg);
@@ -1126,7 +1129,7 @@ program
           const admitted = verdict.ok && admitsNewPR(repoSource.targets, repoSlug, pr.number);
           if (!existing && !admitted) continue;
 
-          const ctx = existing ?? createContext(pr);
+          const ctx = existing ?? createContext(pr, scanAt);
           ctx.title = pr.title;
           // 필터 판정을 컨텍스트에 남긴다 — queue 명령이 GitHub 을 다시 부르지 않고도
           // watch 와 같은 답을 낼 수 있어야 한다.
@@ -1231,12 +1234,24 @@ program
       while (extraTabs.length > 0) await extraTabs.pop()?.close();
     };
 
-    /** 큐 1건 실행 — 헤더 출력부터 라운드 종료까지. */
+    /**
+     * 큐 1건 실행 — 헤더 출력부터 라운드 종료까지.
+     *
+     * @param onDone 이 라운드가 끝난 직후 (성공·실패 무관) 호출된다.
+     *
+     * **배치가 다 끝나기를 기다리지 않는다.** 동시 실행이면 `Promise.all` 이
+     * 배치 전체를 묶으므로, 뒤처리를 배치 끝에서만 하면 먼저 끝난 라운드의
+     * 결과(수렴·게시·큐에서 빠짐)가 가장 느린 라운드가 끝날 때까지 화면에
+     * 나오지 않는다. 라운드 편차가 2~15분이라 그 지연이 그대로 체감된다 —
+     * 로그에는 "응답 수신 완료"·"리뷰 게시 완료" 가 이미 흐르는데 대시보드만
+     * 멎어 있어 사람이 "멈춘 건가" 로 읽는다.
+     */
     const runQueued = async (
       entry: QueueEntry,
       index: number,
       total: number,
       tab: ChatGPTDriver | null,
+      onDone: () => void,
     ): Promise<RoundOutcome> => {
       const { ctx, reason } = entry;
       console.log(
@@ -1264,6 +1279,16 @@ program
           chalk.red(`  ✗ 라운드가 예외로 끝났습니다: ${e instanceof Error ? e.message : String(e)}`),
         );
         return 'failed';
+      } finally {
+        // 실패한 라운드도 알린다 — ERROR 배지와 재시도 대기가 화면에 나와야 한다.
+        // 알림 자체가 실패해도 라운드 결과를 삼키지 않는다.
+        try {
+          onDone();
+        } catch (e) {
+          console.error(
+            chalk.red(`  ✗ 화면 갱신 실패: ${e instanceof Error ? e.message : String(e)}`),
+          );
+        }
       }
     };
 
@@ -1343,25 +1368,33 @@ program
         for (let slot = 0; slot < batch.length; slot++) tabs.push(await leaseTab(slot));
 
         batchSize = batch.length; // 1보다 크면 로그에 어느 PR 의 줄인지 꼬리표가 붙는다
+
+        /**
+         * 라운드 1건의 뒤처리. **배치 끝이 아니라 그 라운드가 끝날 때** 한다.
+         *
+         * 컨텍스트는 runRound 가 제자리에서 갱신하므로(`seen`·`eligible` 이 같은
+         * 객체를 들고 있다) 여기서 다시 만들 필요 없이 그대로 내보내면 된다.
+         */
+        const settle = (entry: QueueEntry): void => {
+          reported.set(ctxKey(entry.ctx), ctxSignature(entry.ctx));
+          // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
+          prioritized.delete(parsePRRef(ctxKey(entry.ctx)) ?? '');
+          publish(seen, buildQueue(eligible), openCount, quotaUntil);
+        };
+
         let outcomes: RoundOutcome[];
         try {
           outcomes = await Promise.all(
-            batch.map((entry, slot) => runQueued(entry, i + slot, queue.length, tabs[slot])),
+            batch.map((entry, slot) =>
+              runQueued(entry, i + slot, queue.length, tabs[slot], () => settle(entry)),
+            ),
           );
         } finally {
           batchSize = 1;
           await releaseTabs(); // 유휴 탭을 남기지 않는다 (다음 배치가 다시 연다)
         }
         i += batch.length;
-
-        for (const entry of batch) {
-          reported.set(ctxKey(entry.ctx), ctxSignature(entry.ctx));
-          // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
-          prioritized.delete(parsePRRef(ctxKey(entry.ctx)) ?? '');
-        }
-        publishControl();
         reviewRan = true;
-        publish(seen, buildQueue(eligible), openCount, quotaUntil);
 
         if (outcomes.includes('quota')) {
           // 한도는 계정 단위라 남은 큐도 지금은 못 돈다. 버리지 않고 미룬다.
