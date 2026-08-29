@@ -126,13 +126,17 @@ test('전체 동기화는 주기가 지나면 다시 돈다 (숨김을 보는 �
   assert.equal(fullSyncDue(cfg, ctx, now), true); // 판별 불가는 도는 쪽으로
 });
 
-test('마지막 라운드가 통째로 숨겨지면 직전 라운드가 판정 대상이 된다', () => {
+test('마지막으로 게시한 라운드의 지적만 본다 — 예전 라운드로 물러서지 않는다', () => {
   const ctx = ctxWith([
     { id: 'T1', path: 'a.ts', line: 1, isResolved: false, authorReplied: false, round: 6, snippet: '' },
     { id: 'T2', path: 'a.ts', line: 2, isResolved: false, authorReplied: false, round: 7, snippet: '' },
   ]);
+  ctx.round = 7;
   assert.deepEqual(latestRoundThreads(ctx).map((t) => t.id), ['T2']);
 
-  ctx.threads = ctx.threads.filter((t) => t.round !== 7); // 7차가 숨겨져 빠진 상태
-  assert.deepEqual(latestRoundThreads(ctx).map((t) => t.id), ['T1']);
+  // 7차가 숨겨져 빠졌다. 예전에는 6차로 물러섰는데, 그 물러섬이 무한 재리뷰의
+  // 원인이었다 — 인라인이 없는 라운드 뒤에 **이미 resolve 된** 예전 스레드가
+  // 판정 대상이 되어 게시 직후 곧바로 "전체 resolve" 가 성립했다.
+  ctx.threads = ctx.threads.filter((t) => t.round !== 7);
+  assert.deepEqual(latestRoundThreads(ctx).map((t) => t.id), []);
 });

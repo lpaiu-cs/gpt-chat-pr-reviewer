@@ -217,12 +217,10 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
     fire(ctx, 'COOLDOWN_ELAPSED', { note: '쿼터 쿨다운 종료' });
   }
 
-  // 5. 작성자 응답 감지 (리뷰 대상 변경 or 마지막 라운드 스레드 전체 resolve)
+  // 5. 작성자 응답 감지 (리뷰 대상 변경 or 게시 시점에 열려 있던 스레드 전체 resolve)
   if (ctx.state === 'AWAITING_AUTHOR') {
     const moved = targetChanged(ctx, data);
-    const lastRound = latestRoundThreads(ctx);
-    const allResolved = lastRound.length > 0 && lastRound.every((t) => t.isResolved);
-    if (moved || allResolved) {
+    if (moved || awaitedThreadsResolved(ctx)) {
       fire(ctx, 'AUTHOR_RESPONDED', { note: moved ?? '전체 스레드 resolve 확인' });
     }
   }
@@ -235,17 +233,44 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
 }
 
 /**
- * **아직 살아 있는 지적 중 가장 최근 라운드의 것**들.
+ * **마지막으로 게시한 라운드**가 만든 지적들 (없으면 빈 배열).
  *
- * `round === ctx.round` 로 못 박으면 안 된다. 그 라운드의 지적이 전부 숨겨지면
- * (중복 게시를 사람이 duplicate 로 숨긴 경우) 대상이 0건이 되어 "전체 resolve"
- * 판정이 영영 성립하지 않고, PR 은 새 커밋이 오기 전까지 응답 대기에 갇힌다.
- * 그때는 실제로 화면에 남아 있는 직전 라운드의 지적이 판정 대상이다.
+ * 예전에는 "스레드가 있는 가장 최근 라운드" 로 물러섰다. 마지막 라운드의 지적이
+ * 전부 숨겨졌을 때 대상이 0건이 되는 것을 피하려던 것인데, 그 물러섬이 무한
+ * 재리뷰의 원인이었다 — 인라인이 하나도 안 달린 라운드 뒤에는 **예전 라운드의
+ * 이미 resolve 된 스레드**가 판정 대상이 되어 게시 직후 곧바로 "전체 resolve"
+ * 가 성립했다. 오래된 resolve 는 이번 리뷰에 대한 응답이 아니다.
+ *
+ * 그 물러섬이 없어도 갇히지 않는다 — 판정의 기준은 이제 게시 시점 스냅샷
+ * (`awaitedThreadIds`)이고, 이 함수는 그 스냅샷이 없는 구버전 컨텍스트의
+ * 근사에만 쓰인다.
  */
 export function latestRoundThreads(ctx: PRContext): PRContext['threads'] {
-  if (ctx.threads.length === 0) return [];
-  const latest = Math.max(...ctx.threads.map((t) => t.round));
-  return ctx.threads.filter((t) => t.round === latest);
+  return ctx.threads.filter((t) => t.round === ctx.round);
+}
+
+/**
+ * 게시 시점에 열려 있던 스레드가 **전부** resolve 됐는가 = 작성자가 응답했는가.
+ *
+ * 기준은 라운드 번호가 아니라 **게시 시점의 스냅샷**이다. 그때 이미 resolve 되어
+ * 있던 스레드는 이번 리뷰에 대한 응답이 아니므로 근거가 될 수 없다.
+ *
+ *  - 스냅샷이 비어 있다 = 기다릴 것이 없었다 (예: 지적이 전부 리뷰 본문으로 간
+ *    라운드). resolve 로는 응답을 알 수 없으므로 **새 커밋만이 응답**이다.
+ *  - 기다리던 스레드가 사라졌다 (사람이 숨김) = resolve 가 아니다. 응답으로
+ *    보지 않는다 — 여기서 응답으로 세면 숨김 하나가 재리뷰를 부른다.
+ *  - 스냅샷이 없다 = 구버전 컨텍스트. 마지막 라운드 스레드로 근사하고, 다음
+ *    게시부터 스냅샷이 생긴다.
+ */
+export function awaitedThreadsResolved(ctx: PRContext): boolean {
+  const awaited = ctx.awaitedThreadIds;
+  if (awaited === undefined) {
+    const mine = latestRoundThreads(ctx);
+    return mine.length > 0 && mine.every((t) => t.isResolved);
+  }
+  if (awaited.length === 0) return false;
+  const byId = new Map(ctx.threads.map((t) => [t.id, t]));
+  return awaited.every((id) => byId.get(id)?.isResolved === true);
 }
 
 /**
@@ -1158,6 +1183,10 @@ export async function runRound(
         baseRefAtLastReview: baseRef,
         retryCount: 0,
         lastError: undefined,
+        // **지금 열려 있는 것**만 담는다 (adoptThreads 직후라 방금 만든 스레드도
+        // 들어 있다). 이미 resolve 된 것은 이번 리뷰에 대한 응답이 아니므로
+        // 제외한다 — 그걸 세던 것이 무한 재리뷰의 원인이었다.
+        awaitedThreadIds: ctx.threads.filter((t) => !t.isResolved).map((t) => t.id),
       },
     });
     // 수렴하면 대화를 놓아준다 — 새 커밋으로 재개될 때는 새 대화에서 시작한다
