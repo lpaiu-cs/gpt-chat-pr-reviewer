@@ -6,6 +6,7 @@ import {
   judgeRebind,
   judgeRevival,
   judgeStuckButton,
+  matchInterrupt,
   type MessageRef,
 } from '../src/chatgpt.js';
 
@@ -190,4 +191,43 @@ test('judgeRevival: 빌려 쓴 브라우저는 내가 다시 띄우지 않는다
   // fork 된 드라이버는 탭만 자기 것이다 — 남의 브라우저를 다시 띄울
   // 권한이 없으므로 분명히 실패해야 한다.
   assert.equal(judgeRevival({ ctxAlive: false, pageAlive: false, owned: false }), 'give-up');
+});
+
+
+// ── 연결 중단 배너 ──────────────────────────────────────────
+//
+// 이 판정은 **라운드를 통째로 버린다**. 게다가 매치한 문자열이 대화 본문에 있으면
+// 새로고침해도 남으므로 복구 3회가 전부 즉시 실패하고, 재시도도 같은 자리에서
+// 같은 이유로 죽는다 — 되살아날 길이 없는 고착이다. 실제로 그렇게 두 PR 이 24회
+// 연속 실패했다. 그래서 오탐 쪽으로 기운 패턴은 여기서 막는다.
+
+test('matchInterrupt: 진짜 배너 문구는 잡는다', () => {
+  assert.equal(
+    matchInterrupt('Connection interrupted. Reload the page.'),
+    'Connection interrupted',
+  );
+  assert.equal(
+    matchInterrupt('...waiting for the complete answer...'),
+    'waiting for the complete answer',
+  );
+  assert.equal(matchInterrupt('연결이 중단되었습니다. 다시 시도하세요.'), '연결이 중단되었습니다');
+});
+
+test('matchInterrupt: 리뷰 본문에 나올 법한 평범한 문장은 잡지 않는다', () => {
+  // 실패한 PR 이 정확히 이 주제였다 — "완전한 응답을 기다리지 않는다" 가 변경의 요지였고,
+  // 그걸 한국어로 리뷰하면 아래 같은 문장이 나온다.
+  for (const prose of [
+    'API 완전한 응답을 기다려야 하므로 지연이 생깁니다.',
+    '소켓 연결이 끊기면 재연결을 시도하세요.',
+    '연결이 중단될 때의 복구 경로가 없습니다.',
+    '완전한 답변을 기다리는 대신 스트리밍으로 바꾸는 편이 낫습니다.',
+    'The client keeps waiting for the complete response before rendering.',
+  ]) {
+    assert.equal(matchInterrupt(prose), null, prose);
+  }
+});
+
+test('matchInterrupt: 걸린 문구를 그대로 돌려준다 (오탐 진단의 유일한 근거)', () => {
+  const hit = matchInterrupt('앞부분 blah Connection Interrupted 뒷부분');
+  assert.equal(hit, 'Connection Interrupted'); // 원문 대소문자 그대로
 });
