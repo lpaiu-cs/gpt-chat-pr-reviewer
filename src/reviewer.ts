@@ -39,6 +39,7 @@ import {
   type ResponseMeta,
 } from './cache.js';
 import { progress } from './progress.js';
+import { chatgptProjectId } from './config.js';
 
 async function addReactionToPullRequest(ctx: PRContext, content: PullRequestReaction): Promise<void> {
   try {
@@ -504,7 +505,7 @@ export function syncPRFromProbe(cfg: AppConfig, ctx: PRContext, probe: PRProbe):
  */
 export type ConversationPlan =
   | { action: 'resume'; url: string; turnsUsed: number }
-  | { action: 'new'; reason: 'first' | 'rotate' | 'dry-run'; turnsUsed: number };
+  | { action: 'new'; reason: 'first' | 'rotate' | 'dry-run' | 'project-changed'; turnsUsed: number };
 
 /**
  * 저장된 대화를 이어 쓸지, 새로 열지 결정한다 (순수 함수).
@@ -527,6 +528,9 @@ export function planConversation(
 
   const url = ctx.conversationUrl;
   if (!url) return { action: 'new', reason: 'first', turnsUsed: 0 };
+  if (chatgptProjectId(cfg.chatgptProjectUrl ?? '') !== chatgptProjectId(url)) {
+    return { action: 'new', reason: 'project-changed', turnsUsed: 0 };
+  }
 
   // 회전 판정은 완료된 라운드가 아니라 실제 전송 횟수로 한다. 파싱·게시가 실패해
   // ctx.round 가 늘지 않아도 프롬프트와 응답은 이미 대화에 쌓였기 때문이다.
@@ -603,6 +607,9 @@ async function enterConversation(
     console.log(
       chalk.yellow(`  ⚠ 이전 대화를 열지 못했습니다 (${plan.url}) — 새 대화로 시작합니다.`),
     );
+    releaseConversation(ctx);
+  } else if (plan.reason === 'project-changed') {
+    console.log(chalk.dim('  ChatGPT 프로젝트 변경 — 지정한 위치에서 새 대화를 시작합니다.'));
     releaseConversation(ctx);
   } else if (plan.reason === 'rotate') {
     console.log(
