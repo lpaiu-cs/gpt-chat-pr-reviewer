@@ -92,13 +92,18 @@ npm run dev -- init
 | `maxTurnsPerConversation` | `10` | 한 ChatGPT 대화에서 보낼 최대 프롬프트 수 |
 | `headless` | `false` | Chrome 헤드리스 실행 |
 | `browserChannel` | `chrome` | Playwright 브라우저 채널 |
-| `chatgptProjectUrl` | 미지정 | 자동 리뷰 대화를 모을 ChatGPT 프로젝트 URL |
+| `chatgptProjectUrl` | setup에서 등록 | 실제 리뷰에 필수인 ChatGPT 프로젝트 URL |
 | `selectors` | — | ChatGPT UI 셀렉터 오버라이드 |
 | `promptTemplate` | — | 리뷰 프롬프트 템플릿 |
 
 ### 자동 리뷰 대화를 ChatGPT 프로젝트에 모으기
 
-ChatGPT에서 리뷰 전용 프로젝트를 만든 뒤, 프로젝트 페이지 주소를 `pr-review.config.json`에 지정합니다.
+`npm run dev -- setup`은 로그인 후 리뷰 전용 프로젝트 생성과 URL 입력을 안내합니다.
+접근 확인을 마친 URL만 `pr-review.config.json`에 저장합니다. 이미 로그인되어 있어도 이 단계를 거칩니다.
+기존 URL은 Enter로 유지하거나 새 URL로 바꿀 수 있습니다. 비대화형 실행에서는
+`setup --project-url <URL>` 또는 저장된 프로젝트 URL이 필요합니다.
+
+직접 설정할 경우 다음 형식을 사용합니다.
 
 ```json
 {
@@ -114,9 +119,9 @@ npm run dev -- stop
 node scripts/daemon.mjs ensure
 ```
 
-새 대화와 회전된 대화는 지정한 프로젝트에서 시작하며, 같은 프로젝트의 PR 대화는 기존대로 이어 씁니다. 프로젝트를 변경하거나 설정을 지우면 다음 전송은 새 위치에서 시작합니다. 프로젝트 접근 실패나 일반 대화로의 리다이렉트는 오류로 처리하며 프로젝트 밖으로 대신 전송하지 않습니다.
+새 대화와 회전된 대화는 지정한 프로젝트에서 시작하며, 같은 프로젝트의 PR 대화는 기존대로 이어 씁니다. 프로젝트를 변경하면 다음 전송은 새 위치에서 시작합니다. 프로젝트 접근 실패나 일반 대화로의 리다이렉트는 오류로 처리하며 프로젝트 밖으로 대신 전송하지 않습니다.
 
-기존 대화를 자동 이동하거나 삭제하지는 않습니다. 새 설정은 이후 생성·전송에 적용됩니다. 프로젝트 URL을 지우거나 빈 문자열로 두면 일반 대화 방식으로 돌아갑니다. 자동화 Chrome 프로필의 계정에도 해당 프로젝트 접근 권한이 있어야 합니다.
+기존 대화를 자동 이동하거나 삭제하지는 않습니다. 새 설정은 이후 생성·전송에 적용됩니다. 프로젝트 URL이 없거나 빈 문자열이면 실제 리뷰는 실행하지 않고 setup을 안내합니다. 관측 전용 `watch --observe`와 설정 조회는 프로젝트 없이 사용할 수 있습니다. 자동화 Chrome 프로필의 계정에도 해당 프로젝트 접근 권한이 있어야 합니다.
 
 [ChatGPT 프로젝트 안내](https://learn.chatgpt.com/docs/projects)에 따라 프로젝트의 지침과 자료도 대화에 적용됩니다. 리뷰 전용으로 사용할 지침·자료만 넣어 두세요. 실제 프로젝트 UI의 입력창이나 URL 형식이 바뀌면 드라이버 업데이트가 필요할 수 있습니다.
 

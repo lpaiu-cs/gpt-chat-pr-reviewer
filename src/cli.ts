@@ -18,10 +18,11 @@
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { createInterface } from 'node:readline/promises';
 import { Command } from 'commander';
 import chalk from 'chalk';
 
-import { loadConfig, initConfig, ensureDataDir, patchConfigFile } from './config.js';
+import { loadConfig, initConfig, ensureDataDir, patchConfigFile, requireProjectUrl } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
 import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage, pollDelay } from './github.js';
 import {
@@ -93,6 +94,7 @@ async function withDriver(
   cfg: AppConfig,
   fn: (driver: ChatGPTDriver) => Promise<void>,
 ): Promise<void> {
+  requireProjectUrl(cfg.chatgptProjectUrl);
   const driver = new ChatGPTDriver(cfg);
   try {
     await driver.launch();
@@ -270,26 +272,54 @@ const program = new Command()
 
 program
   .command('setup')
-  .description('ChatGPT 최초 로그인 — 브라우저를 열어 수동 로그인')
-  .action(async () => {
+  .description('ChatGPT 로그인 및 리뷰 전용 프로젝트 생성·URL 등록')
+  .option('--project-url <url>', '리뷰 전용 ChatGPT 프로젝트 URL (터미널 입력 없이 등록)')
+  .action(async (opts: { projectUrl?: string }) => {
     banner();
     const cfg = loadConfig();
-    const driver = new ChatGPTDriver(cfg);
-
-    console.log(chalk.dim('  브라우저 프로필 경로:'), cfg.browserProfileDir);
-    await driver.launch();
-    await driver.navigateToChatGPT();
-
-    const existing = await driver.getSessionUser();
-    if (existing) {
-      console.log(chalk.green(`  ✓ 이미 로그인되어 있습니다 — ${existing.email ?? existing.name}`));
-    } else {
-      await driver.waitForManualLogin();
+    if (opts.projectUrl !== undefined) cfg.chatgptProjectUrl = requireProjectUrl(opts.projectUrl.trim());
+    if (!process.stdin.isTTY && !cfg.chatgptProjectUrl) {
+      throw new Error('터미널에서 setup을 실행해 프로젝트를 생성하고 URL을 입력하세요. URL을 이미 알면 setup --project-url <url>을 사용하세요.');
     }
+    const release = await lockOrExplain(cfg, 'setup');
+    if (!release) return;
+    const driver = new ChatGPTDriver(cfg);
+    try {
+      console.log(chalk.dim('  브라우저 프로필 경로:'), cfg.browserProfileDir);
+      await driver.launch();
+      await driver.navigateToChatGPT();
 
-    console.log(chalk.green('\n  ✓ 설정 완료 — 브라우저 프로필이 저장되었습니다.'));
-    console.log(chalk.dim('    이후 review / watch 명령에서 자동으로 이 세션을 재사용합니다.\n'));
-    await driver.close();
+      const existing = await driver.getSessionUser();
+      if (existing) {
+        console.log(chalk.green(`  ✓ 이미 로그인되어 있습니다 — ${existing.email ?? existing.name}`));
+      } else {
+        await driver.waitForManualLogin();
+      }
+
+      console.log(chalk.cyan('\n  리뷰 전용 프로젝트 설정'));
+      console.log('  1. 열린 ChatGPT의 사이드바에서 새 프로젝트를 만들거나 기존 리뷰 전용 프로젝트를 여세요.');
+      console.log('  2. 예: "PR 자동 리뷰" — 프로젝트 페이지의 URL을 복사하세요.');
+      console.log('  3. 아래에 URL을 입력하면 이후 자동 리뷰 대화가 해당 프로젝트에 모입니다.');
+      if (process.stdin.isTTY && opts.projectUrl === undefined) {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          for (;;) {
+            const previous = cfg.chatgptProjectUrl;
+            const answer = await rl.question(previous ? `  프로젝트 URL [Enter: ${previous}]: ` : '  프로젝트 URL: ');
+            try { cfg.chatgptProjectUrl = requireProjectUrl(answer.trim() || previous); break; }
+            catch (e) { console.log(chalk.yellow(`  ${e instanceof Error ? e.message : String(e)}`)); }
+          }
+        } finally { rl.close(); }
+      }
+      // 접근 확인이 끝나야 설정 완료다. 로그인만 됐거나 잘못된 URL이면 저장하지 않는다.
+      await driver.startNewChat();
+      patchConfigFile({ chatgptProjectUrl: cfg.chatgptProjectUrl });
+      console.log(chalk.green('\n  ✓ 설정 완료 — 로그인 프로필과 리뷰 전용 프로젝트 URL을 저장했습니다.'));
+      console.log(chalk.dim('    이후 review / watch 명령에서 자동으로 이 세션을 재사용합니다.\n'));
+    } finally {
+      await driver.close();
+      release();
+    }
   });
 
 // ── whoami ──
@@ -311,7 +341,9 @@ program
 
       if (user) {
         console.log(chalk.green(`  ✓ 로그인됨 — ${user.email ?? user.name}`));
-        console.log(chalk.dim('    review / watch 를 실행할 수 있습니다.\n'));
+        console.log(chalk.dim(cfg.chatgptProjectUrl
+          ? `    리뷰 프로젝트: ${cfg.chatgptProjectUrl}\n`
+          : '    프로젝트 설정이 필요합니다. npm run dev -- setup 을 실행하세요.\n'));
       } else {
         console.log(chalk.red('  ✗ 로그아웃 상태입니다 (익명 세션).'));
         console.log(chalk.dim('    이 상태로는 비공개 레포를 읽을 수 없습니다.'));
@@ -334,7 +366,7 @@ program
     const instrPath = ensureInstructionsFile(cfg);
     console.log(chalk.green(`  ✓ ${configPath} 생성 완료`));
     console.log(chalk.green(`  ✓ ${instrPath} 생성 완료 (맞춤 리뷰 지침)`));
-    console.log(chalk.dim('    watch.include 에 감시 범위를 추가한 뒤 watch 를 실행하세요.'));
+    console.log(chalk.dim('    setup으로 로그인·프로젝트 URL 등록 후 watch.include 에 감시 범위를 추가하세요.'));
     console.log(chalk.dim('      예: "include": ["myorg/*"]  또는  ["owner/repo"]\n'));
   });
 
@@ -459,6 +491,7 @@ program
   }) => {
     banner();
     const cfg = loadConfig();
+    if (!opts.observe) requireProjectUrl(cfg.chatgptProjectUrl);
     if (opts.headless) cfg.headless = true;
     ensureDataDir(cfg);
 

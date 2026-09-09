@@ -4,6 +4,11 @@ import { planConversation } from '../src/reviewer.js';
 import { loadConfig } from '../src/config.js';
 import { chatgptProjectId, validateProjectUrl } from '../src/config.js';
 import { ChatGPTDriver } from '../src/chatgpt.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import type { AppConfig, PRContext } from '../src/types.js';
 
 /**
@@ -107,4 +112,28 @@ test('프로젝트 새 대화는 지정 URL로 진입하며 루트 리다이렉�
   assert.equal(destination, PROJECT);
   actual = 'https://chatgpt.com';
   await assert.rejects(driver.startNewChat(), /프로젝트에 진입/);
+});
+
+test('설정 없는 최초 실행은 프로젝트 등록을 안내하고 실제 리뷰를 시작하지 않는다', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'project-setup-'));
+  const cli = fileURLToPath(new globalThis.URL('../src/cli.ts', import.meta.url));
+  const tsx = new globalThis.URL('../node_modules/tsx/dist/loader.mjs', import.meta.url).href;
+  try {
+    for (const args of [['setup'], ['setup', '--project-url', 'https://example.com'], ['watch', '--once']]) {
+      const run = spawnSync(process.execPath, ['--import', tsx, cli, ...args], {
+        cwd: dir, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+      });
+      assert.equal(run.status, 1, run.stderr);
+      assert.match(run.stdout + run.stderr, /프로젝트|project-url/);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('프로젝트가 빠진 드라이버도 일반 채팅으로 폴백하지 않는다', async () => {
+  const driver = new ChatGPTDriver(cfg()) as any;
+  let navigated = false;
+  driver.page = { goto: async () => { navigated = true; } };
+  await assert.rejects(driver.startNewChat(), /setup/);
+  assert.equal(navigated, false);
+  assert.throws(() => driver.assertProjectPage({ url: () => 'https://chatgpt.com/c/123' }), /setup/);
 });

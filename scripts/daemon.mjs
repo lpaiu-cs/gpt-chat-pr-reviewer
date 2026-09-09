@@ -346,7 +346,7 @@ async function ensure({ start = false, requireReady = false } = {}) {
           `  로그 마지막 부분 (${path.join(dataDir(), 'watch.log')}):\n` +
           `${logTail()}\n` +
           `  감시 범위가 비어 있으면 ${ROOT}/pr-review.config.json 의 watch.include 를,\n` +
-          `  ChatGPT 로그인이 만료됐으면 ${ROOT} 에서 \`npm run setup\` 을 실행해야 합니다.`,
+          `  로그인 또는 리뷰 프로젝트 설정이 필요하면 ${ROOT} 에서 \`npm run setup\` 을 실행하세요.`,
       );
     }
 
@@ -457,7 +457,7 @@ async function fetchState(ui) {
     // 로그인 실패 등으로 데몬이 내려갔을 수 있다 — 조용히 기다리면 안 된다.
     die(
       `데몬과의 연결이 끊겼습니다. 로그를 확인하세요: ${path.join(dataDir(), 'watch.log')}\n` +
-        `(ChatGPT 로그인이 만료됐다면 ${ROOT} 에서 \`npm run setup\`)`,
+        `(로그인·리뷰 프로젝트 설정은 ${ROOT} 에서 \`npm run setup\`)`,
     );
   }
 }

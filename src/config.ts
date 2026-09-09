@@ -113,6 +113,13 @@ export function validateProjectUrl(raw: unknown): void {
   }
 }
 
+/** 로그인·관측은 설정 전에도 가능하지만 실제 리뷰는 프로젝트가 필요하다. */
+export function requireProjectUrl(raw: unknown): string {
+  if (!raw) throw new Error('리뷰 전용 ChatGPT 프로젝트가 필요합니다. npm run dev -- setup 으로 로그인하고 프로젝트를 생성한 뒤 URL을 입력하세요.');
+  validateProjectUrl(raw);
+  return raw as string;
+}
+
 export function loadConfig(configPath?: string): AppConfig {
   const file = configPath ?? CONFIG_FILE;
   if (existsSync(file)) {
@@ -174,6 +181,7 @@ export function initConfig(configPath?: string): string {
     browserProfileDir: DEFAULT_CONFIG.browserProfileDir,
     headless: false,
     browserChannel: 'chrome',
+    chatgptProjectUrl: '', // setup에서 로그인 후 프로젝트를 생성하고 URL을 입력한다
     customInstructionsFile: DEFAULT_CONFIG.customInstructionsFile,
     quotaCooldownMs: DEFAULT_CONFIG.quotaCooldownMs,
     maxTurnsPerConversation: DEFAULT_CONFIG.maxTurnsPerConversation,

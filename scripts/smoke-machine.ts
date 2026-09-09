@@ -427,7 +427,7 @@ const fakePR: PRInfo = {
 // ── 시나리오 12: 대화 세션 유지·회전·해제 ──────────────────
 
 {
-  const cfg = { ...loadConfig(), maxTurnsPerConversation: 3 };
+  const cfg = { ...loadConfig('tests/__no-such-config__.json'), maxTurnsPerConversation: 3 };
   const CONV = 'https://chatgpt.com/c/68c1f0aa-1111-2222-3333-444455556666';
 
   // 1차는 대화가 없으니 새로 연다

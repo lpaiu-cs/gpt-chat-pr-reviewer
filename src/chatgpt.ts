@@ -9,7 +9,7 @@ import { chromium, type BrowserContext, type Locator, type Page } from 'playwrig
 import chalk from 'chalk';
 import { progress } from './progress.js';
 import type { AppConfig } from './types.js';
-import { chatgptProjectId, validateProjectUrl } from './config.js';
+import { chatgptProjectId, validateProjectUrl, requireProjectUrl } from './config.js';
 
 /** ChatGPT 사용량 한도 도달 — 상태 머신의 QUOTA_EXCEEDED 이벤트로 매핑된다. */
 export class QuotaLimitError extends Error {
@@ -730,11 +730,11 @@ export class ChatGPTDriver {
 
   // ── 대화 ──────────────────────────────────────────────────
 
-  /** 새 대화 시작. 프로젝트를 지정했으면 그 안에서만 생성한다. */
+  /** 새 대화는 설정한 리뷰 전용 프로젝트 안에서만 생성한다. */
   async startNewChat(): Promise<void> {
     const p = this.requirePage();
-    validateProjectUrl(this.cfg.chatgptProjectUrl);
-    await p.goto(this.cfg.chatgptProjectUrl || this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const project = requireProjectUrl(this.cfg.chatgptProjectUrl);
+    await p.goto(project, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
     // 새 대화 진입 시 뜨는 안내 모달을 닫고, 하이드레이션이 끝날 여유를 준다
     await p.keyboard.press('Escape').catch(() => {});
@@ -744,8 +744,8 @@ export class ChatGPTDriver {
 
   /** 프로젝트 접근 실패·일반 대화로의 리다이렉트 시 밖에 전송하지 않는다. */
   private assertProjectPage(page: Page): void {
-    const project = this.cfg.chatgptProjectUrl;
-    if (project && chatgptProjectId(page.url()) !== chatgptProjectId(project)) {
+    const project = requireProjectUrl(this.cfg.chatgptProjectUrl);
+    if (chatgptProjectId(page.url()) !== chatgptProjectId(project)) {
       throw new Error('지정한 ChatGPT 프로젝트에 진입하지 못했습니다 — 프로젝트 접근 권한과 URL을 확인하세요.');
     }
   }
