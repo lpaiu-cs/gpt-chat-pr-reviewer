@@ -1108,12 +1108,10 @@ export class ChatGPTDriver {
       /* JS 포커스로 진행 */
     }
 
-    const focused = await page.evaluate((selector: string) => {
-      const el = document.querySelector(selector) as HTMLElement | null;
-      if (!el) return false;
-      el.focus();
+    const focused = await input.evaluate((el) => {
+      (el as HTMLElement).focus();
       return document.activeElement === el || el.contains(document.activeElement);
-    }, sel.textInput);
+    });
 
     if (!focused) {
       throw new Error('프롬프트 입력창에 포커스할 수 없습니다 — 브라우저 화면 상태를 확인하세요');
@@ -1128,26 +1126,30 @@ export class ChatGPTDriver {
 
     // ProseMirror의 paste 트랜잭션을 사용한다. 다중 줄 CDP insertText는
     // Chromium에서 줄마다 레이아웃을 재계산해 renderer를 수분간 붙잡을 수 있다.
-    await this.inputStep('붙여넣기', () => page.evaluate(
-      ({ selector, t }: { selector: string; t: string }) => {
-        const el = document.querySelector(selector) as HTMLElement | null;
-        if (!el) return false;
-        el.focus();
+    const input = page.locator(this.cfg.selectors.textInput).first();
+    // ChatGPT는 한 번에 10,000자를 넘게 붙이면 첨부로 전환한다.
+    // 코드 포인트 단위로 나누어 surrogate pair도 보존한다.
+    const chars = Array.from(text.replace(/\r\n/g, '\n'));
+    for (let at = 0; at < chars.length; at += 4000) {
+      await this.inputStep('붙여넣기', () => input.evaluate(
+      (el, t: string) => {
+        (el as HTMLElement).focus();
         const dt = new DataTransfer();
         dt.setData('text/plain', t);
         // PM의 plain-text paste는 연속 개행을 문단 하나로 합친다. 자체 clipboard
         // 형식으로 공백 보존을 요청하고, 개행은 hard break로 전달한다.
         const escaped = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        dt.setData('text/html', `<p data-pm-slice="0 0 []">${escaped.replace(/\r?\n/g, '<br>')}</p>`);
+        // PM이 마지막 BR을 표시용으로 버리므로 실제 마지막 개행과 구분한다.
+        dt.setData('text/html', `<p data-pm-slice="1 1 []">${escaped.replace(/\r?\n/g, '<br>')}<br></p>`);
         el.dispatchEvent(
           new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
         );
       },
-      { selector: this.cfg.selectors.textInput, t: text },
+      chars.slice(at, at + 4000).join(''),
     ));
+    }
     // 처리된 paste는 preventDefault로 false를 반환할 수 있다. 이벤트 반환값이
     // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
-    const input = page.locator(this.cfg.selectors.textInput).first();
     const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n$/, '');
     const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
     if (await this.inputStep('붙여넣기 검증', matches)) return;
@@ -1169,8 +1171,9 @@ export class ChatGPTDriver {
       'button[aria-label*="보내기"]',
     ])];
     // 동일 버튼을 셀렉터마다 다시 기다리지 않는다. 중지 버튼은 명시적으로 제외한다.
-    const selector = candidates.map(c => `:is(${c}):visible:not(:disabled):not([data-testid="stop-button"]):not([aria-label*="Stop"])`).join(',');
-    await page.locator(selector).first().click({ timeout: 10_000 });
+    const buttons = candidates.map(c => page.locator(c)).reduce((all, next) => all.or(next));
+    const enabledSend = page.locator(':visible:not(:disabled):not([data-testid="stop-button"]):not([aria-label*="Stop"])');
+    await buttons.and(enabledSend).first().click({ timeout: 10_000 });
   }
 
   /**

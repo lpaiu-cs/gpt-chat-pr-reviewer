@@ -35,6 +35,12 @@
 
 ## 실제 적용 후 확인
 
+### PR #36 1차 리뷰 후 보완
+
+[OpenAI 릴리스 노트](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)의 2026-08-04 항목에서 10k자 초과 paste의 첨부 전환을 확인했다. 한 번의 이벤트를 4,000코드포인트(UTF-16 최대 8,000자)로 제한하고, CRLF 정규화 후 나누어 이모지와 개행 경계를 보존한다. 열린 clipboard slice와 표시용 마지막 BR을 사용해 조각 사이 문단 추가·개행 손실을 막는다. 최종 전체 내용 검증은 유지한다.
+
+설정된 셀렉터는 Locator.evaluate / or / and로 처리해 CSS 외의 Playwright 셀렉터 문법을 유지한다. 격리 Chrome + ProseMirror에 10k 초과 paste를 가로채는 핸들러를 추가한 실험에서 동일 91,203자 입력 523ms, 내부 문서 원문 일치를 확인했다. `#prompt-textarea:visible`, `css=...`, XPath 전송 버튼 및 중지 버튼 제외도 통과했다. 회귀 테스트 92/92와 build 통과. 실제 로그인 서비스 검증은 여전히 남아 있다.
+
 1. focus / insert 또는 paste / 내용 검증 / click / 전송 확인의 시작·종료 시간을 구분한다. 길이·줄 수와 page crash 이벤트도 기록한다.
 2. 진행 중 생성이나 공유 브라우저를 끊지 않는다. 별도 테스트 환경에서 같은 크기의 입력으로 paste와 insertText를 비교한다.
 3. paste는 반환값이 아닌 전체 입력 내용으로 검증한다. 대량 글자별 타이핑 제거와 버튼 대기 예산 통합을 우선 검토한다.
