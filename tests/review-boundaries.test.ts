@@ -18,13 +18,13 @@ const pr = { owner: 'o', repo: 'r', number: 1, url: 'https://github.com/o/r/pull
 
 async function fixture(fn: (f: {
   cfg: AppConfig; ctx: PRContext; driver: ChatGPTDriver; posts: any[];
-  controls: { failSync: boolean; losePostResponse: boolean; wrongTarget: boolean; prompts: string[] };
+  controls: { failSync: boolean; losePostResponse: boolean; wrongTarget: boolean; rejectPost: boolean; prompts: string[] };
 }) => Promise<void>) {
   const dir = fs.mkdtempSync(path.join(tmpdir(), 'review-boundary-'));
   const cfg = { ...loadConfig(path.join(dir, 'absent.json')), dataDir: dir, customInstructionsFile: path.join(dir, 'instructions.md') };
   const ctx = createContext(pr);
   const posts: any[] = [];
-  const controls = { failSync: false, losePostResponse: false, wrongTarget: false, prompts: [] as string[] };
+  const controls = { failSync: false, losePostResponse: false, wrongTarget: false, rejectPost: false, prompts: [] as string[] };
   const original = cp.execFile;
   const respond = (file: string, args: string[], opts: any) => {
     assert.equal(file, 'gh');
@@ -34,6 +34,10 @@ async function fixture(fn: (f: {
     if (args[1]?.includes('/compare/')) return args.includes('-q') ? base : diff;
     if (args[1]?.includes('/reviews?')) return JSON.stringify([posts]);
     if (args[1]?.endsWith('/reviews')) {
+      if (controls.rejectPost) throw Object.assign(new Error('Validation Failed'), {
+        stdout: JSON.stringify({ status: '422', message: 'Validation Failed', errors: ['body is too long'] }),
+        stderr: 'gh: Validation Failed (HTTP 422)',
+      });
       const payload = JSON.parse(opts.input);
       const posted = { ...payload, id: posts.length + 1, state: payload.event };
       posts.push(posted);
@@ -56,7 +60,7 @@ async function fixture(fn: (f: {
   cp.execFile = ((file: string, args: string[], opts: any, callback: any) => ({
     stdin: { on() {}, end(input: string) { setImmediate(() => {
       try { callback(null, respond(file, args, { ...opts, input }), ''); }
-      catch (error) { callback(error, '', ''); }
+      catch (error) { callback(error, (error as any).stdout ?? '', (error as any).stderr ?? ''); }
     }); } },
   })) as any;
   syncBuiltinESMExports();
@@ -110,6 +114,21 @@ test('서버 저장 후 응답 유실: 재시작해도 새 질문과 중복 POST
   assert.equal(f.controls.prompts.length, 1);
   assert.equal(restored.pendingReview, undefined);
   assert.equal(restored.requestedCount, 1);
+}));
+
+test('확정된 POST 검증 거부는 저장된 payload를 버리고 새 응답으로 복구한다', async () => fixture(async f => {
+  f.controls.rejectPost = true;
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  const restored = loadContext(f.cfg, 'o', 'r', 1)!;
+  assert.equal(restored.pendingReview, undefined);
+  assert.equal(f.posts.length, 0);
+  f.controls.rejectPost = false;
+  applySyncEvents(f.cfg, restored, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  // 이전 대화 복귀는 이 검증의 대상이 아니다.
+  delete restored.conversationUrl;
+  assert.equal(await runRound(f.cfg, f.driver, restored), 'posted');
+  assert.equal(f.controls.prompts.length, 2);
+  assert.equal(f.posts.length, 1);
 }));
 
 test('잘못된 판정/코멘트는 전체 리뷰를 거부한다', () => {

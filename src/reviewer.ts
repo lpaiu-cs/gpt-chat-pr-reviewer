@@ -26,6 +26,7 @@ import {
   fetchMergeCommit,
   fetchMergeBase,
   fetchDiffAt,
+  ReviewValidationError,
 } from './github.js';
 import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
@@ -1279,6 +1280,9 @@ export async function runRound(
     const timedOut = e instanceof ResponseTimeoutError;
     const raw = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 280);
     const msg = timedOut ? `타임아웃 — ${raw}` : raw;
+    // 검증 거부는 리뷰가 생성되지 않았다. 다음 시도는 새 응답/수정 캐시를 받는다.
+    // 응답 유실·타임아웃·조회 실패는 기존 UUID를 유지한다.
+    if (e instanceof ReviewValidationError) delete ctx.pendingReview;
     fire(ctx, 'REVIEW_FAILED', { note: msg, patch: { lastError: msg } });
     saveContext(cfg, ctx);
     await removeReactionFromPullRequest(ctx, 'eyes');

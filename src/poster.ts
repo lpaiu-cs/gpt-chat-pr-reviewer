@@ -313,6 +313,6 @@ export async function postReviewToGitHub(
       console.log(chalk.green('  ✓ 리뷰 게시 완료 (COMMENT 로 하향)'));
       return outcome(posted.id, 0, kept.length);
     }
-    throw new Error(`리뷰 게시 실패: ${msg}`);
+    throw err; // 확정 거부와 성공 여부 미확정의 구분을 호출부까지 보존한다.
   }
 }

@@ -817,11 +817,26 @@ export async function findPublishedReview(owner: string, repo: string, number: n
     r.body.includes(`<!-- gpt-chat-pr-reviewer:${key}:`)) ?? null;
 }
 
+/** POST가 검증 단계에서 거부됐음이 확인된 경우에만 사용한다. */
+export class ReviewValidationError extends Error {}
+
 async function submitReview(owner: string, repo: string, number: number, payload: string): Promise<PublishedReview> {
-  const result = JSON.parse(await gh(
+  let raw: string;
+  try {
+    raw = await gh(
     ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
     { input: payload },
-  ));
+    );
+  } catch (e) {
+    const err = e as { stdout?: string; stderr?: string };
+    let status: unknown;
+    try { status = JSON.parse(err.stdout ?? '').status; } catch { /* 상태 미확인 */ }
+    if ([413, 422].includes(Number(status)) || /\(HTTP (413|422)\)/.test(err.stderr ?? '')) {
+      throw new ReviewValidationError(ghErrorMessage(e), { cause: e });
+    }
+    throw e;
+  }
+  const result = JSON.parse(raw);
   if (!Number.isSafeInteger(result.id) || result.id <= 0) throw new Error('게시 결과의 review ID를 확인하지 못했습니다');
   return result;
 }
