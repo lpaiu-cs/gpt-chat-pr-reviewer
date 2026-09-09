@@ -4,15 +4,15 @@
  * PR 정보 조회, diff 파싱, 리뷰 게시, GraphQL 스레드 동기화를 담당한다.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import chalk from 'chalk';
 import type { PRInfo, DiffHunk, ReviewComment } from './types.js';
 
 // ── PR 식별 ─────────────────────────────────────────────────
 
 /** 현재 디렉터리가 속한 레포의 'owner/repo' 슬러그. */
-export function currentRepoSlug(): string {
-  return gh(['repo', 'view', '--json', 'owner,name', '-q', '.owner.login+"/"+.name']).trim();
+export async function currentRepoSlug(): Promise<string> {
+  return (await gh(['repo', 'view', '--json', 'owner,name', '-q', '.owner.login+"/"+.name'])).trim();
 }
 
 /**
@@ -23,10 +23,10 @@ export function currentRepoSlug(): string {
  * 조회를 섞으면 이 함수를 테스트할 수 없으므로 해석기를 주입받는다 —
  * 기본값이 실제 gh 호출이고, 호출부는 건드리지 않는다.
  */
-export function parsePRInput(
+export async function parsePRInput(
   input: string,
-  resolveCurrentRepo: () => string = currentRepoSlug,
-): { owner: string; repo: string; number: number } {
+  resolveCurrentRepo: () => string | Promise<string> = currentRepoSlug,
+): Promise<{ owner: string; repo: string; number: number }> {
   // https://github.com/owner/repo/pull/123
   const urlRe = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/;
   const urlMatch = input.match(urlRe);
@@ -39,7 +39,7 @@ export function parsePRInput(
 
   // 단순 숫자 (현재 디렉터리가 gh repo 일 때)
   if (/^\d+$/.test(input.trim())) {
-    const [owner, repo] = resolveCurrentRepo().split('/');
+    const [owner, repo] = (await resolveCurrentRepo()).split('/');
     return { owner, repo, number: +input.trim() };
   }
 
@@ -55,26 +55,29 @@ export function parsePRInput(
  * 198개 ≈ 분당 8개). `windowsHide` 는 execSync 에서 먹지 않는다 — 숨겨야 할 대상이
  * gh 가 아니라 그 앞의 셸이기 때문이다.
  *
- * 그래서 셸을 아예 거치지 않고 execFileSync 로 직접 띄운다. 호출부마다 플래그를
+ * 그래서 셸을 아예 거치지 않고 execFile 로 비동기 실행해 직접 띄운다. 호출부마다 플래그를
  * 붙이는 방식은 쓰지 않았다 — opt-in 이면 새 호출부가 생길 때마다 재발한다.
  *
  * **인자는 배열로 넘긴다.** 셸이 없으므로 인용부호를 우리가 쓰면 안 된다.
  * 셸에서 `-q ".owner.login"` 이던 것은 `['-q', '.owner.login']` 이 되고, 따옴표를
  * 그대로 남기면 gh 가 그 문자까지 값으로 받는다.
  */
-function gh(
+export async function gh(
   argv: string[],
-  opts: { input?: string; maxBuffer?: number; captureStderr?: boolean } = {},
-): string {
+  opts: { input?: string; maxBuffer?: number; captureStderr?: boolean; timeoutMs?: number } = {},
+): Promise<string> {
   try {
-    return execFileSync('gh', argv, {
-      encoding: 'utf-8',
-      windowsHide: true,
-      input: opts.input,
-      maxBuffer: opts.maxBuffer,
-      // stderr 를 캡처할지. 기본은 부모로 흘려보내지만, 10초 주기로 도는 경로에서는
-      // 부분 실패 메시지가 그대로 쏟아져 로그를 못 쓰게 만든다.
-      stdio: opts.captureStderr ? ['pipe', 'pipe', 'pipe'] : undefined,
+    return await new Promise<string>((resolve, reject) => {
+      const child = execFile('gh', argv, {
+        encoding: 'utf-8', windowsHide: true, timeout: opts.timeoutMs ?? 60_000,
+        maxBuffer: opts.maxBuffer ?? 10 * 1024 * 1024,
+      }, (error, stdout, stderr) => {
+        if (error) reject(Object.assign(error, { stdout, stderr }));
+        else resolve(stdout);
+      });
+      // EPIPE는 자식이 먼저 종료한 경우다. 실제 성공/실패는 종료 콜백이 결정한다.
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(opts.input);
     });
   } catch (e) {
     // 셸을 거치지 않으므로 PATH 에 gh 실행 파일이 그대로 있어야 한다.
@@ -106,8 +109,8 @@ function toPRInfo(owner: string, repo: string, d: any): PRInfo {
   };
 }
 
-export function getPRInfo(owner: string, repo: string, number: number): PRInfo {
-  const raw = gh(['pr', 'view', String(number), '--repo', `${owner}/${repo}`, '--json', PR_JSON_FIELDS]);
+export async function getPRInfo(owner: string, repo: string, number: number): Promise<PRInfo> {
+  const raw = await gh(['pr', 'view', String(number), '--repo', `${owner}/${repo}`, '--json', PR_JSON_FIELDS]);
   return toPRInfo(owner, repo, JSON.parse(raw));
 }
 
@@ -115,6 +118,7 @@ export function getPRInfo(owner: string, repo: string, number: number): PRInfo {
 
 export interface SyncThread {
   id: string;
+  reviewId?: number;
   isResolved: boolean;
   path: string;
   line: number | null;
@@ -138,18 +142,20 @@ export interface PRSyncData {
   threads: SyncThread[];
 }
 
-const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
-  rateLimit{ cost remaining }
+const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!,$after:String){
+  rateLimit{ cost remaining resetAt }
   repository(owner:$owner,name:$name){
     pullRequest(number:$num){
       state
       headRefOid
       baseRefName
-      reviewThreads(first:100){
+      reviewThreads(first:100,after:$after){
+        pageInfo{hasNextPage endCursor}
         nodes{
           id isResolved path line originalLine
-          comments(first:50){
-            nodes{ author{ login } body isMinimized pullRequestReview{ isMinimized } }
+          comments(first:100){
+            pageInfo{hasNextPage endCursor}
+            nodes{ author{ login } body isMinimized pullRequestReview{ databaseId isMinimized } }
           }
         }
       }
@@ -157,19 +163,45 @@ const SYNC_QUERY = `query($owner:String!,$name:String!,$num:Int!){
   }
 }`;
 
-/** PR 의 현재 상태 + 리뷰 스레드를 한 번의 GraphQL 호출로 가져온다. */
-export function fetchPRSyncData(owner: string, repo: string, number: number): PRSyncData {
+/** PR의 현재 상태와 모든 리뷰 스레드/답글 페이지를 가져온다. */
+export async function fetchPRSyncData(owner: string, repo: string, number: number): Promise<PRSyncData> {
   // -F (대문자) 만 @- stdin 확장을 지원한다. -f 는 "@-" 를 문자열 그대로 보낸다.
-  const { data } = graphQLTolerant(
-    ['-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `num=${number}`],
-    SYNC_QUERY,
-  );
-  const pr = data.repository.pullRequest;
+  let pr: any;
+  let cursor: string | null = null;
+  const nodes: any[] = [];
+  do {
+    const { data, errors } = await graphQLTolerant(
+      ['-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `num=${number}`,
+        ...(cursor ? ['-f', `after=${cursor}`] : [])], SYNC_QUERY);
+    if (errors?.length) throw new Error('리뷰 스레드 전체 조회 실패');
+    const next = data.repository.pullRequest;
+    if (pr && (pr.headRefOid !== next.headRefOid || pr.baseRefName !== next.baseRefName || pr.state !== next.state)) {
+      throw new Error('페이지 조회 중 PR 대상이 변경됐습니다 — 다음 스캔에서 재조회합니다');
+    }
+    pr = next;
+    nodes.push(...pr.reviewThreads.nodes);
+    cursor = nextCursor(pr.reviewThreads, cursor);
+  } while (cursor);
+  for (const node of nodes) {
+    let comments = node.comments;
+    let after = nextCursor(comments, null);
+    while (after) {
+      const { data, errors } = await graphQLTolerant(['-f', `id=${node.id}`, '-f', `after=${after}`],
+        `query($id:ID!,$after:String!){rateLimit{cost remaining resetAt} node(id:$id){... on PullRequestReviewThread{
+          comments(first:100,after:$after){pageInfo{hasNextPage endCursor}
+            nodes{author{login} body isMinimized pullRequestReview{databaseId isMinimized}}}
+        }}}`);
+      if (errors?.length || !data.node) throw new Error('리뷰 답글 전체 조회 실패');
+      comments = data.node.comments;
+      node.comments.nodes.push(...comments.nodes);
+      after = nextCursor(comments, after);
+    }
+  }
   return {
     status: pr.state,
     headSha: pr.headRefOid,
     baseRef: pr.baseRefName,
-    threads: (pr.reviewThreads?.nodes ?? []).map((n: any) => {
+    threads: nodes.map((n: any) => {
       const comments = (n.comments?.nodes ?? []).map((c: any) => ({
         author: c.author?.login ?? '',
         body: c.body ?? '',
@@ -178,6 +210,7 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
       }));
       return {
         id: n.id,
+        reviewId: n.comments?.nodes?.[0]?.pullRequestReview?.databaseId,
         isResolved: n.isResolved,
         path: n.path,
         line: n.line ?? n.originalLine ?? null,
@@ -187,6 +220,19 @@ export function fetchPRSyncData(owner: string, repo: string, number: number): PR
       };
     }),
   };
+}
+
+/** 불완전한 연결을 빈 목록으로 해석하지 않는다. */
+function nextCursor(connection: any, previous: string | null): string | null {
+  const info = connection?.pageInfo;
+  if (!Array.isArray(connection?.nodes) || typeof info?.hasNextPage !== 'boolean') {
+    throw new Error('페이지 완전성을 확인하지 못했습니다');
+  }
+  if (!info.hasNextPage) return null;
+  if (typeof info.endCursor !== 'string' || !info.endCursor || info.endCursor === previous) {
+    throw new Error('다음 페이지 커서가 유효하지 않습니다');
+  }
+  return info.endCursor;
 }
 
 /**
@@ -246,7 +292,7 @@ export interface RepoProbe {
  */
 export const THREAD_ALIAS_CHUNK = 20;
 
-/** 한 레포에서 1회에 조회하는 열린 PR 개수. 초과분은 totalCount 로 감지해 알린다. */
+/** 열린 PR 목록의 페이지 크기. 마지막 페이지까지 순서대로 조회한다. */
 export const PROBE_PAGE = 50;
 
 /**
@@ -266,17 +312,28 @@ const PROBE_PR_FIELDS = `number title url state updatedAt headRefOid baseRefName
 
 let graphqlSpent = 0;
 let graphqlRemaining = -1;
+let graphqlResetAt = 0;
 
-function recordUsage(rateLimit: { cost?: number; remaining?: number } | undefined): void {
+function recordUsage(rateLimit: { cost?: number; remaining?: number; resetAt?: string } | undefined): void {
   graphqlSpent += rateLimit?.cost ?? 1; // rateLimit 미조회 쿼리도 최소 1 로 센다
   if (typeof rateLimit?.remaining === 'number') graphqlRemaining = rateLimit.remaining;
+  const reset = Date.parse(rateLimit?.resetAt ?? '');
+  if (Number.isFinite(reset)) graphqlResetAt = reset;
 }
 
 /** 마지막 집계 이후의 GraphQL 소모량을 가져오고 카운터를 리셋한다. */
-export function takeGraphQLUsage(): { cost: number; remaining: number } {
-  const usage = { cost: graphqlSpent, remaining: graphqlRemaining };
+export function takeGraphQLUsage(): { cost: number; remaining: number; resetAt: number } {
+  const usage = { cost: graphqlSpent, remaining: graphqlRemaining, resetAt: graphqlResetAt };
   graphqlSpent = 0;
   return usage;
+}
+
+/** 한도가 갱신된 뒤까지 과거 잔여량을 근거로 잠들지 않는다. */
+export function pollDelay(base: number, cost: number, remaining: number, resetAt: number, now = Date.now()): number {
+  if (remaining < 0 || (resetAt > 0 && resetAt <= now)) return base;
+  const horizon = resetAt > now ? resetAt - now : 60_000;
+  const scaled = remaining <= 0 ? horizon : Math.ceil(Math.max(1, cost) * horizon / Math.max(1, remaining * 0.5));
+  return Math.max(base, Math.min(horizon, scaled));
 }
 
 /**
@@ -286,9 +343,9 @@ export function takeGraphQLUsage(): { cost: number; remaining: number } {
  * 함께 반환하고 gh 는 비정상 종료한다. 그대로 두면 오래된 컨텍스트 하나가 그
  * 레포의 스캔 전체를 죽인다. data 가 있으면 경고만 남기고 진행한다.
  */
-function graphQLTolerant(args: string[], query: string): { data: any; errors?: any[] } {
+async function graphQLTolerant(args: string[], query: string): Promise<{ data: any; errors?: any[] }> {
   try {
-    const raw = gh(['api', 'graphql', ...args, '-F', 'query=@-'], {
+    const raw = await gh(['api', 'graphql', ...args, '-F', 'query=@-'], {
       input: query,
       maxBuffer: 10 * 1024 * 1024,
       captureStderr: true,
@@ -323,7 +380,7 @@ function graphQLTolerant(args: string[], query: string): { data: any; errors?: a
  * 주의: PR.updatedAt 은 스레드 resolve 로 갱신되지 않는다(실측). 따라서
  * resolve 감지가 필요한 PR 은 반드시 threadsFor 에 포함시켜야 한다.
  */
-export function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []): RepoProbe {
+export async function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []): Promise<RepoProbe> {
   const [owner, repo] = ownerSlashRepo.split('/');
 
   // alias 를 청크로 나눈다. 첫 쿼리에만 PR 목록을 싣고, 나머지 청크는 스레드만.
@@ -333,26 +390,27 @@ export function fetchRepoProbe(ownerSlashRepo: string, threadsFor: number[] = []
   }
   if (chunks.length === 0) chunks.push([]);
 
-  const runQuery = (ids: number[], withList: boolean): any => {
+  const runQuery = async (ids: number[], withList: boolean, after: string | null = null): Promise<any> => {
     const aliases = ids
       .map(
         (n) =>
-          `    t${n}: pullRequest(number:${n}){ reviewThreads(first:100){ nodes{ id isResolved } } }`,
+          `    t${n}: pullRequest(number:${n}){ reviewThreads(first:100){ pageInfo{hasNextPage endCursor} nodes{ id isResolved } } }`,
       )
       .join('\n');
     const listPart = withList
-      ? `    prs: pullRequests(states:OPEN, first:${PROBE_PAGE}, orderBy:{field:UPDATED_AT,direction:DESC}){
-      totalCount
+      ? `    prs: pullRequests(states:OPEN, first:${PROBE_PAGE}, after:$after, orderBy:{field:UPDATED_AT,direction:DESC}){
+      totalCount pageInfo{hasNextPage endCursor}
       nodes{ ${PROBE_PR_FIELDS} }
     }\n`
       : '';
-    const query = `query($owner:String!,$name:String!){
-  rateLimit{ cost remaining }
+    const query = `query($owner:String!,$name:String!${withList ? ',$after:String' : ''}){
+  rateLimit{ cost remaining resetAt }
   repository(owner:$owner,name:$name){
 ${listPart}${aliases}
   }
 }`;
-    return graphQLTolerant(['-F', `owner=${owner}`, '-F', `name=${repo}`], query);
+    return await graphQLTolerant(['-F', `owner=${owner}`, '-F', `name=${repo}`,
+      ...(after ? ['-f', `after=${after}`] : [])], query);
   };
 
   let cost = 0;
@@ -360,8 +418,8 @@ ${listPart}${aliases}
   let prs: PRProbe[] = [];
   let totalOpen = 0;
 
-  chunks.forEach((ids, i) => {
-    const { data, errors } = runQuery(ids, i === 0);
+  for (const [i, ids] of chunks.entries()) {
+    const { data, errors } = await runQuery(ids, i === 0);
     if (errors?.length) {
       // 보통 추적 중이던 PR 이 사라진 경우. 나머지 결과는 그대로 쓴다.
       console.log(
@@ -374,7 +432,17 @@ ${listPart}${aliases}
 
     if (i === 0) {
       totalOpen = repoNode.prs?.totalCount ?? 0;
-      prs = (repoNode.prs?.nodes ?? []).map((n: any) => ({
+      const nodes = [...(repoNode.prs?.nodes ?? [])];
+      let after = nextCursor(repoNode.prs, null);
+      while (after) {
+        const page = await runQuery([], true, after);
+        if (page.errors?.length) throw new Error('열린 PR 페이지 조회 실패');
+        cost += page.data.rateLimit?.cost ?? 1;
+        remaining = page.data.rateLimit?.remaining ?? remaining;
+        nodes.push(...page.data.repository.prs.nodes);
+        after = nextCursor(page.data.repository.prs, after);
+      }
+      prs = [...new Map(nodes.map(n => [n.number, n])).values()].map((n: any) => ({
         ...toPRInfo(owner, repo, n),
         status: n.state,
         updatedAt: n.updatedAt,
@@ -390,12 +458,28 @@ ${listPart}${aliases}
       if (!node) continue;
       const target = prs.find((p) => p.number === n);
       if (!target) continue;
-      target.threads = (node.reviewThreads?.nodes ?? []).map((t: any) => ({
+      let connection = node.reviewThreads;
+      const states = [...connection.nodes];
+      let after = nextCursor(connection, null);
+      while (after) {
+        const { data, errors } = await graphQLTolerant(['-f', `owner=${owner}`, '-f', `name=${repo}`, '-F', `num=${n}`, '-f', `after=${after}`],
+          `query($owner:String!,$name:String!,$num:Int!,$after:String!){rateLimit{cost remaining resetAt}
+            repository(owner:$owner,name:$name){pullRequest(number:$num){reviewThreads(first:100,after:$after){
+              pageInfo{hasNextPage endCursor} nodes{id isResolved}
+            }}}}`);
+        if (errors?.length) throw new Error('probe 스레드 페이지 조회 실패');
+        cost += data.rateLimit?.cost ?? 1;
+        remaining = data.rateLimit?.remaining ?? remaining;
+        connection = data.repository.pullRequest.reviewThreads;
+        states.push(...connection.nodes);
+        after = nextCursor(connection, after);
+      }
+      target.threads = states.map((t: any) => ({
         id: t.id,
         isResolved: t.isResolved,
       }));
     }
-  });
+  }
 
   return { prs, totalOpen, truncated: totalOpen > prs.length, cost, remaining };
 }
@@ -422,7 +506,7 @@ export interface RepoSearchResult {
 const SEARCH_MAX_PAGES = 10;
 
 const REPO_SEARCH_QUERY = `query($q:String!,$after:String){
-  rateLimit{ cost remaining }
+  rateLimit{ cost remaining resetAt }
   search(query:$q, type:ISSUE, first:100, after:$after){
     issueCount
     pageInfo{ hasNextPage endCursor }
@@ -437,7 +521,7 @@ const REPO_SEARCH_QUERY = `query($q:String!,$after:String){
  * 살아있는 데이터를 읽고, 이 함수는 **대상 목록만** 정한다. 검색 인덱스는
  * 반영 지연이 있어 새 커밋 감지에는 쓸 수 없기 때문에 역할을 나눈 것이다.
  */
-export function searchPRRepos(searchQuery: string): RepoSearchResult {
+export async function searchPRRepos(searchQuery: string): Promise<RepoSearchResult> {
   const repos = new Set<string>();
   const prs: { slug: string; number: number }[] = [];
   let cursor: string | null = null;
@@ -450,7 +534,7 @@ export function searchPRRepos(searchQuery: string): RepoSearchResult {
     // JSON.stringify 를 쓰면 안 된다. 셸이 있을 때는 그 따옴표를 셸이 벗겨줬지만
     // 이제 셸이 없으므로 gh 가 따옴표까지 값으로 받는다 (검색이 통째로 어긋난다).
     const args = ['-f', `q=${searchQuery}`, ...(cursor ? ['-f', `after=${cursor}`] : [])];
-    const { data } = graphQLTolerant(args, REPO_SEARCH_QUERY);
+    const { data } = await graphQLTolerant(args, REPO_SEARCH_QUERY);
     const search = data?.search;
     if (!search) break;
 
@@ -483,9 +567,9 @@ let viewerLoginCache: string | null = null;
  * 실패를 null 로 떨어뜨린다 — 부모를 모르면 "머지인지 아닌지 모른다" 이고,
  * 모를 때의 기본 방향은 **평소대로 재리뷰**다 (absorbsReviewedMerge 참고).
  */
-export function fetchCommitParents(owner: string, repo: string, sha: string): string[] | null {
+export async function fetchCommitParents(owner: string, repo: string, sha: string): Promise<string[] | null> {
   try {
-    const raw = gh(['api', `repos/${owner}/${repo}/commits/${sha}`, '-q', '.parents[].sha'], {
+    const raw = await gh(['api', `repos/${owner}/${repo}/commits/${sha}`, '-q', '.parents[].sha'], {
       captureStderr: true, // 10초 주기 경로다 — 부분 실패 메시지로 로그를 덮지 않는다
     });
     const parents = raw
@@ -505,9 +589,9 @@ export function fetchCommitParents(owner: string, repo: string, sha: string): st
  * 미리 계산해 둔 **테스트 머지** 커밋이라 실제 머지 결과가 아니다
  * (실측: 열린 PR 33 이 merged=false 인데도 sha 를 갖고 있었다).
  */
-export function fetchMergeCommit(owner: string, repo: string, number: number): string | null {
+export async function fetchMergeCommit(owner: string, repo: string, number: number): Promise<string | null> {
   try {
-    const raw = gh(
+    const raw = await gh(
       ['api', `repos/${owner}/${repo}/pulls/${number}`, '-q', '[.merged, .merge_commit_sha] | @tsv'],
       { captureStderr: true },
     );
@@ -519,9 +603,9 @@ export function fetchMergeCommit(owner: string, repo: string, number: number): s
 }
 
 /** 현재 gh 인증 계정의 로그인 아이디 (캐시됨). */
-export function getViewerLogin(): string {
+export async function getViewerLogin(): Promise<string> {
   if (!viewerLoginCache) {
-    viewerLoginCache = gh(['api', 'user', '-q', '.login']).trim();
+    viewerLoginCache = (await gh(['api', 'user', '-q', '.login'])).trim();
   }
   return viewerLoginCache;
 }
@@ -542,13 +626,13 @@ export function buildPullRequestReactionPayload(content: PullRequestReaction): s
 }
 
 /** PR 자체에 반응을 남긴다. PR 은 reactions API 에서 issue 번호로 다룬다. */
-export function addPullRequestReaction(
+export async function addPullRequestReaction(
   owner: string,
   repo: string,
   number: number,
   content: PullRequestReaction,
-): void {
-  gh(
+): Promise<void> {
+  await gh(
     [
       'api',
       `repos/${owner}/${repo}/issues/${number}/reactions`,
@@ -579,14 +663,14 @@ export function viewerReactionIds(
 }
 
 /** 현재 gh 인증 사용자가 PR에 남긴 특정 반응을 모두 제거한다. */
-export function removePullRequestReaction(
+export async function removePullRequestReaction(
   owner: string,
   repo: string,
   number: number,
   content: PullRequestReaction,
-): void {
+): Promise<void> {
   const endpoint = `repos/${owner}/${repo}/issues/${number}/reactions`;
-  const raw = gh(
+  const raw = await gh(
     [
       'api',
       endpoint,
@@ -608,8 +692,8 @@ export function removePullRequestReaction(
     ? (parsed as PullRequestReactionRecord[][]).flat()
     : (parsed as PullRequestReactionRecord[]);
 
-  for (const id of viewerReactionIds(reactions, content, getViewerLogin())) {
-    gh(
+  for (const id of viewerReactionIds(reactions, content, await getViewerLogin())) {
+    await gh(
       [
         'api',
         `${endpoint}/${id}`,
@@ -625,8 +709,8 @@ export function removePullRequestReaction(
 
 // ── Diff 파싱 ───────────────────────────────────────────────
 
-export function fetchDiff(owner: string, repo: string, number: number): string {
-  return gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], {
+export async function fetchDiff(owner: string, repo: string, number: number): Promise<string> {
+  return await gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], {
     maxBuffer: 10 * 1024 * 1024,
   });
 }
@@ -637,8 +721,8 @@ export function fetchDiff(owner: string, repo: string, number: number): string {
  * `gh pr diff` 는 언제나 현재 head 를 준다. 응답을 기다리는 2~15분 사이에 새 커밋이
  * 들어오면, 검토한 커밋에 리뷰를 고정해 놓고 라인 검증만 새 diff 로 하게 된다.
  */
-export function fetchDiffAt(owner: string, repo: string, base: string, sha: string): string {
-  return gh(
+export async function fetchDiffAt(owner: string, repo: string, base: string, sha: string): Promise<string> {
+  return await gh(
     [
       'api',
       `repos/${owner}/${repo}/compare/${base}...${sha}`,
@@ -647,6 +731,14 @@ export function fetchDiffAt(owner: string, repo: string, base: string, sha: stri
     ],
     { maxBuffer: 10 * 1024 * 1024 },
   );
+}
+
+/** 브랜치 이름이 움직여도 같은 diff를 읽도록 merge-base를 커밋으로 고정한다. */
+export async function fetchMergeBase(owner: string, repo: string, base: string, head: string): Promise<string> {
+  const sha = (await gh(['api', `repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${head}`,
+    '-q', '.merge_base_commit.sha'])).trim();
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('merge-base SHA를 확인하지 못했습니다');
+  return sha;
 }
 
 /**
@@ -715,15 +807,27 @@ export function buildReviewPayload(
   });
 }
 
-function submitReview(owner: string, repo: string, number: number, payload: string): void {
-  gh(
+export interface PublishedReview { id: number; body: string; commit_id: string; state: string }
+
+export async function findPublishedReview(owner: string, repo: string, number: number, key: string,
+  commitId: string): Promise<PublishedReview | null> {
+  const pages = JSON.parse(await gh(['api', `repos/${owner}/${repo}/pulls/${number}/reviews?per_page=100`,
+    '--paginate', '--slurp'])) as PublishedReview[][];
+  return pages.flat().find(r => r.state !== 'PENDING' && r.commit_id === commitId &&
+    r.body.includes(`<!-- gpt-chat-pr-reviewer:${key}:`)) ?? null;
+}
+
+async function submitReview(owner: string, repo: string, number: number, payload: string): Promise<PublishedReview> {
+  const result = JSON.parse(await gh(
     ['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--method', 'POST', '--input', '-'],
     { input: payload },
-  );
+  ));
+  if (!Number.isSafeInteger(result.id) || result.id <= 0) throw new Error('게시 결과의 review ID를 확인하지 못했습니다');
+  return result;
 }
 
 /** 인라인 코멘트 포함 리뷰 게시. */
-export function postReview(
+export async function postReview(
   owner: string,
   repo: string,
   number: number,
@@ -731,18 +835,18 @@ export function postReview(
   event: string,
   comments: ReviewComment[],
   commitId?: string | null,
-): void {
-  submitReview(owner, repo, number, buildReviewPayload(body, event, comments, commitId));
+): Promise<PublishedReview> {
+  return await submitReview(owner, repo, number, buildReviewPayload(body, event, comments, commitId));
 }
 
 /** 본문만 있는 단순 리뷰 게시. */
-export function postSimpleReview(
+export async function postSimpleReview(
   owner: string,
   repo: string,
   number: number,
   body: string,
   event: 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' = 'COMMENT',
   commitId?: string | null,
-): void {
-  submitReview(owner, repo, number, buildReviewPayload(body, event, [], commitId));
+): Promise<PublishedReview> {
+  return await submitReview(owner, repo, number, buildReviewPayload(body, event, [], commitId));
 }

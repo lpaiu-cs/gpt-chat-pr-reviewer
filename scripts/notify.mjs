@@ -284,8 +284,7 @@ const STATE_EVENT = {
 };
 
 let session = null;
-let prevPhase = null;
-let prevActiveKey = null;
+let prevActive = new Map();
 /**
  * 이번 끊김을 이미 알렸는가.
  *
@@ -320,8 +319,7 @@ function onSnapshot(s) {
     session = s.session;
     baselined = false;
     warnedNoMatch = false;
-    prevPhase = null;
-    prevActiveKey = null;
+    prevActive = new Map();
   }
 
   // 필터 오타 경고는 **추적 중인 PR 이 실제로 있을 때만** 낸다. 아직 하나도
@@ -338,14 +336,16 @@ function onSnapshot(s) {
     }
   }
 
-  const a = s.active;
+  const active = Array.isArray(s.active) ? s.active : s.active ? [s.active] : [];
 
   if (baselined) {
-    if (a && a.key !== prevActiveKey) {
-      emit('round-start', a, `${a.round}차 · ${a.reasonLabel}`);
-    }
-    if (a && a.phase === 'posting' && prevPhase !== 'posting') {
-      emit('posting', a, `${a.round}차 · 대기 ${Math.round((Date.now() - a.startedAt) / 1000)}초 경과`);
+    for (const a of active) {
+      const before = prevActive.get(a.key);
+      const started = !before || before.round !== a.round || before.startedAt !== a.startedAt;
+      if (started) emit('round-start', a, `${a.round}차 · ${a.reasonLabel}`);
+      if (a.phase === 'posting' && (started || before.phase !== 'posting')) {
+        emit('posting', a, `${a.round}차 · 대기 ${Math.round((Date.now() - a.startedAt) / 1000)}초 경과`);
+      }
     }
 
     for (const c of s.contexts) {
@@ -361,8 +361,7 @@ function onSnapshot(s) {
     }
   }
 
-  prevActiveKey = a?.key ?? null;
-  prevPhase = a?.phase ?? null;
+  prevActive = new Map(active.map(a => [a.key, a]));
   prevStates = new Map(s.contexts.map((c) => [c.key, c.state]));
 
   if (!baselined) {
@@ -397,7 +396,7 @@ function onSnapshot(s) {
       console.log(
         `connected  ${FILTERS.length ? FILTERS.map((f) => f.label).join(',') : '전체'}  ` +
           `watching=${watching.map((c) => `${c.key}:${c.state}`).join(',') || '없음'}` +
-          (a && matchesFilter(a.key) ? `  active=${a.key}:${a.phase}` : ''),
+          active.filter(a => matchesFilter(a.key)).map(a => `  active=${a.key}:${a.phase}`).join(''),
       );
       return;
     }
@@ -407,7 +406,9 @@ function onSnapshot(s) {
     for (const c of watching) {
       say(C.dim(`  · ${c.key}  ${c.stateLabel}  ${c.round}라운드${c.excludedReason ? `  (제외: ${c.excludedReason})` : ''}`));
     }
-    if (a && matchesFilter(a.key)) say(C.cyan(`  · 진행 중: ${a.key} ${a.round}차 (${a.phase})`));
+    for (const a of active.filter(a => matchesFilter(a.key))) {
+      say(C.cyan(`  · 진행 중: ${a.key} ${a.round}차 (${a.phase})`));
+    }
   }
 }
 

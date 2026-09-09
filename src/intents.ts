@@ -73,10 +73,13 @@ export const INTENT_KINDS: Intent['kind'][] = [
 
 class IntentQueue {
   private q: Intent[] = [];
+  /** idle 타이머만 깨운다. 상태 적용은 계속 루프의 안전 지점에서 한다. */
+  onPending?: () => void;
 
   /** 큐에 넣고 대기 건수를 돌려준다. */
   push(intent: Intent): number {
     this.q.push(intent);
+    this.onPending?.();
     return this.q.length;
   }
 

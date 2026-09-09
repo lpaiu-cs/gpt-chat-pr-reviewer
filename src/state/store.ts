@@ -5,9 +5,11 @@
  * status/graph 명령과 향후 UI 가 그대로 읽을 수 있다.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { AppConfig, PRContext, PRInfo } from '../types.js';
+import { TRANSITIONS } from './machine.js';
 
 function stateDir(cfg: AppConfig): string {
   const d = path.join(cfg.dataDir, 'state');
@@ -64,15 +66,34 @@ export function loadContext(
 ): PRContext | null {
   const fp = fileFor(cfg, owner, repo, num);
   if (!existsSync(fp)) return null;
-  try {
-    return JSON.parse(readFileSync(fp, 'utf-8'));
-  } catch {
-    return null;
-  }
+  return readContext(fp);
 }
 
 export function saveContext(cfg: AppConfig, ctx: PRContext): void {
-  writeFileSync(fileFor(cfg, ctx.owner, ctx.repo, ctx.prNumber), JSON.stringify(ctx, null, 2), 'utf-8');
+  const target = fileFor(cfg, ctx.owner, ctx.repo, ctx.prNumber);
+  const temp = `${target}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, JSON.stringify(ctx, null, 2), { encoding: 'utf-8', flag: 'wx' });
+    renameSync(temp, target);
+  } finally {
+    try { unlinkSync(temp); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
+  }
+}
+
+function readContext(file: string): PRContext {
+  try {
+    const c = JSON.parse(readFileSync(file, 'utf-8'));
+    if (!c || !Object.hasOwn(TRANSITIONS, c.state) || !Array.isArray(c.history) ||
+        !Array.isArray(c.threads) || !Number.isSafeInteger(c.round) || c.round < 0 ||
+        !Number.isSafeInteger(c.prNumber) || c.prNumber < 1 ||
+        typeof c.owner !== 'string' || typeof c.repo !== 'string' ||
+        typeof c.updatedAt !== 'string') throw new Error('컨텍스트 형식 오류');
+    return c;
+  } catch (e) {
+    throw new Error(`상태 파일을 읽지 못했습니다. 신규 PR로 덮어쓰지 않습니다: ${file}`, { cause: e });
+  }
 }
 
 /** 추적 중인 모든 PR 컨텍스트 (최근 업데이트 순). */
@@ -81,11 +102,7 @@ export function listContexts(cfg: AppConfig): PRContext[] {
   const out: PRContext[] = [];
   for (const f of readdirSync(dir)) {
     if (!f.endsWith('.json')) continue;
-    try {
-      out.push(JSON.parse(readFileSync(path.join(dir, f), 'utf-8')));
-    } catch {
-      /* 손상된 파일 스킵 */
-    }
+    out.push(readContext(path.join(dir, f)));
   }
   return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }

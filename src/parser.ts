@@ -11,12 +11,17 @@ export function parseGPTResponse(raw: string): ReviewResult {
   if (json) {
     try {
       const obj = JSON.parse(json);
-      // summary/comments 중 하나도 없으면 리뷰 JSON 이 아니라고 본다
-      if (obj && (obj.summary !== undefined || obj.comments !== undefined)) {
+      if (obj && typeof obj.summary === 'string' && obj.summary.trim() &&
+          ['approve', 'request_changes', 'comment'].includes(obj.approval) &&
+          Array.isArray(obj.comments) && obj.comments.every(isComment) &&
+          (obj.reviewedHeadSha === undefined || typeof obj.reviewedHeadSha === 'string') &&
+          (obj.reviewedBaseSha === undefined || typeof obj.reviewedBaseSha === 'string')) {
         return {
-          summary: String(obj.summary ?? '리뷰 요약 없음'),
-          approval: normalizeApproval(obj.approval),
-          comments: normalizeComments(obj.comments),
+          summary: obj.summary,
+          approval: obj.approval,
+          comments: obj.comments,
+          reviewedHeadSha: obj.reviewedHeadSha,
+          reviewedBaseSha: obj.reviewedBaseSha,
           raw,
           parsed: true,
         };
@@ -65,24 +70,10 @@ function extractJSON(text: string): string | null {
   return null;
 }
 
-// ── 정규화 ──────────────────────────────────────────────────
-
-function normalizeApproval(v: unknown): ReviewResult['approval'] {
-  if (typeof v !== 'string') return 'comment';
-  const s = v.toLowerCase().replace(/[\s_-]/g, '');
-  if (s.includes('request') || s.includes('change')) return 'request_changes';
-  if (s.includes('approve') && !s.includes('request')) return 'approve';
-  return 'comment';
-}
-
-function normalizeComments(arr: unknown): ReviewComment[] {
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .filter((c): c is Record<string, unknown> => c !== null && typeof c === 'object')
-    .map((c) => ({
-      path: String(c.path ?? ''),
-      line: typeof c.line === 'number' ? c.line : parseInt(String(c.line), 10) || 0,
-      body: String(c.body ?? ''),
-    }))
-    .filter((c) => c.path && c.body);
+function isComment(c: unknown): c is ReviewComment {
+  if (!c || typeof c !== 'object') return false;
+  const v = c as Record<string, unknown>;
+  return typeof v.path === 'string' && v.path.trim().length > 0 &&
+    typeof v.body === 'string' && v.body.trim().length > 0 &&
+    Number.isSafeInteger(v.line) && (v.line as number) > 0;
 }
