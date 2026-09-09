@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { planConversation } from '../src/reviewer.js';
 import { loadConfig } from '../src/config.js';
+import { chatgptProjectId, validateProjectUrl } from '../src/config.js';
+import { ChatGPTDriver } from '../src/chatgpt.js';
 import type { AppConfig, PRContext } from '../src/types.js';
 
 /**
@@ -72,4 +74,37 @@ test('구버전 컨텍스트(전송 횟수 없음)는 라운드 차이로 근사
   // 11차 = 시작 라운드로부터 10 — 상한에 정확히 닿는다.
   assert.equal(planConversation(cfg(), old, 11).action, 'new');
   assert.equal(planConversation(cfg(), old, 10).action, 'resume');
+});
+
+const PROJECT = 'https://chatgpt.com/g/g-p-6aa1b62772a081919310c24aabc056a0/project';
+test('프로젝트 변경·해제는 회전하고 같은 프로젝트의 대화만 이어 쓴다', () => {
+  const config = { ...cfg(), chatgptProjectUrl: PROJECT };
+  const context = ctx(1);
+  assert.equal(planConversation(config, context, 2).action, 'new');
+  context.conversationUrl = PROJECT.replace('/project', '-reviews/c/1234');
+  assert.equal(planConversation(config, context, 2).action, 'resume');
+  assert.equal(planConversation(cfg(), context, 2).action, 'new');
+  assert.equal(planConversation({ ...config, chatgptProjectUrl: PROJECT.replace('6aa1', '7aa1') }, context, 2).action, 'new');
+  assert.equal(chatgptProjectId(context.conversationUrl), chatgptProjectId(PROJECT));
+  for (const bad of [null, 123, 'https://evil.com/g/g-p-123/project', PROJECT.replace('/project', '/c/123'), 'https://chatgpt.com/c/123']) {
+    assert.throws(() => validateProjectUrl(bad), /chatgptProjectUrl/);
+  }
+  validateProjectUrl(PROJECT);
+  validateProjectUrl('');
+});
+
+test('프로젝트 새 대화는 지정 URL로 진입하며 루트 리다이렉트 시 실패한다', async () => {
+  const config = { ...cfg(), chatgptProjectUrl: PROJECT };
+  const driver = new ChatGPTDriver(config) as any;
+  let actual = PROJECT;
+  let destination = '';
+  driver.page = {
+    goto: async (url: string) => { destination = url; },
+    waitForSelector: async () => {}, keyboard: { press: async () => {} },
+    waitForTimeout: async () => {}, url: () => actual,
+  };
+  await driver.startNewChat();
+  assert.equal(destination, PROJECT);
+  actual = 'https://chatgpt.com';
+  await assert.rejects(driver.startNewChat(), /프로젝트에 진입/);
 });

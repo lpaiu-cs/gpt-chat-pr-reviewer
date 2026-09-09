@@ -97,6 +97,22 @@ const DEFAULT_WATCH_SCOPE: WatchScope = {
 
 // ── 공개 API ────────────────────────────────────────────────
 
+/** 프로젝트 이름(slug)이 바뀌어도 동일한 프로젝트로 판정한다. */
+export function chatgptProjectId(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    if (u.origin !== 'https://chatgpt.com' || u.username || u.password) return null;
+    return /^\/g\/(g-p-[a-f0-9]+)(?:-[^/]+)?\/(?:project\/?|c\/[a-zA-Z0-9-]+)$/.exec(u.pathname)?.[1] ?? null;
+  } catch { return null; }
+}
+
+export function validateProjectUrl(raw: unknown): void {
+  if (raw === undefined || raw === '') return;
+  if (typeof raw !== 'string' || !chatgptProjectId(raw) || !/\/project\/?$/.test(new URL(raw).pathname)) {
+    throw new Error('chatgptProjectUrl에는 https://chatgpt.com/g/g-p-…/project 형식의 프로젝트 URL을 지정하세요.');
+  }
+}
+
 export function loadConfig(configPath?: string): AppConfig {
   const file = configPath ?? CONFIG_FILE;
   if (existsSync(file)) {
@@ -111,6 +127,7 @@ export function loadConfig(configPath?: string): AppConfig {
         `${file} 을 읽을 수 없습니다 (JSON 형식 오류) — 파일을 고치거나 지운 뒤 init 으로 다시 만들어주세요.`,
       );
     }
+    validateProjectUrl(user.chatgptProjectUrl);
     return {
       ...DEFAULT_CONFIG,
       ...user,

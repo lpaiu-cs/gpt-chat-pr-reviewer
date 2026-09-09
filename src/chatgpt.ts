@@ -9,6 +9,7 @@ import { chromium, type BrowserContext, type Locator, type Page } from 'playwrig
 import chalk from 'chalk';
 import { progress } from './progress.js';
 import type { AppConfig } from './types.js';
+import { chatgptProjectId, validateProjectUrl } from './config.js';
 
 /** ChatGPT 사용량 한도 도달 — 상태 머신의 QUOTA_EXCEEDED 이벤트로 매핑된다. */
 export class QuotaLimitError extends Error {
@@ -448,6 +449,7 @@ export class ChatGPTDriver {
   private lastNetAt = 0;
 
   constructor(config: AppConfig) {
+    validateProjectUrl(config.chatgptProjectUrl);
     this.cfg = config;
   }
 
@@ -728,14 +730,24 @@ export class ChatGPTDriver {
 
   // ── 대화 ──────────────────────────────────────────────────
 
-  /** 새 대화 시작 (chatgpt.com 루트로 이동). */
+  /** 새 대화 시작. 프로젝트를 지정했으면 그 안에서만 생성한다. */
   async startNewChat(): Promise<void> {
     const p = this.requirePage();
-    await p.goto(this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    validateProjectUrl(this.cfg.chatgptProjectUrl);
+    await p.goto(this.cfg.chatgptProjectUrl || this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
     // 새 대화 진입 시 뜨는 안내 모달을 닫고, 하이드레이션이 끝날 여유를 준다
     await p.keyboard.press('Escape').catch(() => {});
     await p.waitForTimeout(1_000);
+    this.assertProjectPage(p);
+  }
+
+  /** 프로젝트 접근 실패·일반 대화로의 리다이렉트 시 밖에 전송하지 않는다. */
+  private assertProjectPage(page: Page): void {
+    const project = this.cfg.chatgptProjectUrl;
+    if (project && chatgptProjectId(page.url()) !== chatgptProjectId(project)) {
+      throw new Error('지정한 ChatGPT 프로젝트에 진입하지 못했습니다 — 프로젝트 접근 권한과 URL을 확인하세요.');
+    }
   }
 
   /**
@@ -761,6 +773,7 @@ export class ChatGPTDriver {
 
     // 접근 불가 시 루트나 다른 대화로 튕긴다
     if (parseConversationUrl(p.url()) !== want) return false;
+    if (this.cfg.chatgptProjectUrl && chatgptProjectId(p.url()) !== chatgptProjectId(this.cfg.chatgptProjectUrl)) return false;
 
     const body = await p
       .locator('body')
@@ -826,12 +839,14 @@ export class ChatGPTDriver {
     const beforeUserCount = await this.countUserMessages(p);
 
     // ── 프롬프트 입력 ──
+    this.assertProjectPage(p);
     await this.inputStep(`프롬프트 입력 (${prompt.length}자, ${prompt.split('\n').length}줄)`, () => this.fillPrompt(p, prompt));
 
     // ── 전송 ──
     // 이번 라운드의 생성만 근거로 쓴다. 이 값이 드라이버 수명 동안 남아 있으면
     // 지난 라운드에서 본 요청을 "지금 관측되는 생성" 의 근거로 삼게 된다.
     this.sawGeneration = false;
+    this.assertProjectPage(p);
     await this.inputStep('전송 버튼', () => this.clickSend(p));
 
     // ── 전송 성공 검증 ──
