@@ -547,6 +547,7 @@ export class ChatGPTDriver {
    * 그때는 판정을 바꾸지 않는다 — 근거 없는 조기 절단이 더 나쁘다.
    */
   private trackGenerationTraffic(page: Page): void {
+    page.on('crash', () => console.error(chalk.red('  ✗ Chrome 리뷰 탭 crash 감지')));
     const isGeneration = (url: string, method: string): boolean =>
       method === 'POST' && /\/backend-api\/[^?]*conversation/.test(url);
 
@@ -794,7 +795,7 @@ export class ChatGPTDriver {
   /**
    * 프롬프트를 전송하고 응답 전문을 반환한다.
    *
-   * 1. 텍스트를 입력 (클립보드 paste → 실패 시 keyboard.type fallback)
+   * 1. 붙여넣기로 입력하고 전체 내용을 검증
    * 2. 전송 버튼 클릭
    * 3. 어시스턴트 메시지가 안정될 때까지 폴링
    */
@@ -825,21 +826,20 @@ export class ChatGPTDriver {
     const beforeUserCount = await this.countUserMessages(p);
 
     // ── 프롬프트 입력 ──
-    await this.fillPrompt(p, prompt);
+    await this.inputStep(`프롬프트 입력 (${prompt.length}자, ${prompt.split('\n').length}줄)`, () => this.fillPrompt(p, prompt));
 
     // ── 전송 ──
     // 이번 라운드의 생성만 근거로 쓴다. 이 값이 드라이버 수명 동안 남아 있으면
     // 지난 라운드에서 본 요청을 "지금 관측되는 생성" 의 근거로 삼게 된다.
     this.sawGeneration = false;
-    await this.clickSend(p);
+    await this.inputStep('전송 버튼', () => this.clickSend(p));
 
     // ── 전송 성공 검증 ──
-    // clickSend 는 버튼 후보를 모두 놓치면 Enter 로 전송하는데, 그 성공 여부는
-    // 확인하지 않고 돌아온다. 전송이 실제로 안 됐으면 우리 질문 노드가 영영 안
+    // 클릭이 끝나도 전송 성공은 아니다. 실제로 안 됐으면 우리 질문 노드가 영영 안
     // 붙어 수집 루프가 예산(responseTimeoutMs, 기본 15분)을 전부 태운 뒤
     // 타임아웃으로 접힌다. 몇 초짜리 검증으로 그 비용을 줄인다 — 실패 시에는
     // pendingSend 기록(onSent) 전이라 상태도 깨끗하다.
-    if (!(await this.verifyPromptSent(p, lastUserBefore, beforeUserCount))) {
+    if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, lastUserBefore, beforeUserCount)))) {
       throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
     }
 
@@ -1064,14 +1064,19 @@ export class ChatGPTDriver {
     return null;
   }
 
-  /** 입력창에 실제 텍스트가 들어갔는지 확인. */
-  private async inputHasText(page: Page): Promise<boolean> {
-    const t = await page
-      .locator(this.cfg.selectors.textInput)
-      .first()
-      .innerText()
-      .catch(() => '');
-    return t.trim().length > 0;
+  /** 타임아웃으로 입력을 겹쳐 실행하지 않는다. 느린 호출은 경고만 남긴다. */
+  private async inputStep<T>(label: string, action: () => Promise<T>): Promise<T> {
+    const since = Date.now();
+    console.log(chalk.dim(`  입력 단계 시작: ${label}`));
+    const timer = setTimeout(() => console.log(chalk.yellow(`  ⚠ ${label} 10초째 진행 중`)), 10_000);
+    try {
+      const result = await action();
+      console.log(chalk.dim(`  입력 단계 완료: ${label} (${Date.now() - since}ms)`));
+      return result;
+    } catch (e) {
+      console.log(chalk.yellow(`  입력 단계 실패: ${label} (${Date.now() - since}ms)`));
+      throw e;
+    } finally { clearTimeout(timer); }
   }
 
   /**
@@ -1103,12 +1108,10 @@ export class ChatGPTDriver {
       /* JS 포커스로 진행 */
     }
 
-    const focused = await page.evaluate((selector: string) => {
-      const el = document.querySelector(selector) as HTMLElement | null;
-      if (!el) return false;
-      el.focus();
+    const focused = await input.evaluate((el) => {
+      (el as HTMLElement).focus();
       return document.activeElement === el || el.contains(document.activeElement);
-    }, sel.textInput);
+    });
 
     if (!focused) {
       throw new Error('프롬프트 입력창에 포커스할 수 없습니다 — 브라우저 화면 상태를 확인하세요');
@@ -1117,71 +1120,60 @@ export class ChatGPTDriver {
 
   /** ProseMirror contenteditable 에 텍스트를 삽입한다. */
   private async fillPrompt(page: Page, text: string): Promise<void> {
-    await this.focusInput(page);
+    await this.inputStep('입력창 포커스', () => this.focusInput(page));
     await page.keyboard.press('Control+A');
     await page.keyboard.press('Delete');
 
-    // 방법 1: CDP insertText — contenteditable 에 가장 안정적이고 빠르다
-    await page.keyboard.insertText(text);
-    await page.waitForTimeout(200);
-    if (await this.inputHasText(page)) return;
-
-    // 방법 2: 합성 paste 이벤트
-    const pasted = await page.evaluate(
-      ({ selector, t }: { selector: string; t: string }) => {
-        const el = document.querySelector(selector) as HTMLElement | null;
-        if (!el) return false;
-        el.focus();
+    // ProseMirror의 paste 트랜잭션을 사용한다. 다중 줄 CDP insertText는
+    // Chromium에서 줄마다 레이아웃을 재계산해 renderer를 수분간 붙잡을 수 있다.
+    const input = page.locator(this.cfg.selectors.textInput).first();
+    // ChatGPT는 한 번에 10,000자를 넘게 붙이면 첨부로 전환한다.
+    // 코드 포인트 단위로 나누어 surrogate pair도 보존한다.
+    const chars = Array.from(text.replace(/\r\n/g, '\n'));
+    for (let at = 0; at < chars.length; at += 4000) {
+      await this.inputStep('붙여넣기', () => input.evaluate(
+      (el, t: string) => {
+        (el as HTMLElement).focus();
         const dt = new DataTransfer();
         dt.setData('text/plain', t);
-        return el.dispatchEvent(
+        // PM의 plain-text paste는 연속 개행을 문단 하나로 합친다. 자체 clipboard
+        // 형식으로 공백 보존을 요청하고, 개행은 hard break로 전달한다.
+        const escaped = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        // PM이 마지막 BR을 표시용으로 버리므로 실제 마지막 개행과 구분한다.
+        dt.setData('text/html', `<p data-pm-slice="1 1 []">${escaped.replace(/\r?\n/g, '<br>')}<br></p>`);
+        el.dispatchEvent(
           new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
         );
       },
-      { selector: this.cfg.selectors.textInput, t: text },
-    );
-    if (pasted) {
-      await page.waitForTimeout(300);
-      if (await this.inputHasText(page)) return;
+      chars.slice(at, at + 4000).join(''),
+    ));
     }
-
-    // 방법 3: keyboard.type
-    console.log(chalk.dim('  insertText·paste 실패 — keyboard.type 로 재시도'));
-    await this.focusInput(page);
-    await page.keyboard.type(text, { delay: 1 });
-    if (!(await this.inputHasText(page))) {
-      throw new Error('프롬프트 입력 실패 — textInput 셀렉터를 확인하세요');
+    // 처리된 paste는 preventDefault로 false를 반환할 수 있다. 이벤트 반환값이
+    // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
+    const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n$/, '');
+    const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
+    if (await this.inputStep('붙여넣기 검증', matches)) return;
+    if ((await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
+      await this.inputStep('짧은 입력 폴백', () => page.keyboard.insertText(text));
+      if (await matches()) return;
     }
+    throw new Error('프롬프트 전체 내용이 일치하지 않습니다 — 재입력하거나 전송하지 않습니다');
   }
 
   private async clickSend(page: Page): Promise<void> {
-    // 전송 버튼이 활성화될 때까지 잠시 대기
-    await page.waitForTimeout(600);
-
-    // 설정된 셀렉터를 먼저, 그다음 알려진 후보들을 순서대로 시도
-    const candidates = [
+    // 후보 전체를 하나의 대기 예산으로 확인한다.
+    const candidates = [...new Set([
       this.cfg.selectors.sendButton,
       '#composer-submit-button',
       'button[data-testid="send-button"]',
       'button[aria-label="Send prompt"]',
       'button[aria-label*="Send"]',
       'button[aria-label*="보내기"]',
-    ];
-
-    for (const c of candidates) {
-      const btn = page.locator(c).first();
-      try {
-        if (await btn.isVisible({ timeout: 1_500 })) {
-          await btn.click();
-          return;
-        }
-      } catch {
-        /* 다음 후보 */
-      }
-    }
-
-    console.log(chalk.dim('  send 버튼 미발견 — Enter 로 전송'));
-    await page.keyboard.press('Enter');
+    ])];
+    // 동일 버튼을 셀렉터마다 다시 기다리지 않는다. 중지 버튼은 명시적으로 제외한다.
+    const buttons = candidates.map(c => page.locator(c)).reduce((all, next) => all.or(next));
+    const enabledSend = page.locator(':visible:not(:disabled):not([data-testid="stop-button"]):not([aria-label*="Stop"])');
+    await buttons.and(enabledSend).first().click({ timeout: 10_000 });
   }
 
   /**
