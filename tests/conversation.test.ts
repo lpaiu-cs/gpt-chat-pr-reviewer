@@ -1,9 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { planConversation } from '../src/reviewer.js';
+import { planConversation, reconcileCachedOrigin } from '../src/reviewer.js';
 import { loadConfig } from '../src/config.js';
 import { chatgptProjectId, validateProjectUrl } from '../src/config.js';
-import { ChatGPTDriver } from '../src/chatgpt.js';
+import { ChatGPTDriver, sameConversationUrl } from '../src/chatgpt.js';
+import type { ResponseMeta } from '../src/cache.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import type { AppConfig, PRContext } from '../src/types.js';
 
 /**
@@ -107,4 +113,64 @@ test('프로젝트 새 대화는 지정 URL로 진입하며 루트 리다이렉�
   assert.equal(destination, PROJECT);
   actual = 'https://chatgpt.com';
   await assert.rejects(driver.startNewChat(), /프로젝트에 진입/);
+});
+
+test('프로젝트 이름 변경 리다이렉트는 같은 대화와 캐시를 유지한다', async () => {
+  const old = PROJECT.replace('/project', '/c/1234');
+  const renamed = old.replace('/c/', '-pr-jadong-ribyu/c/');
+  const driver = new ChatGPTDriver({ ...cfg(), chatgptProjectUrl: PROJECT }) as any;
+  let actual = renamed;
+  driver.page = {
+    goto: async () => {}, waitForSelector: async () => {},
+    keyboard: { press: async () => {} }, waitForTimeout: async () => {},
+    url: () => actual, locator: () => ({ innerText: async () => '' }),
+  };
+  assert.equal(await driver.resumeChat(old, { requireAssistant: false }), true);
+  const context = { ...ctx(1), conversationUrl: old };
+  assert.equal(reconcileCachedOrigin(context, { conversationUrl: renamed, dryRun: false } as ResponseMeta), false);
+  assert.equal(context.conversationUrl, old);
+  for (actual of [renamed.replace('/c/1234', '/c/5678'), renamed.replace('6aa1', '7aa1'), 'https://chatgpt.com/c/1234']) {
+    assert.equal(await driver.resumeChat(old, { requireAssistant: false }), false);
+    assert.equal(sameConversationUrl(old, actual), false);
+  }
+  assert.equal(sameConversationUrl('invalid', 'invalid'), false);
+  assert.equal(sameConversationUrl(URL, `${URL}?source=review`), true);
+});
+
+test('프로젝트 입력창 실패는 원인과 최신 URL 등록 방법을 함께 안내한다', async () => {
+  const driver = new ChatGPTDriver({ ...cfg(), chatgptProjectUrl: PROJECT }) as any;
+  driver.page = {
+    goto: async () => {}, url: () => PROJECT,
+    waitForSelector: async () => { throw new Error('selector timeout'); },
+  };
+  await assert.rejects(driver.startNewChat(), (error: Error) => {
+    assert.match(error.message, /setup --project-url/);
+    assert.match(error.message, /selector timeout/);
+    assert.ok(error.message.includes(PROJECT));
+    return true;
+  });
+});
+
+test('설정 없는 최초 실행은 프로젝트 등록을 안내하고 실제 리뷰를 시작하지 않는다', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'project-setup-'));
+  const cli = fileURLToPath(new globalThis.URL('../src/cli.ts', import.meta.url));
+  const tsx = new globalThis.URL('../node_modules/tsx/dist/loader.mjs', import.meta.url).href;
+  try {
+    for (const args of [['setup'], ['setup', '--project-url', 'https://example.com'], ['watch', '--once']]) {
+      const run = spawnSync(process.execPath, ['--import', tsx, cli, ...args], {
+        cwd: dir, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+      });
+      assert.equal(run.status, 1, run.stderr);
+      assert.match(run.stdout + run.stderr, /프로젝트|project-url/);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('프로젝트가 빠진 드라이버도 일반 채팅으로 폴백하지 않는다', async () => {
+  const driver = new ChatGPTDriver(cfg()) as any;
+  let navigated = false;
+  driver.page = { goto: async () => { navigated = true; } };
+  await assert.rejects(driver.startNewChat(), /setup/);
+  assert.equal(navigated, false);
+  assert.throws(() => driver.assertProjectPage({ url: () => 'https://chatgpt.com/c/123' }), /setup/);
 });

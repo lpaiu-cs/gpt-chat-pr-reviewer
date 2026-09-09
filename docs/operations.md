@@ -6,7 +6,7 @@
 
 | 명령 | 설명 |
 |---|---|
-| `setup` | ChatGPT 로그인용 브라우저 프로필 생성 |
+| `setup` | ChatGPT 로그인 후 리뷰 전용 프로젝트 생성 안내·URL 입력·접근 확인·저장 |
 | `whoami` | 현재 ChatGPT 로그인 상태 확인 |
 | `init` | 설정과 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 지침 파일 열기 |

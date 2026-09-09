@@ -308,7 +308,7 @@ export interface AppConfig {
   /** Playwright channel — 'chrome' = 시스템 Chrome, 'chromium' = Playwright 내장 */
   browserChannel: string;
   chatgptUrl: string;
-  /** 자동 리뷰의 새 대화를 만들 ChatGPT 프로젝트 URL. 미지정이면 일반 대화. */
+  /** setup에서 등록하는 리뷰 전용 프로젝트 URL. 실제 리뷰에는 필수. */
   chatgptProjectUrl?: string;
   /** 응답 대기 최대 시간 (ms) */
   responseTimeoutMs: number;
