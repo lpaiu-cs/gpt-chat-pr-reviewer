@@ -28,7 +28,7 @@ import {
   fetchDiffAt,
   ReviewValidationError,
 } from './github.js';
-import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError } from './chatgpt.js';
+import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError, sameConversationUrl } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure } from './parser.js';
 import { postReviewToGitHub, commentDigest, type LiveComment } from './poster.js';
 import { loadInstructions } from './instructions.js';
@@ -580,7 +580,7 @@ export function releaseConversation(ctx: PRContext): void {
  */
 export function reconcileCachedOrigin(ctx: PRContext, meta: ResponseMeta | null): boolean {
   if (!ctx.conversationUrl) return false;
-  if (meta && !meta.dryRun && meta.conversationUrl === ctx.conversationUrl) return false;
+  if (meta && !meta.dryRun && meta.conversationUrl && sameConversationUrl(meta.conversationUrl, ctx.conversationUrl)) return false;
   releaseConversation(ctx);
   return true;
 }

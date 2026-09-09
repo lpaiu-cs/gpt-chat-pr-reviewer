@@ -408,6 +408,17 @@ export function parseConversationUrl(raw: string): string | null {
   return `${u.origin}${u.pathname}`; // 쿼리·프래그먼트는 버린다
 }
 
+/** 프로젝트 이름(slug)이 바뀌어도 프로젝트 ID와 대화 ID가 같으면 같은 대화다. */
+export function sameConversationUrl(a: string, b: string): boolean {
+  const left = parseConversationUrl(a);
+  const right = parseConversationUrl(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const project = chatgptProjectId(left);
+  return project !== null && project === chatgptProjectId(right)
+    && new URL(left).pathname.split('/c/')[1] === new URL(right).pathname.split('/c/')[1];
+}
+
 /**
  * 화면 텍스트에서 쿼터/한도 안내를 감지하기 위한 패턴.
  *
@@ -734,8 +745,15 @@ export class ChatGPTDriver {
   async startNewChat(): Promise<void> {
     const p = this.requirePage();
     const project = requireProjectUrl(this.cfg.chatgptProjectUrl);
-    await p.goto(project, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
+    try {
+      await p.goto(project, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      this.assertProjectPage(p);
+      await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
+    } catch (cause) {
+      throw new Error('지정한 ChatGPT 프로젝트에 진입하지 못했습니다 — 로그인·접근 권한·입력창을 확인하세요. '
+        + '프로젝트 이름을 바꿨다면 데몬 종료 후 npm run dev -- setup --project-url "최신 프로젝트 URL"로 다시 등록하세요. '
+        + `현재 주소: ${p.url()}\n${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    }
     // 새 대화 진입 시 뜨는 안내 모달을 닫고, 하이드레이션이 끝날 여유를 준다
     await p.keyboard.press('Escape').catch(() => {});
     await p.waitForTimeout(1_000);
@@ -772,7 +790,7 @@ export class ChatGPTDriver {
     await p.waitForTimeout(1_000);
 
     // 접근 불가 시 루트나 다른 대화로 튕긴다
-    if (parseConversationUrl(p.url()) !== want) return false;
+    if (!sameConversationUrl(p.url(), want)) return false;
     if (this.cfg.chatgptProjectUrl && chatgptProjectId(p.url()) !== chatgptProjectId(this.cfg.chatgptProjectUrl)) return false;
 
     const body = await p
