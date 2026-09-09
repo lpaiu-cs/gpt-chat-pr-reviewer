@@ -23,7 +23,7 @@ import chalk from 'chalk';
 
 import { loadConfig, initConfig, ensureDataDir, patchConfigFile } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
-import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage } from './github.js';
+import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage, pollDelay } from './github.js';
 import {
   absorbReviewedMerge,
   syncPR,
@@ -78,11 +78,11 @@ function banner() {
 // ── 공용 헬퍼 ───────────────────────────────────────────────
 
 /** 컨텍스트 로드 or 생성 (생성 시 저장까지). */
-function loadOrCreateContext(cfg: AppConfig, prInput: string): PRContext {
-  const { owner, repo, number } = parsePRInput(prInput);
+async function loadOrCreateContext(cfg: AppConfig, prInput: string): Promise<PRContext> {
+  const { owner, repo, number } = await parsePRInput(prInput);
   const existing = loadContext(cfg, owner, repo, number);
   if (existing) return existing;
-  const info = getPRInfo(owner, repo, number);
+  const info = await getPRInfo(owner, repo, number);
   const ctx = createContext(info);
   saveContext(cfg, ctx);
   return ctx;
@@ -141,7 +141,6 @@ function stateBadge(state: PRState): string {
 const HEARTBEAT_MS = 10 * 60_000;
 
 /** 남은 GraphQL 한도 중 감시에 쓸 최대 비율 (나머지는 리뷰 게시·수동 조회 몫). */
-const RATE_BUDGET_RATIO = 0.5;
 
 /** 폴링 주기 하한 — 이보다 짧으면 secondary rate limit 위험. */
 const MIN_INTERVAL_MS = 5_000;
@@ -393,8 +392,8 @@ program
       const releaseLock = await lockOrExplain(cfg, 'review');
       if (!releaseLock) return;
 
-      const ctx = loadOrCreateContext(cfg, pr);
-      syncPR(cfg, ctx);
+      const ctx = await loadOrCreateContext(cfg, pr);
+      await syncPR(cfg, ctx);
 
       if (ctx.state === 'CLOSED') {
         console.log(`  ${stateBadge(ctx.state)} — 닫힌 PR 은 리뷰할 수 없습니다.\n`);
@@ -942,6 +941,7 @@ program
     const reported = new Map<string, string>();
     let lastHeartbeat = 0;
     let lastRemaining = -1; // 마지막 probe 가 보고한 GraphQL 잔여 한도
+    let lastResetAt = 0;
     let lastCycleCost = 0; // 직전 사이클이 실제로 쓴 GraphQL point 합계
     let watchedRepos = 0; // 마지막 스캔에서 실제로 폴링한 레포 수
     /** 레포별 마지막 probe 시각 — resolve 를 기다리지 않는 레포를 늦추는 기준. */
@@ -972,28 +972,9 @@ program
     };
 
     /**
-     * 이벤트 루프에 한 틱을 돌려준다 — 대시보드가 숨 쉬는 자리다.
-     *
-     * `github.ts` 의 모든 호출은 `execFileSync` 다. 한 번이 **스레드를 통째로**
-     * 0.5초씩 붙잡고(실측 431~561ms), 레포를 연달아 훑는 동안 그게 이어 붙는다.
-     * UI 서버는 같은 루프에 업혀 있어서(ui/server.ts 헤더 참고) 그 동안 요청을
-     * 받지도 답하지도 못한다 — 실측으로 레포 3개짜리 스캔 중에 누른 버튼은
-     * 1,906ms 만에 응답했다 (한산할 때는 3ms). 사람은 그걸 "버튼이 안 먹는다"
-     * 로 겪는다.
-     *
-     * 사이에 한 틱을 넘겨주면 밀린 요청이 그 틈에 처리되어 최악 지연이
-     * **gh 호출 한 번**으로 줄어든다. 스캔이 느려지지는 않는다 — 넘겨주는 것은
-     * 이미 대기 중인 콜백뿐이고, 그동안 새 사이클이 끼어들지도 않는다
-     * (다음 사이클은 `loop` 가 끝난 뒤에야 예약된다). 의도 큐도 안전하다 —
-     * HTTP 핸들러는 큐에 쌓기만 하고, 배수는 여전히 사이클 시작점에서만 한다.
-     */
-    const breathe = (): Promise<void> => new Promise((r) => setImmediate(r));
-
-    /**
      * 스캔 — 감시 범위의 모든 레포를 동기화하고, 리뷰 후보 컨텍스트를 모은다.
      * 여기서는 리뷰를 실행하지 않는다. 실행 순서는 큐가 정한다.
      *
-     * **GitHub 을 부를 때마다 루프를 놓아준다** (`breathe`). 이유는 그 함수 주석에 있다.
      */
     const scan = async (): Promise<{
       eligible: PRContext[];
@@ -1007,8 +988,7 @@ program
       // 이번 스캔에서 처음 본 PR 은 모두 이 시각으로 기록한다 — 큐 순서가 probe
       // 반환 순서(번호 내림차순)에 끌려가지 않게 한다 (createContext 주석 참고).
       const scanAt = new Date(now).toISOString();
-      await breathe(); // 탐색도 gh 호출이다 (캐시가 만료됐을 때만 나가지만)
-      const discovered = repoSource.list();
+      const discovered = await repoSource.list();
       const all = listContexts(cfg);
 
       // GitHub 슬러그는 대소문자를 구분하지 않는다. 컨텍스트에 낡은 케이싱이
@@ -1084,8 +1064,7 @@ program
 
         let probe;
         try {
-          await breathe(); // 이 호출이 0.5초 동안 루프를 붙잡는다 — 그 전에 밀린 요청을 처리한다
-          probe = fetchRepoProbe(repoSlug, needThreads);
+          probe = await fetchRepoProbe(repoSlug, needThreads);
         } catch {
           console.log(chalk.yellow(`  ⚠ ${repoSlug} probe 실패 — 건너뜁니다.`));
           continue;
@@ -1107,8 +1086,7 @@ program
         // 추적 중이지만 열린 목록에 없는 PR → 닫힘 확인 (여기서만 개별 조회)
         for (const c of tracked) {
           if (!probe.prs.some((p) => p.number === c.prNumber)) {
-            await breathe();
-            syncPR(cfg, c);
+            await syncPR(cfg, c);
             reportIfChanged(c);
             seen.push(c);
           }
@@ -1147,8 +1125,7 @@ program
           // head 차이를 보고 AUTHOR_RESPONDED 를 발화해 버리면 이미 늦다.
           // 조건에 안 맞으면 GitHub 을 부르지도 않는다 (absorbReviewedMerge 참고).
           if (ctx.headShaAtLastReview && pr.headSha !== ctx.headShaAtLastReview) {
-            await breathe(); // 부모 조회가 나갈 수 있다 — 대시보드를 멈춰 세우지 않는다
-            absorbReviewedMerge(cfg, ctx, pr.headSha);
+            await absorbReviewedMerge(cfg, ctx, pr.headSha);
           }
 
           // 1단계: probe 만으로 전이 판정 (API 추가 호출 없음)
@@ -1156,8 +1133,7 @@ program
 
           // 2단계: 모르는 스레드가 생겼을 때만 전체 동기화
           if (needsFull) {
-            await breathe();
-            syncPR(cfg, ctx);
+            await syncPR(cfg, ctx);
           }
 
           reportIfChanged(ctx);
@@ -1189,6 +1165,7 @@ program
       const usage = takeGraphQLUsage();
       lastCycleCost = usage.cost;
       lastRemaining = usage.remaining;
+      lastResetAt = usage.resetAt;
       progress.cycle({ lastCost: usage.cost, remaining: usage.remaining });
       return usage.cost;
     };
@@ -1459,12 +1436,8 @@ program
       // 폴백도 설정값(watchRepos)이 아니라 실제로 폴링한 레포 수를 쓴다.
       // 계정 모드에서는 watchRepos 가 비어 있고 레포 수는 실행 중에 늘어난다.
       const perScan = Math.max(1, lastCycleCost || watchedRepos);
-      const scansPerHour = 3_600_000 / base;
-      const needed = perScan * scansPerHour;
-      const budget = lastRemaining * RATE_BUDGET_RATIO;
-      if (needed <= budget) return base;
-
-      const scaled = Math.ceil((perScan * 3_600_000) / Math.max(1, budget));
+      const scaled = pollDelay(base, perScan, lastRemaining, lastResetAt);
+      if (scaled <= base) return base;
       console.log(
         chalk.yellow(
           `    ⚠ 잔여 한도 ${lastRemaining.toLocaleString()} — 주기를 ${formatDuration(scaled)} 로 자동 상향`,
@@ -1497,21 +1470,25 @@ program
     // 리뷰를 게시하고, 브라우저 페이지 하나를 서로 다투다 전송·수신에도 실패했다.
     let stopped = false;
     let timer: NodeJS.Timeout | null = null;
+    let cycleRunning = false;
 
     // 리뷰를 실행한 사이클 직후에는 대기 없이 재스캔한다.
     // 라운드는 2~15분 걸리므로 그 사이에 쌓인 변화를 바로 확인해야 한다.
     // (이걸 안 하면 15분 라운드 뒤 다시 폴링 주기를 기다려 꼬리 지연이 붙는다)
     const scheduleNext = (delayMs: number): void => {
       if (stopped) return;
+      if (timer) clearTimeout(timer);
       progress.cycle({ nextScanAt: Date.now() + delayMs });
       timer = setTimeout(async () => {
         if (stopped) return;
+        cycleRunning = true;
         let reviewRan = false;
         try {
           reviewRan = await loop(false);
         } catch (e) {
           console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
         }
+        cycleRunning = false;
         // 종료 요청은 사이클이 완전히 끝난 뒤에만 처리한다 — 라운드 중간에
         // 끊으면 이미 소비한 대화 한도로 만든 응답을 버린다.
         if (stopRequested) {
@@ -1519,7 +1496,7 @@ program
           await cleanup();
           return;
         }
-        scheduleNext(reviewRan ? 0 : nextDelay()); // 사이클 종료 후에만 다음 예약
+        scheduleNext(reviewRan || intents.pending > 0 ? 0 : nextDelay());
       }, delayMs);
     };
 
@@ -1528,10 +1505,12 @@ program
         `\n  ${formatDuration(cfg.watchIntervalMs)}마다 스캔합니다 (리뷰 직후에는 즉시 재스캔). Ctrl+C 로 종료.\n`,
       ),
     );
-    scheduleNext(cfg.watchIntervalMs);
+    intents.onPending = () => { if (!cycleRunning) scheduleNext(0); };
+    scheduleNext(intents.pending > 0 || stopRequested ? 0 : nextDelay());
 
     const cleanup = async () => {
       stopped = true;
+      intents.onPending = undefined;
       if (timer) clearTimeout(timer);
       await driver?.close();
       await ui?.close();
@@ -1766,7 +1745,7 @@ program
   .command('status [pr]')
   .description('추적 중인 PR 상태 조회 (pr 지정 시 상세 뷰)')
   .option('--json', 'JSON 으로 출력 (UI/스크립트 연동용)', false)
-  .action((pr: string | undefined, opts: { json: boolean }) => {
+  .action(async (pr: string | undefined, opts: { json: boolean }) => {
     const cfg = loadConfig();
     ensureDataDir(cfg);
 
@@ -1797,7 +1776,7 @@ program
     }
 
     // ── 상세 뷰 ──
-    const { owner, repo, number } = parsePRInput(pr);
+    const { owner, repo, number } = await parsePRInput(pr);
     const ctx = loadContext(cfg, owner, repo, number);
     if (!ctx) {
       console.log(chalk.dim(`\n  ${owner}/${repo}#${number} — 추적 기록 없음\n`));
@@ -1851,11 +1830,11 @@ program
 program
   .command('graph [pr]')
   .description('상태 머신 mermaid 다이어그램 출력 (pr 지정 시 현재 상태 강조)')
-  .action((pr: string | undefined) => {
+  .action(async (pr: string | undefined) => {
     const cfg = loadConfig();
     let current: PRState | undefined;
     if (pr) {
-      const { owner, repo, number } = parsePRInput(pr);
+      const { owner, repo, number } = await parsePRInput(pr);
       current = loadContext(cfg, owner, repo, number)?.state;
     }
     console.log('```mermaid');
@@ -1869,10 +1848,10 @@ program
 program
   .command('rounds <pr>')
   .description('특정 PR 의 리뷰 라운드 이력 조회')
-  .action((pr: string) => {
+  .action(async (pr: string) => {
     banner();
     const cfg = loadConfig();
-    const { owner, repo, number } = parsePRInput(pr);
+    const { owner, repo, number } = await parsePRInput(pr);
     const ctx = loadContext(cfg, owner, repo, number);
 
     if (!ctx) {

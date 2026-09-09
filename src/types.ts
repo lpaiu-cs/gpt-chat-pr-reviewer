@@ -14,6 +14,9 @@ export interface ReviewResult {
   raw: string;
   /** JSON 추출·파싱 성공 여부. false 면 게시해서는 안 된다. */
   parsed: boolean;
+  /** 모델이 확인한 고정 diff의 양 끝. 실제 게시 시 저장된 대상과 대조한다. */
+  reviewedHeadSha?: string;
+  reviewedBaseSha?: string;
 }
 
 export interface PRInfo {
@@ -45,7 +48,7 @@ export interface DiffHunk {
  *  CONVERGED       — 리뷰 수렴 (approve) — 새 커밋 발생 시 재개
  *  QUOTA_BLOCKED   — ChatGPT 사용량 한도 — 쿨다운 후 재개
  *  ERROR           — 실패 — 재시도 대기
- *  CLOSED          — PR 닫힘/머지 (terminal)
+ *  CLOSED          — PR 닫힘/머지 (재오픈 시 REVIEW_DUE)
  */
 export type PRState =
   | 'REVIEW_DUE'
@@ -66,7 +69,8 @@ export type PREvent =
   | 'COOLDOWN_ELAPSED'
   | 'REVIEW_FAILED'
   | 'RETRY'
-  | 'PR_CLOSED';
+  | 'PR_CLOSED'
+  | 'PR_REOPENED';
 
 /** 우리가 게시한 리뷰 스레드 1개의 추적 레코드. */
 export interface ThreadRecord {
@@ -148,6 +152,16 @@ export interface PRContext {
    * 근사한다.
    */
   awaitedThreadIds?: string[];
+  /** 게시 성공 후 스레드 조회가 실패해 아직 확정하지 못한 대기 집합. */
+  awaitedReview?: { id: number; inline: number };
+  /** POST 전에 저장한다. 재시작 시 같은 키로 이미 게시된 리뷰부터 조회한다. */
+  pendingReview?: {
+    key: string;
+    round: number;
+    result: ReviewResult;
+    target: { headSha: string | null; baseRef: string | null; mergeBaseSha?: string | null };
+    openThreadIds: string[];
+  };
   /**
    * 이 PR 의 라운드를 이어가는 ChatGPT 대화 URL (https://chatgpt.com/c/<uuid>).
    *
@@ -191,6 +205,7 @@ export interface PRContext {
     round: number;
     headSha: string | null;
     baseRef?: string | null;
+    mergeBaseSha?: string | null;
     /** 전송 시각 (ISO) — "이 전송이 이미 답을 받았는가" 를 라운드가 아니라 전송 단위로 본다 */
     at?: string;
   };

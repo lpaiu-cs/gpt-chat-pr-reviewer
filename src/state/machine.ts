@@ -14,7 +14,7 @@
  *              │  └─ AUTHOR_RESPONDED ─ AWAITING_AUTHOR   CONVERGED
  *              └──────── NEW_COMMITS ─────────────────────────┘
  *
- *   모든 상태 ─ PR_CLOSED ─▶ CLOSED (terminal)
+ *   모든 상태 ─ PR_CLOSED ─▶ CLOSED ─ PR_REOPENED → REVIEW_DUE
  */
 
 import type { PRState, PREvent, PRContext, EventRecord } from '../types.js';
@@ -49,7 +49,7 @@ export const TRANSITIONS: Record<PRState, Partial<Record<PREvent, PRState>>> = {
     RETRY: 'REVIEW_DUE',
     PR_CLOSED: 'CLOSED',
   },
-  CLOSED: {},
+  CLOSED: { PR_REOPENED: 'REVIEW_DUE' },
 };
 
 export const STATE_LABELS: Record<PRState, string> = {
@@ -70,7 +70,7 @@ export const NEXT_ACTION_HINTS: Record<PRState, string> = {
   CONVERGED: '수렴 완료 — 새 커밋 발생 시 자동 재개',
   QUOTA_BLOCKED: '쿼터 쿨다운 대기 후 자동 재시도',
   ERROR: '자동 재시도 대기 (또는 review --force)',
-  CLOSED: '종료됨 — 추가 액션 없음',
+  CLOSED: '종료됨 — 다시 열리면 리뷰 재개',
 };
 
 // ── 실행 ────────────────────────────────────────────────────
@@ -123,7 +123,6 @@ export function toMermaid(current?: PRState): string {
       lines.push(`  ${from} --> ${to}: ${ev}`);
     }
   }
-  lines.push('  CLOSED --> [*]');
   if (current) {
     lines.push('  classDef current fill:#4a90d9,color:#fff,stroke:#2b6cb0');
     lines.push(`  class ${current} current`);

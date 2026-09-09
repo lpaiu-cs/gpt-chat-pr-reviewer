@@ -166,7 +166,7 @@ const fakePR: PRInfo = {
 {
   const ctx = createContext(fakePR);
   assert(!canFire('REVIEW_DUE', 'POSTED_COMMENTS'), 'REVIEW_DUE 에서 POSTED_COMMENTS 불가');
-  assert(!canFire('CLOSED', 'START_REVIEW'), 'CLOSED 는 terminal (START_REVIEW 불가)');
+  assert(!canFire('CLOSED', 'START_REVIEW'), 'CLOSED 는 PR_REOPENED 전에는 START_REVIEW 불가');
 
   let threw = false;
   try {
@@ -1449,7 +1449,7 @@ const fakePR: PRInfo = {
 
   // 그래서 범위를 바꿀 때는 freshness 가 아니라 캐시 자체를 버려야 한다.
   const src = createRepoSource({ mode: 'repos', include: ['oldorg/a'], exclude: [] });
-  assert(src.list().includes('oldorg/a'), '탐색 결과가 캐시에 담긴다');
+  assert((await src.list()).includes('oldorg/a'), '탐색 결과가 캐시에 담긴다');
   src.targets = new Map([['oldorg/a', new Set([1])]]);
 
   src.reset();
@@ -1485,7 +1485,7 @@ const fakePR: PRInfo = {
   );
 
   // discoverRepos 와 같은 판정을 쓰는지 — 갈라지면 이 검증이 무의미해진다.
-  const r = discoverRepos({ mode: 'repos', include: ['owner/repo', 'owner/*'], exclude: [] });
+  const r = await discoverRepos({ mode: 'repos', include: ['owner/repo', 'owner/*'], exclude: [] });
   assert(
     r.repos.join() === 'owner/repo',
     'discoverRepos 가 버리는 패턴 = unsupportedPatterns 가 지목하는 패턴',

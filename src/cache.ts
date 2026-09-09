@@ -43,6 +43,7 @@ export interface ResponseMeta {
    */
   headSha?: string;
   baseRef?: string;
+  mergeBaseSha?: string;
 }
 
 /** 원본 응답과 출처를 저장하고 .txt 경로를 반환한다. */

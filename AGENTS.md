@@ -61,7 +61,7 @@ REVIEW_DUE ─ START_REVIEW → REVIEWING ─ POSTED_COMMENTS → AWAITING_AUTHO
                               └ REVIEW_FAILED → ERROR ─ RETRY → REVIEW_DUE
 AWAITING_AUTHOR ─ AUTHOR_RESPONDED(새 커밋 or 전체 resolve) → REVIEW_DUE
 CONVERGED ─ NEW_COMMITS → REVIEW_DUE
-모든 상태 ─ PR_CLOSED → CLOSED (terminal)
+모든 상태 ─ PR_CLOSED → CLOSED ─ PR_REOPENED → REVIEW_DUE
 ```
 
 PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레드별 resolve/답글 여부·
@@ -117,7 +117,7 @@ base 브랜치가 앞으로 나가는 건 대상에 안 들어온다 — 3-dot �
 들어온 커밋이 검토 완료로 기록돼 approve 하나로 CONVERGED 가 된다. `countTurn` 전에
 던지므로 대화 한도도 쓰지 않고 `ERROR → RETRY` 로 돌아온다. 검토 대상은 응답
 캐시 사이드카에도 남긴다 — `--from-cache` 는 아무것도 전송하지 않아 다시 알아낼
-방법이 없다 (구버전 캐시는 값이 없으므로 종전 동작).
+방법이 없다. 고정 head/merge-base SHA 및 응답의 확인값이 없는 구버전 캐시는 게시하지 않는다.
 
 **게시 직전 대조로는 못 막는다.** 판정과 응답 확보 사이가 2~15분이고, 크래시가
 없는 정상 경로(전송 → 대기 → 게시)에도 같은 창이 있다. 그래서 base 를 상태로
@@ -522,7 +522,7 @@ gh 를 부르므로 빈 검은 창이 연속으로 깜빡인다 (실측 25분에
 `windowsHide` 는 execSync 에서 안 먹는다 — 숨겨야 할 대상이 gh 가 아니라 그 앞의 셸이다.
 
 그래서 **모든 gh 호출은 `github.ts` 의 `gh()` 게이트웨이 하나만 지난다.**
-`execFileSync('gh', argv, { windowsHide: true })` 로 셸을 아예 거치지 않는다.
+`execFile('gh', argv, { windowsHide: true, timeout: 60_000 }, callback)` 로 셸 없이 비동기 실행한다. 모든 호출자는 Promise를 기다린다.
 호출부마다 플래그를 붙이는 방식은 쓰지 않았다 — opt-in 이면 새 호출부마다 재발한다.
 
 **인자는 배열로 넘긴다.** 셸이 없으므로 인용부호를 우리가 쓰면 안 된다.
@@ -532,19 +532,22 @@ gh 를 부르므로 빈 검은 창이 연속으로 깜빡인다 (실측 25분에
 실측: A/B 로 gh 12회 호출 시 execSync 는 cmd.exe 6개 포착(25ms 샘플러라 하한),
 execFileSync 는 0개. 수정 후 watch 70초 폴링에서도 0개.
 
-### 동기 호출이라 스캔은 루프를 숨 쉬게 해야 한다 (`breathe`)
+### 비동기 호출과 제어 대기
 
-`execFileSync` 는 **스레드를 통째로** 붙잡는다 — 실측 gh 한 번이 431~561ms 다.
-대시보드 서버는 같은 이벤트 루프에 얹혀 있으므로(`ui/server.ts` 헤더 참고) 레포를
-연달아 훑는 동안 요청을 받지도 답하지도 못한다. 실측: 레포 3개 스캔 중에 누른
-버튼은 **1,906ms** 만에 응답했다 (한산할 때는 3ms). 레포가 8개면 4초를 넘는다.
+gh 프로세스 대기 중에도 HTTP와 다른 리뷰 탭은 진행한다. 호출마다 60초 제한을 두고,
+시간 초과 등 성공 여부가 불명확한 게시 오류는 즉시 다른 리뷰로 재시도하지 않는다.
+의도 큐는 idle 타이머만 깨운다. 실행 중인 사이클과 겹치지 않으며 다음 안전 지점에서 적용한다.
+GraphQL 대기는 resetAt까지 남은 시간으로 계산하고, 갱신 시각을 모르면 1분 후 재확인한다.
 
-그래서 `cli.ts` 의 `scan()` 은 gh 를 부르기 **직전마다** `await breathe()`
-(`setImmediate`) 로 한 틱을 넘겨준다. 밀린 HTTP 요청이 그 틈에 처리되어 최악
-지연이 **gh 호출 한 번**으로 줄어든다 (실측 1,522ms → 541ms). 스캔 자체가
-느려지지는 않는다 — 넘겨주는 것은 이미 대기 중인 콜백뿐이고, 다음 사이클은
-`loop` 가 끝난 뒤에야 예약되므로 사이클이 겹치지도 않는다. 의도 큐의 규칙도
-그대로다: HTTP 핸들러는 큐에 쌓기만 하고 배수는 여전히 사이클 시작점에서만 한다.
+### 게시와 저장의 복구 경계
+
+모델에는 head SHA, merge-base SHA, 해당 diff를 실제로 전송한다. 응답의 reviewedHeadSha와
+reviewedBaseSha가 일치해야 게시한다. 인라인 검증도 이 고정 커밋 쌍을 사용한다.
+게시 전에 pendingReview에 UUID, 결과, 대상, 기존 열린 스레드를 원자적으로 저장한다.
+재시도는 GitHub 리뷰 본문의 같은 UUID를 먼저 조회해 이미 성공한 POST를 회수한다.
+게시 후 스레드 조회가 실패하면 review ID와 인라인 개수를 남겨 다음 전체 동기화에서 복구한다.
+리뷰 스레드, 답글, 열린 PR 목록은 마지막 페이지까지 읽는다. 불완전한 연결을 빈 목록으로 인정하지 않는다.
+상태 파일은 같은 디렉터리의 임시 파일을 rename으로 교체한다. 읽기 실패는 오류이며 신규 PR로 처리하지 않는다.
 
 ## 주의사항
 

@@ -151,7 +151,7 @@ const REPO_SLUG = /^[^/\s]+\/[^/\s]+$/;
  * repos 모드는 설정에 적힌 그대로 쓰고, 나머지는 GraphQL 검색으로 발견한다
  * (실측 cost 는 페이지당 1 point).
  */
-export function discoverRepos(scope: WatchScope): DiscoveryResult {
+export async function discoverRepos(scope: WatchScope): Promise<DiscoveryResult> {
   const exclude = scope.exclude ?? [];
 
   if (scope.mode === 'repos') {
@@ -195,7 +195,7 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
 
   for (const q of queries) {
     try {
-      const r = searchPRRepos(q);
+      const r = await searchPRRepos(q);
       r.repos.forEach((s) => found.add(s));
       if (byPR) {
         for (const { slug, number } of r.prs) {
@@ -232,7 +232,7 @@ export function discoverRepos(scope: WatchScope): DiscoveryResult {
 
 export interface RepoSource {
   /** 필요하면 재탐색하고 현재 대상 목록을 돌려준다. */
-  list(): string[];
+  list(): Promise<string[]>;
   /**
    * 감시 범위가 **런타임에 바뀌었을 때** 호출한다. 캐시·targets·freshness 를
    * 모두 버려 다음 list() 가 새 범위로 처음부터 탐색하게 한다.
@@ -344,11 +344,11 @@ export function createRepoSource(scope: WatchScope): RepoSource {
       source.lastAt = 0;
       warned.clear();
     },
-    list() {
+    async list() {
       const stale = Date.now() - source.lastAt >= interval;
       if (source.lastAt > 0 && !stale) return cached;
 
-      const r = discoverRepos(scope);
+      const r = await discoverRepos(scope);
       source.lastAt = Date.now();
       source.truncated = r.truncated;
       // 실패한 범위의 허용 목록까지 지워지면 그 PR 들이 추적 대상에서 빠진다.
