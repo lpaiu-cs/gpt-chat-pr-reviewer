@@ -99,8 +99,8 @@ test('프로젝트 변경·해제는 회전하고 같은 프로젝트의 대화�
   validateProjectUrl('');
 });
 
-test('프로젝트 새 대화는 지정 URL로 진입하며 루트 리다이렉트 시 실패한다', async () => {
-  const config = { ...cfg(), chatgptProjectUrl: PROJECT };
+test('이미 열린 빈 프로젝트 홈은 전체 로딩 없이 재사용한다', async () => {
+  const config = { ...cfg(), chatgptProjectUrl: PROJECT, chatgptProjectName: 'Reviews' };
   const driver = new ChatGPTDriver(config) as any;
   let actual = PROJECT;
   let destination = '';
@@ -108,9 +108,10 @@ test('프로젝트 새 대화는 지정 URL로 진입하며 루트 리다이렉�
     goto: async (url: string) => { destination = url; },
     waitForSelector: async () => {}, keyboard: { press: async () => {} },
     waitForTimeout: async () => {}, url: () => actual,
+    locator: () => ({ isVisible: async () => true, innerText: async () => '' }),
   };
   await driver.startNewChat();
-  assert.equal(destination, PROJECT);
+  assert.equal(destination, '');
   actual = 'https://chatgpt.com';
   await assert.rejects(driver.startNewChat(), /프로젝트에 진입/);
 });
@@ -138,13 +139,13 @@ test('프로젝트 이름 변경 리다이렉트는 같은 대화와 캐시를 �
 });
 
 test('프로젝트 입력창 실패는 원인과 최신 URL 등록 방법을 함께 안내한다', async () => {
-  const driver = new ChatGPTDriver({ ...cfg(), chatgptProjectUrl: PROJECT }) as any;
+  const driver = new ChatGPTDriver({ ...cfg(), chatgptProjectUrl: PROJECT, chatgptProjectName: 'Reviews' }) as any;
   driver.page = {
     goto: async () => {}, url: () => PROJECT,
-    waitForSelector: async () => { throw new Error('selector timeout'); },
+    locator: () => ({ isVisible: async () => { throw new Error('selector timeout'); } }),
   };
   await assert.rejects(driver.startNewChat(), (error: Error) => {
-    assert.match(error.message, /setup --project-url/);
+    assert.match(error.message, /setup/);
     assert.match(error.message, /selector timeout/);
     assert.ok(error.message.includes(PROJECT));
     return true;

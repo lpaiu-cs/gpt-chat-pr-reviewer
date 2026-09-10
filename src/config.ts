@@ -62,7 +62,7 @@ JSON 코드블록 **하나만** 출력하세요. 인사말·해설·요약 문�
 
 const DEFAULT_CONFIG: AppConfig = {
   browserProfileDir: './browser-profile',
-  headless: false,
+  headless: true,
   browserChannel: 'chrome',
   chatgptUrl: 'https://chatgpt.com',
   responseTimeoutMs: 900_000, // 15분 — 추론 모드 + 커넥터 탐색은 오래 걸린다
@@ -115,7 +115,7 @@ export function validateProjectUrl(raw: unknown): void {
 
 /** 로그인·관측은 설정 전에도 가능하지만 실제 리뷰는 프로젝트가 필요하다. */
 export function requireProjectUrl(raw: unknown): string {
-  if (!raw) throw new Error('리뷰 전용 ChatGPT 프로젝트가 필요합니다. npm run dev -- setup 으로 로그인하고 프로젝트를 생성한 뒤 URL을 입력하세요.');
+  if (!raw) throw new Error('리뷰 전용 ChatGPT 프로젝트가 필요합니다. npm run dev -- setup 으로 로그인하고 프로젝트를 열어 등록하세요.');
   validateProjectUrl(raw);
   return raw as string;
 }
@@ -135,6 +135,9 @@ export function loadConfig(configPath?: string): AppConfig {
       );
     }
     validateProjectUrl(user.chatgptProjectUrl);
+    if (user.chatgptProjectName !== undefined && (typeof user.chatgptProjectName !== 'string' || !user.chatgptProjectName.trim())) {
+      throw new Error('chatgptProjectName에는 비어 있지 않은 프로젝트 이름을 지정하세요.');
+    }
     return {
       ...DEFAULT_CONFIG,
       ...user,
@@ -179,9 +182,9 @@ export function initConfig(configPath?: string): string {
   if (existsSync(file)) return file;
   const skeleton: Partial<AppConfig> = {
     browserProfileDir: DEFAULT_CONFIG.browserProfileDir,
-    headless: false,
+    headless: true,
     browserChannel: 'chrome',
-    chatgptProjectUrl: '', // setup에서 로그인 후 프로젝트를 생성하고 URL을 입력한다
+    chatgptProjectUrl: '', // setup에서 열린 프로젝트의 URL과 이름을 읽어 등록한다
     customInstructionsFile: DEFAULT_CONFIG.customInstructionsFile,
     quotaCooldownMs: DEFAULT_CONFIG.quotaCooldownMs,
     maxTurnsPerConversation: DEFAULT_CONFIG.maxTurnsPerConversation,

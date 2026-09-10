@@ -310,6 +310,8 @@ export interface AppConfig {
   chatgptUrl: string;
   /** setup에서 등록하는 리뷰 전용 프로젝트 URL. 실제 리뷰에는 필수. */
   chatgptProjectUrl?: string;
+  /** 사이드바 탐색용 이름. 진입 후 URL의 프로젝트 ID를 반드시 대조한다. */
+  chatgptProjectName?: string;
   /** 응답 대기 최대 시간 (ms) */
   responseTimeoutMs: number;
   selectors: ChatGPTSelectors;

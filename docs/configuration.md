@@ -90,24 +90,28 @@ npm run dev -- init
 | `quotaCooldownMs` | `10800000` | ChatGPT 한도 도달 후 대기 시간 |
 | `maxAutoRetries` | `2` | 실패한 리뷰의 자동 재시도 횟수 |
 | `maxTurnsPerConversation` | `10` | 한 ChatGPT 대화에서 보낼 최대 프롬프트 수 |
-| `headless` | `false` | Chrome 헤드리스 실행 |
+| `headless` | `true` | 창 없는 Chrome 실행. setup은 로그인·프로젝트 선택을 위해 창을 표시 |
 | `browserChannel` | `chrome` | Playwright 브라우저 채널 |
 | `chatgptProjectUrl` | setup에서 등록 | 실제 리뷰에 필수인 ChatGPT 프로젝트 URL |
+| `chatgptProjectName` | setup에서 등록 | 사이드바 탐색용 이름. 진입 후 URL의 프로젝트 ID를 대조 |
 | `selectors` | — | ChatGPT UI 셀렉터 오버라이드 |
 | `promptTemplate` | — | 리뷰 프롬프트 템플릿 |
 
 ### 자동 리뷰 대화를 ChatGPT 프로젝트에 모으기
 
-`npm run dev -- setup`은 로그인 후 리뷰 전용 프로젝트 생성과 URL 입력을 안내합니다.
-접근 확인을 마친 URL만 `pr-review.config.json`에 저장합니다. 이미 로그인되어 있어도 이 단계를 거칩니다.
-기존 URL은 Enter로 유지하거나 새 URL로 바꿀 수 있습니다. 비대화형 실행에서는
-`setup --project-url <URL>` 또는 저장된 프로젝트 URL이 필요합니다.
+`npm run dev -- setup`은 로그인 후 리뷰 전용 프로젝트를 만들거나 열도록 안내합니다.
+프로젝트 홈에서 입력창이 보이면 터미널에서 Enter를 누르세요. 이름과 URL을 자동으로 읽고,
+홈으로 돌아갔다가 자동으로 다시 진입하는 검증을 통과해야 `pr-review.config.json`에 저장합니다.
+비대화형 실행에서는 `setup --project-url <URL> --project-name "이름"` 또는 저장된 URL과 이름이 필요합니다.
+프로젝트는 사이드바에 고정해 두세요. 같은 이름이 여럿이면 유일한 이름으로 변경한 뒤 다시 등록하세요.
+일반 Chrome과 자동화 프로필은 계정이 다를 수 있으므로 setup이 표시하는 계정과 프로젝트를 확인하세요.
 
 직접 설정할 경우 다음 형식을 사용합니다.
 
 ```json
 {
-  "chatgptProjectUrl": "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/project"
+  "chatgptProjectUrl": "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/project",
+  "chatgptProjectName": "PR 자동 리뷰"
 }
 ```
 
@@ -125,16 +129,25 @@ node scripts/daemon.mjs ensure
 
 프로젝트 이름을 정하거나 변경하면 주소의 `g-p-<ID>` 뒤에 이름이 붙거나 바뀔 수 있습니다.
 프로젝트 ID와 대화 ID가 같으면 같은 대화로 인식하므로, 이름이 바뀐 주소로 리다이렉트되어도 기존 대화와 응답 캐시를 유지합니다.
-이전 주소가 열리지 않거나 입력창 대기가 실패하면 브라우저에서 프로젝트를 열고 최신 주소를 복사해 다시 등록하세요.
+주소를 직접 열면 실패하지만 사이드바에서 열면 성공하는 경우가 있어 자동화는 화면 내부 이동을 사용합니다.
+프로젝트 홈 버튼은 Enter로 실행하므로 마우스 호버와 창을 앞으로 가져오는 동작이 필요하지 않습니다.
+기존 빈 프로젝트 홈은 재사용하며, 입력창에 작성 중인 내용이 있으면 덮어쓰지 않고 중단합니다.
+프로젝트 이름을 바꾸거나 진입에 실패하면 setup에서 해당 프로젝트를 다시 열어 등록하세요.
 
 ```bash
 npm run dev -- stop
-# 기존 데몬이 종료된 뒤, 복사한 실제 주소로 실행
-npm run dev -- setup --project-url "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-reviews/project"
+# 기존 데몬이 종료된 뒤
+npm run dev -- setup
+npm run dev -- project-check --repeat 3
 node scripts/daemon.mjs ensure
 ```
 
 입력창 오류가 반드시 이름 변경 때문인 것은 아닙니다. 최신 URL에서도 실패하면 자동화 프로필의 로그인·프로젝트 접근 권한과 입력창 표시 여부를 확인하세요. 오류에는 현재 주소와 원래 실패 원인이 함께 기록됩니다.
+
+watch의 `ready=true`는 로그인뿐 아니라 프로젝트 자동 진입도 통과한 뒤에만 표시됩니다.
+`project-check`는 응답을 생성하거나 GitHub 리뷰를 게시하지 않습니다. 기본은 설정된 Chrome 실행 방식이며,
+`--headless`로 창 없는 실행을 명시할 수도 있습니다. 구버전 설정의 `headless: false`는 유지되므로
+포커스를 뺏지 않는 자동 실행을 원하면 `true`로 바꾸세요. 창을 표시하는 `false` 모드는 기동 시 포커스가 이동할 수 있습니다.
 
 [ChatGPT 프로젝트 안내](https://learn.chatgpt.com/docs/projects)에 따라 프로젝트의 지침과 자료도 대화에 적용됩니다. 리뷰 전용으로 사용할 지침·자료만 넣어 두세요. 실제 프로젝트 UI의 입력창이나 URL 형식이 바뀌면 드라이버 업데이트가 필요할 수 있습니다.
 
