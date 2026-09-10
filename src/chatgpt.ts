@@ -10,6 +10,7 @@ import chalk from 'chalk';
 import { progress } from './progress.js';
 import type { AppConfig } from './types.js';
 import { chatgptProjectId, validateProjectUrl, requireProjectUrl } from './config.js';
+import { enterProject, readProjectEntry } from './project-entry.js';
 
 /** ChatGPT 사용량 한도 도달 — 상태 머신의 QUOTA_EXCEEDED 이벤트로 매핑된다. */
 export class QuotaLimitError extends Error {
@@ -478,7 +479,7 @@ export class ChatGPTDriver {
       ],
     });
     this.page = this.ctx.pages()[0] ?? (await this.ctx.newPage());
-    this.trackGenerationTraffic(this.page);
+    await this.preparePage(this.page);
   }
 
   /**
@@ -519,7 +520,7 @@ export class ChatGPTDriver {
     if (plan === 'reopen-tab' && this.ctx) {
       console.log(chalk.yellow('  ⚠ 탭이 닫혔 있습니다 — 같은 브라우저에 탭만 다시 엽니다.'));
       this.page = await this.ctx.newPage();
-      this.trackGenerationTraffic(this.page);
+      await this.preparePage(this.page);
       resetTraffic();
       await this.navigateToChatGPT();
       return true;
@@ -559,6 +560,17 @@ export class ChatGPTDriver {
    * 패턴에 안 걸려 한 번도 관측하지 못하면 `sawGeneration` 이 false 로 남고,
    * 그때는 판정을 바꾸지 않는다 — 근거 없는 조기 절단이 더 나쁘다.
    */
+  private async preparePage(page: Page): Promise<void> {
+    if (this.cfg.headless) {
+      // 설치된 Chrome 버전을 그대로 사용한다. headless 식별자에서는 같은 프로필도
+      // ChatGPT 홈/로그인이 로드되지 않아 일반 모드와 같은 UA로 맞춘다.
+      const session = await page.context().newCDPSession(page);
+      const { userAgent } = await session.send('Browser.getVersion');
+      await session.send('Network.setUserAgentOverride', { userAgent: userAgent.replace('HeadlessChrome/', 'Chrome/') });
+    }
+    this.trackGenerationTraffic(page);
+  }
+
   private trackGenerationTraffic(page: Page): void {
     page.on('crash', () => console.error(chalk.red('  ✗ Chrome 리뷰 탭 crash 감지')));
     const isGeneration = (url: string, method: string): boolean =>
@@ -609,7 +621,8 @@ export class ChatGPTDriver {
     child.ctx = ctx;
     child.owned = false;
     child.page = await ctx.newPage();
-    child.trackGenerationTraffic(child.page);
+    try { await child.preparePage(child.page); }
+    catch (error) { await child.close(); throw error; }
     return child;
   }
 
@@ -741,17 +754,29 @@ export class ChatGPTDriver {
 
   // ── 대화 ──────────────────────────────────────────────────
 
+  async registerProject(): Promise<void> {
+    const entry = await readProjectEntry(this.requirePage(), this.cfg.selectors.textInput);
+    this.cfg.chatgptProjectUrl = entry.url;
+    this.cfg.chatgptProjectName = entry.name;
+    // 수동 진입만 성공한 상태를 등록 완료로 오인하지 않는다.
+    await this.navigateToChatGPT();
+    await this.startNewChat();
+  }
+
+  async projectEntry() {
+    this.assertProjectPage(this.requirePage());
+    return readProjectEntry(this.requirePage(), this.cfg.selectors.textInput);
+  }
+
   /** 새 대화는 설정한 리뷰 전용 프로젝트 안에서만 생성한다. */
   async startNewChat(): Promise<void> {
     const p = this.requirePage();
     const project = requireProjectUrl(this.cfg.chatgptProjectUrl);
     try {
-      await p.goto(project, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      this.assertProjectPage(p);
-      await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
+      await enterProject(p, { url: project, name: this.cfg.chatgptProjectName ?? '' }, this.cfg.selectors.textInput);
     } catch (cause) {
       throw new Error('지정한 ChatGPT 프로젝트에 진입하지 못했습니다 — 로그인·접근 권한·입력창을 확인하세요. '
-        + '프로젝트 이름을 바꿨다면 데몬 종료 후 npm run dev -- setup --project-url "최신 프로젝트 URL"로 다시 등록하세요. '
+        + '데몬 종료 후 npm run dev -- setup 으로 프로젝트를 열어 다시 등록하세요. 사이드바에 프로젝트가 보이도록 고정해 주세요. '
         + `현재 주소: ${p.url()}\n${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     }
     // 새 대화 진입 시 뜨는 안내 모달을 닫고, 하이드레이션이 끝날 여유를 준다
@@ -781,7 +806,27 @@ export class ChatGPTDriver {
     if (!want) return false;
 
     try {
-      await p.goto(want, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      if (!sameConversationUrl(p.url(), want)) {
+        if (chatgptProjectId(want)) {
+          if (chatgptProjectId(want) !== chatgptProjectId(this.cfg.chatgptProjectUrl ?? '')) return false;
+          await this.startNewChat();
+          const id = new URL(want).pathname.split('/c/')[1];
+          const link = p.locator(`a[href$="/c/${id}"]`).first();
+          // ponytail: 최근 200개까지 탐색. 더 오래된 대화는 새 대화로 회전한다.
+          for (let i = 0; i < 10 && !(await link.isVisible()); i++) {
+            const more = p.getByRole('button', { name: /^(Load more conversations|더 많은 대화 불러오기)$/i });
+            if (!(await more.isVisible())) break;
+            const before = await p.locator('a[href*="/c/"]').count();
+            await more.press('Enter');
+            await p.waitForFunction(n => document.querySelectorAll('a[href*="/c/"]').length > n, before, { timeout: 10_000 });
+          }
+          if (!(await link.isVisible())) return false;
+          await link.press('Enter');
+          await p.waitForURL(u => sameConversationUrl(u.href, want), { timeout: 15_000 });
+        } else {
+          await p.goto(want, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+        }
+      }
       await p.waitForSelector(this.cfg.selectors.textInput, { timeout: 15_000 });
     } catch {
       return false;

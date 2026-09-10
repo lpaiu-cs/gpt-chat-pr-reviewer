@@ -6,7 +6,8 @@
 
 | 명령 | 설명 |
 |---|---|
-| `setup` | ChatGPT 로그인 후 리뷰 전용 프로젝트 생성 안내·URL 입력·접근 확인·저장 |
+| `setup` | 로그인 후 열린 프로젝트의 이름·URL 읽기 → 자동 재진입 검증 → 저장 |
+| `project-check` | 리뷰를 보내지 않고 프로젝트 진입 반복 검증 (`--repeat 3`, 선택적 `--headless`) |
 | `whoami` | 현재 ChatGPT 로그인 상태 확인 |
 | `init` | 설정과 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 지침 파일 열기 |

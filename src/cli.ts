@@ -266,24 +266,29 @@ function openInEditor(file: string): void {
 const program = new Command()
   .name('pr-review')
   .description('상태 머신 기반 ChatGPT PR 자동 리뷰')
-  .version('0.3.0');
+  .version('0.4.0');
 
 // ── setup ──
 
 program
   .command('setup')
-  .description('ChatGPT 로그인 및 리뷰 전용 프로젝트 생성·URL 등록')
+  .description('ChatGPT 로그인 후 열린 리뷰 프로젝트를 등록하고 자동 진입 검증')
   .option('--project-url <url>', '리뷰 전용 ChatGPT 프로젝트 URL (터미널 입력 없이 등록)')
-  .action(async (opts: { projectUrl?: string }) => {
+  .option('--project-name <name>', '사이드바의 프로젝트 이름 (--project-url과 함께 사용)')
+  .action(async (opts: { projectUrl?: string; projectName?: string }) => {
     banner();
     const cfg = loadConfig();
     if (opts.projectUrl !== undefined) cfg.chatgptProjectUrl = requireProjectUrl(opts.projectUrl.trim());
-    if (!process.stdin.isTTY && !cfg.chatgptProjectUrl) {
-      throw new Error('터미널에서 setup을 실행해 프로젝트를 생성하고 URL을 입력하세요. URL을 이미 알면 setup --project-url <url>을 사용하세요.');
+    if (opts.projectName !== undefined) cfg.chatgptProjectName = opts.projectName.trim();
+    if ((opts.projectUrl !== undefined || opts.projectName !== undefined) && (!opts.projectUrl || !opts.projectName?.trim())) {
+      throw new Error('--project-url과 --project-name을 함께 지정하세요. 또는 터미널에서 setup으로 프로젝트를 직접 열어 등록하세요.');
+    }
+    if (!process.stdin.isTTY && (!cfg.chatgptProjectUrl || !cfg.chatgptProjectName)) {
+      throw new Error('터미널에서 setup으로 프로젝트를 열어 등록하세요. 비대화형 실행은 --project-url <url> --project-name <name>이 필요합니다.');
     }
     const release = await lockOrExplain(cfg, 'setup');
     if (!release) return;
-    const driver = new ChatGPTDriver(cfg);
+    const driver = new ChatGPTDriver({ ...cfg, headless: false });
     try {
       console.log(chalk.dim('  브라우저 프로필 경로:'), cfg.browserProfileDir);
       await driver.launch();
@@ -298,28 +303,59 @@ program
 
       console.log(chalk.cyan('\n  리뷰 전용 프로젝트 설정'));
       console.log('  1. 열린 ChatGPT의 사이드바에서 새 프로젝트를 만들거나 기존 리뷰 전용 프로젝트를 여세요.');
-      console.log('  2. 예: "PR 자동 리뷰" — 프로젝트 페이지의 URL을 복사하세요.');
-      console.log('  3. 아래에 URL을 입력하면 이후 자동 리뷰 대화가 해당 프로젝트에 모입니다.');
+      console.log('  2. 프로젝트를 사이드바에 고정하고, 새 채팅 입력창이 보이는 프로젝트 홈을 여세요.');
+      console.log('  3. Enter를 누르면 이름과 URL을 자동으로 읽고, 다시 찾아 들어갈 수 있는지 검증합니다.');
       if (process.stdin.isTTY && opts.projectUrl === undefined) {
         const rl = createInterface({ input: process.stdin, output: process.stdout });
         try {
           for (;;) {
-            const previous = cfg.chatgptProjectUrl;
-            const answer = await rl.question(previous ? `  프로젝트 URL [Enter: ${previous}]: ` : '  프로젝트 URL: ');
-            try { cfg.chatgptProjectUrl = requireProjectUrl(answer.trim() || previous); break; }
+            await rl.question('  브라우저에서 리뷰 프로젝트를 연 뒤 Enter: ');
+            try { await driver.registerProject(); break; }
             catch (e) { console.log(chalk.yellow(`  ${e instanceof Error ? e.message : String(e)}`)); }
           }
         } finally { rl.close(); }
       }
       // 접근 확인이 끝나야 설정 완료다. 로그인만 됐거나 잘못된 URL이면 저장하지 않는다.
       await driver.startNewChat();
-      patchConfigFile({ chatgptProjectUrl: cfg.chatgptProjectUrl });
+      const selected = await driver.projectEntry();
+      patchConfigFile({ chatgptProjectUrl: selected.url, chatgptProjectName: selected.name });
+      console.log(chalk.dim(`  프로젝트: ${selected.name}\n  ${selected.url}`));
       console.log(chalk.green('\n  ✓ 설정 완료 — 로그인 프로필과 리뷰 전용 프로젝트 URL을 저장했습니다.'));
       console.log(chalk.dim('    이후 review / watch 명령에서 자동으로 이 세션을 재사용합니다.\n'));
     } finally {
       await driver.close();
       release();
     }
+  });
+
+program.command('project-check')
+  .description('리뷰를 보내지 않고 등록된 프로젝트의 자동 진입을 반복 검증')
+  .option('--repeat <n>', '반복 횟수 (1~10)', '3')
+  .option('--headless', 'Chrome 창 없이 검증')
+  .action(async (opts: { repeat: string; headless?: boolean }) => {
+    const repeats = Number(opts.repeat);
+    if (!Number.isInteger(repeats) || repeats < 1 || repeats > 10) throw new Error('--repeat은 1~10 정수여야 합니다.');
+    const cfg = loadConfig();
+    requireProjectUrl(cfg.chatgptProjectUrl);
+    if (opts.headless) cfg.headless = true;
+    const release = await lockOrExplain(cfg, 'project-check');
+    if (!release) throw new Error('데몬 종료 후 project-check를 실행하세요.');
+    const driver = new ChatGPTDriver(cfg);
+    try {
+      await driver.launch();
+      await driver.navigateToChatGPT();
+      const account = await driver.getSessionUser();
+      if (!account) throw new Error('ChatGPT 로그인을 확인하지 못했습니다. setup으로 로그인 상태를 확인하세요.');
+      console.log(JSON.stringify({ account }));
+      for (let i = 0; i < repeats; i++) {
+        const at = Date.now();
+        const worker = await driver.fork();
+        try {
+          await worker.startNewChat();
+          console.log(JSON.stringify({ check: i + 1, startedAt: new Date(at).toISOString(), elapsedMs: Date.now() - at, ...await worker.projectEntry() }));
+        } finally { await worker.close(); }
+      }
+    } finally { await driver.close(); release(); }
   });
 
 // ── whoami ──
@@ -960,10 +996,12 @@ program
       }
       console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
       progress.patch({ account: user.email ?? user.name ?? null });
+      await driver.startNewChat();
+      console.log(chalk.dim('  프로젝트 자동 진입 확인 완료'));
     }
 
     // 여기까지 왔으면 초기화가 끝났다 — 관측 모드는 띄울 것이 없고, 리뷰 모드는
-    // 브라우저와 로그인 확인을 통과했다. 이 값을 켜기 전까지 붙는 쪽은 기동
+    // 브라우저·로그인·프로젝트 진입 확인을 통과했다. 이 값을 켜기 전까지 붙는 쪽은 기동
     // 성공으로 보지 않는다. UI 는 이보다 한참 먼저 열리기 때문이다
     // (Snapshot.ready 주석 참고 — 로그인 만료 시 곧 죽을 프로세스를 정상으로
     // 보고하던 자리다).

@@ -355,7 +355,7 @@ async function ensure({ start = false, requireReady = false } = {}) {
       die(
         (d
           ? `데몬이 ${secs}초 안에 초기화를 끝내지 못했습니다 (대시보드는 응답하지만 준비 전).\n` +
-            `  브라우저 기동이나 ChatGPT 로그인 확인에서 멈춰 있을 수 있습니다.\n`
+            `  브라우저 기동, ChatGPT 로그인 또는 프로젝트 진입 확인에서 멈춰 있을 수 있습니다.\n`
           : `데몬이 ${secs}초 안에 뜨지 않았습니다.\n`) +
           `  로그 마지막 부분 (${path.join(dataDir(), 'watch.log')}):\n` +
           `${logTail()}`,
