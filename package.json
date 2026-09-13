@@ -30,7 +30,8 @@
   ],
   "type": "module",
   "bin": {
-    "pr-review": "./dist/cli.js"
+    "pr-review": "./dist/cli.js",
+    "pr-review-daemon": "./scripts/daemon.mjs"
   },
   "scripts": {
     "build": "tsc && node scripts/copy-ui.mjs",
