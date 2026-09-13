@@ -266,7 +266,7 @@ function openInEditor(file: string): void {
 const program = new Command()
   .name('pr-review')
   .description('상태 머신 기반 ChatGPT PR 자동 리뷰')
-  .version('0.4.0');
+  .version('0.4.1');
 
 // ── setup ──
 
