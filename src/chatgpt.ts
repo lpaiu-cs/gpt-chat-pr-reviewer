@@ -775,9 +775,10 @@ export class ChatGPTDriver {
     try {
       await enterProject(p, { url: project, name: this.cfg.chatgptProjectName ?? '' }, this.cfg.selectors.textInput);
     } catch (cause) {
-      throw new Error('지정한 ChatGPT 프로젝트에 진입하지 못했습니다 — 로그인·접근 권한·입력창을 확인하세요. '
-        + '데몬 종료 후 npm run dev -- setup 으로 프로젝트를 열어 다시 등록하세요. 사이드바에 프로젝트가 보이도록 고정해 주세요. '
-        + `현재 주소: ${p.url()}\n${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      // 원인을 첫 줄 앞머리에 둔다 — 로그는 첫 줄만, 그것도 앞에서 자른다.
+      throw new Error(`ChatGPT 프로젝트에 진입하지 못했습니다: ${cause instanceof Error ? cause.message : String(cause)}`
+        + ` (현재 주소: ${p.url()}) 데몬 종료 후 npm run dev -- setup 으로 프로젝트를 열어 다시 등록하고,`
+        + ' 사이드바에 프로젝트가 보이도록 고정해 주세요.', { cause });
     }
     // 새 대화 진입 시 뜨는 안내 모달을 닫고, 하이드레이션이 끝날 여유를 준다
     await p.keyboard.press('Escape').catch(() => {});
@@ -1208,12 +1209,15 @@ export class ChatGPTDriver {
     // ChatGPT는 한 번에 10,000자를 넘게 붙이면 첨부로 전환한다.
     // 코드 포인트 단위로 나누어 surrogate pair도 보존한다.
     const chars = Array.from(text.replace(/\r\n/g, '\n'));
+    const grew: number[] = [];
     for (let at = 0; at < chars.length; at += 4000) {
       await this.inputStep('붙여넣기', () => input.evaluate(
       (el, t: string) => {
         (el as HTMLElement).focus();
         const dt = new DataTransfer();
-        dt.setData('text/plain', t);
+        // **text/plain 을 넣지 않는다.** ChatGPT 는 붙여넣은 평문에서 GitHub URL 을
+        // 찾아 참조 칩(위젯)으로 바꾼다 — 본문의 URL 이 사라져 검증이 늘 실패했다.
+        // 칩 전환은 text/plain 만 읽고, PM 은 text/html 이 있으면 그쪽을 쓴다.
         // PM의 plain-text paste는 연속 개행을 문단 하나로 합친다. 자체 clipboard
         // 형식으로 공백 보존을 요청하고, 개행은 hard break로 전달한다.
         const escaped = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1225,17 +1229,36 @@ export class ChatGPTDriver {
       },
       chars.slice(at, at + 4000).join(''),
     ));
+      // 조각마다 입력창이 실제로 얼마나 자랐는지 남긴다. 실패했을 때 원인을
+      // 가르는 유일한 증거다 — 누적이 멈추면 재마운트·첨부 전환, 조각 길이보다
+      // 조금씩 크면 경계마다 줄바꿈이 끼는 것이다.
+      grew.push(await input.evaluate((el) => (el as HTMLElement).innerText.length));
     }
     // 처리된 paste는 preventDefault로 false를 반환할 수 있다. 이벤트 반환값이
     // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
-    const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n$/, '');
+    const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
     const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
     if (await this.inputStep('붙여넣기 검증', matches)) return;
     if ((await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
       await this.inputStep('짧은 입력 폴백', () => page.keyboard.insertText(text));
       if (await matches()) return;
     }
-    throw new Error('프롬프트 전체 내용이 일치하지 않습니다 — 재입력하거나 전송하지 않습니다');
+    // 비우기 전에 무엇이 들어갔는지부터 읽는다 — 이게 원인을 가르는 증거다.
+    const actual = normalize(await input.innerText({ timeout: 3_000 }));
+    const want = normalize(text);
+    let diffAt = 0;
+    while (diffAt < actual.length && diffAt < want.length && actual[diffAt] === want[diffAt]) diffAt++;
+    // 실패한 입력의 잔해를 남기지 않는다. 남기면 다음 라운드의 프로젝트 진입
+    // 가드가 그걸 사람이 쓰던 초안으로 보고 같은 PR 이 영원히 막힌다.
+    try {
+      await this.focusInput(page);
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Delete');
+    } catch { /* 비우지 못해도 아래 오류가 먼저다 */ }
+    const detail = `기대 ${want.length}자 · 실제 ${actual.length}자 · 첫 불일치 ${diffAt}`
+      + ` (기대 ${JSON.stringify(want.slice(diffAt, diffAt + 40))} ↔ 실제 ${JSON.stringify(actual.slice(diffAt, diffAt + 40))})`
+      + ` · 조각별 누적 ${grew.join('/')}`;
+    throw new Error(`프롬프트 전체 내용이 일치하지 않습니다 — 재입력하거나 전송하지 않습니다. ${detail}`);
   }
 
   private async clickSend(page: Page): Promise<void> {
