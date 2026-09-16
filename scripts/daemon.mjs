@@ -261,8 +261,8 @@ function launch() {
   // 존재 여부는 신선도가 아니다.
   const src = path.join(ROOT, 'src', 'cli.ts');
   const args = existsSync(src)
-    ? ['--import', 'tsx', src, 'watch', '--ui']
-    : [path.join(ROOT, 'dist', 'cli.js'), 'watch', '--ui'];
+    ? ['--import', 'tsx', src, 'serve', '--ui', '--no-open']
+    : [path.join(ROOT, 'dist', 'cli.js'), 'serve', '--ui', '--no-open'];
 
   const child = spawn(process.execPath, args, {
     cwd: ROOT, // dataDir·설정 파일 경로가 cwd 상대다
@@ -311,7 +311,7 @@ async function ensure({ start = false, requireReady = false } = {}) {
     die(
       '이 설치본의 리뷰 데몬이 돌고 있지 않습니다.\n' +
         `  시작하려면 (브라우저·ChatGPT 한도를 씁니다):  node "${path.join(ROOT, 'scripts', 'daemon.mjs').replace(/\\/g, '/')}" review <PR>\n` +
-        `  또는 ${ROOT} 에서  npm run dev -- watch --ui`,
+        `  또는 ${ROOT} 에서  npm run dev -- serve --ui`,
     );
   }
 

@@ -93,7 +93,7 @@ URL만 저장된 구버전 설정은 `setup`으로 이름도 등록하세요. �
 ### 2. 대상 확인하기 — 관측 모드 (리뷰는 아직 실행되지 않습니다)
 
 ```bash
-npm run dev -- watch --ui --observe
+npm run dev -- serve --ui --observe
 ```
 
 브라우저에서 [http://127.0.0.1:4478](http://127.0.0.1:4478)을 여세요.
@@ -115,13 +115,14 @@ npm run dev -- watch --ui --observe
 
 ```bash
 npm run dev -- stop
-npm run daemon -- ensure
+npm run dev -- serve --background
 ```
 
 저장된 UI 설정을 그대로 사용해 자동 리뷰를 시작합니다. 이후 감시 범위, 필터,
 맞춤 리뷰 지침과 종료까지 대시보드에서 관리할 수 있습니다.
 
-`ensure` 대신 `npm run dev -- watch --ui` 를 써도 되지만 성격이 다릅니다 —
+준비가 끝나면 대시보드를 기본 브라우저로 엽니다. 자동 열기를 끄려면 `--no-open`을 붙이세요.
+`--background` 없이 `npm run dev -- serve`를 쓰면 포그라운드로 실행합니다 —
 [실행 방식 두 가지](#실행-방식-두-가지)를 보세요.
 
 ### 4. (선택) PR 하나만 시험해보기
@@ -132,14 +133,25 @@ npm run dev -- review https://github.com/owner/repo/pull/123 --dry-run
 
 `--dry-run`은 GitHub 게시만 생략하며 ChatGPT 대화 한도는 사용합니다.
 
-> `watch`가 실행 중일 때 다른 터미널에서 `review`를 동시에 실행하지 마세요.
+> `serve`가 실행 중일 때 다른 터미널에서 `review`를 동시에 실행하지 마세요.
 > 같은 상태 파일을 다루므로 한 프로세스만 사용해야 합니다.
 
 ## 실행 방식 두 가지
 
 같은 데몬을 띄우지만 수명과 로그가 다릅니다.
 
-| | `npm run daemon -- ensure` | `npm run dev -- watch --ui` |
+데몬 실행 명령은 `pr-review serve`입니다. `gpt-chat-pr-watch` 스킬은 실행 중인
+데몬의 상태만 읽고, `gpt-chat-pr-review` 스킬은 리뷰를 요청합니다.
+기존 `pr-review watch`와 `npm run watch`는 호환 별칭으로 계속 동작합니다.
+`ensure`는 별도 데몬 클라이언트의 명령이므로 `npm run daemon -- ensure`로 실행합니다.
+
+평소에는 `pr-review serve -b`를 사용하세요 (`-b` = `--background`). 기존 데몬이
+있으면 재시작 없이 연결하고 대시보드를 엽니다. `--no-open`은 브라우저 자동 열기만
+끄고, 포그라운드의 `--no-ui`는 대시보드 서버도 끕니다.
+백그라운드는 저장된 설정으로 기동하므로 `--once`, `--observe`, `--dry-run`,
+`--headless`, `--ui-port` 같은 실행 옵션은 포그라운드에서 사용하세요.
+
+| | `npm run daemon -- ensure` | `npm run dev -- serve --ui` |
 |---|---|---|
 | 실행 | 백그라운드로 분리 | 그 터미널에 붙어서 (포그라운드) |
 | 터미널을 닫으면 | **계속 돕니다** | 같이 종료됩니다 |
@@ -147,8 +159,8 @@ npm run dev -- review https://github.com/owner/repo/pull/123 --dry-run
 | 이미 떠 있으면 | 그대로 두고 주소만 알려줌 (멱등) | 잠금 충돌로 뜨지 않음 |
 | 로그인 만료 확인 | 기동 성공 전에 확인 | 대시보드는 먼저 뜨고 그 뒤 확인 |
 
-평소에는 `ensure` 를 권합니다. 로그가 파일에 남아야 나중에 실패 원인을 짚을 수
-있고, 세션을 닫아도 리뷰가 이어집니다. `watch --ui` 는 로그를 눈앞에서 흘려보며
+`serve -b`는 내부적으로 `ensure`를 사용하고 대시보드를 자동으로 엽니다.
+로그가 파일에 남고, 세션을 닫아도 리뷰가 이어집니다. `serve`는 로그를 눈앞에서 흘려보며
 디버깅할 때 씁니다.
 
 종료는 어느 쪽이든 같습니다 — 대시보드의 **종료** 버튼 또는 `npm run dev -- stop`.
@@ -195,10 +207,12 @@ $gpt-chat-pr-review 스킬로 이 PR에 ChatGPT 리뷰어를 붙여줘.
 
 | 명령 | 설명 |
 |---|---|
+| `pr-review serve -b` | 백그라운드 기동 또는 기존 데몬 연결 후 대시보드 자동 열기 |
+| `pr-review serve -b --no-open` | 브라우저를 열지 않고 백그라운드 기동·연결 |
 | `npm run daemon -- ensure` | 데몬을 백그라운드로 띄운다 (이미 떠 있으면 그대로) |
 | `npm run daemon -- status` | 돌고 있는 데몬의 진행 상황·대기열 |
-| `npm run dev -- watch --ui` | 포그라운드로 감시와 대시보드 시작 |
-| `npm run dev -- watch --ui --observe` | 리뷰는 실행하지 않고 대상만 관측 |
+| `npm run dev -- serve --ui` | 포그라운드로 자동 리뷰 데몬과 대시보드 시작 |
+| `npm run dev -- serve --ui --observe` | 리뷰는 실행하지 않고 대상만 관측 |
 | `npm run dev -- review <pr-url>` | PR 한 건 리뷰 (데몬이 떠 있으면 쓰지 마세요) |
 | `npm run dev -- queue` | 리뷰 대기열 확인 |
 | `npm run dev -- status [pr]` | 현재 상태 확인 |
@@ -224,7 +238,7 @@ $gpt-chat-pr-review 스킬로 이 PR에 ChatGPT 리뷰어를 붙여줘.
 접수된 것입니다 — [대시보드에서 할 수 있는 것](#대시보드에서-할-수-있는-것) 참고.
 
 **터미널을 닫았더니 리뷰가 멈췄습니다**
-`npm run dev -- watch --ui` 는 포그라운드 실행이라 터미널과 함께 종료됩니다.
+`npm run dev -- serve --ui` 는 포그라운드 실행이라 터미널과 함께 종료됩니다.
 `npm run daemon -- ensure` 로 띄우면 세션과 무관하게 계속 돕니다.
 
 **대시보드가 안 열립니다**

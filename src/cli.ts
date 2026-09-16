@@ -8,7 +8,7 @@
  *   init              설정 파일 + 맞춤 지침 파일 생성
  *   instructions      맞춤 지침 파일 열기/생성
  *   review <pr>       특정 PR 리뷰 라운드 실행
- *   watch             감시 범위 폴링 → 상태 머신 동기화 → 큐 순서대로 자동 리뷰
+ *   serve             리뷰 데몬 실행: 감시 범위 폴링 → 동기화 → 자동 리뷰
  *                     (--ui 로 localhost 관측 대시보드 동반 실행)
  *   queue             리뷰 대기열 조회 (--json)
  *   status [pr]       추적 중인 PR 상태 조회 (--json)
@@ -16,10 +16,12 @@
  *   rounds <pr>       특정 PR 의 리뷰 라운드 이력 조회
  */
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import chalk from 'chalk';
 
 import { loadConfig, initConfig, ensureDataDir, patchConfigFile, requireProjectUrl } from './config.js';
@@ -245,8 +247,8 @@ async function lockOrExplain(cfg: AppConfig, command: string): Promise<(() => vo
   }
 }
 
-/** OS 기본 편집기로 파일 열기 (실패해도 무시). */
-function openInEditor(file: string): void {
+/** OS 기본 앱으로 파일 또는 대시보드 열기 (실패해도 경로는 남긴다). */
+function openWithDefaultApp(file: string): void {
   try {
     const [cmd, args] =
       process.platform === 'win32'
@@ -255,7 +257,9 @@ function openInEditor(file: string): void {
           ? ['open', [file]]
           : ['xdg-open', [file]];
     // windowsHide: 'cmd /c start' 도 콘솔 창을 띄운다 (github.ts 의 gh 게이트웨이 참고).
-    spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', (e) => console.error(`자동으로 열지 못했습니다: ${file} (${e.message})`));
+    child.unref();
   } catch {
     /* 편집기 실행 실패 — 경로만 안내 */
   }
@@ -321,7 +325,7 @@ program
       patchConfigFile({ chatgptProjectUrl: selected.url, chatgptProjectName: selected.name });
       console.log(chalk.dim(`  프로젝트: ${selected.name}\n  ${selected.url}`));
       console.log(chalk.green('\n  ✓ 설정 완료 — 로그인 프로필과 리뷰 전용 프로젝트 URL을 저장했습니다.'));
-      console.log(chalk.dim('    이후 review / watch 명령에서 자동으로 이 세션을 재사용합니다.\n'));
+      console.log(chalk.dim('    이후 review / serve 명령에서 자동으로 이 세션을 재사용합니다.\n'));
     } finally {
       await driver.close();
       release();
@@ -417,7 +421,7 @@ program
     const f = ensureInstructionsFile(cfg);
     console.log(chalk.green(`  ✓ 지침 파일: ${f}`));
     console.log(chalk.dim('    이 파일의 내용이 매 리뷰 프롬프트에 주입됩니다.\n'));
-    openInEditor(f);
+    openWithDefaultApp(f);
   });
 
 // ── review ──
@@ -506,18 +510,25 @@ program
     },
   );
 
-// ── watch ──
+// ── serve ──
 
 program
-  .command('watch')
-  .description('감시 범위 폴링 → 상태 머신 동기화 → 리뷰 큐 순서대로 자동 리뷰')
+  .command('serve')
+  .alias('watch')
+  .description('리뷰 데몬 실행 — 감시·동기화·자동 리뷰 (watch는 이전 이름)')
+  .addOption(new Option('-b, --background', '기존 데몬에 연결하거나 백그라운드로 시작한다')
+    .conflicts(['once', 'observe', 'dryRun', 'headless', 'uiPort']))
   .option('--headless', '헤드리스 모드로 실행', false)
   .option('--dry-run', '게시·상태 전이 없이 결과만 출력', false)
   .option('--once', '1회만 스캔 후 큐를 모두 소진하고 종료', false)
   .option('--observe', '감시·동기화만 하고 리뷰는 실행하지 않는다 (브라우저·한도 소비 없음)', false)
-  .option('--ui', '관측 대시보드를 localhost 에 띄운다 (읽기 전용)', false)
+  .option('--ui', '대시보드를 localhost 에 띄운다', true)
+  .option('--no-ui', '대시보드를 사용하지 않는다 (포그라운드 전용)')
+  .option('--no-open', '대시보드를 기본 브라우저로 자동으로 열지 않는다')
   .option('--ui-port <port>', `대시보드 포트 (기본 ${DEFAULT_UI_PORT})`)
   .action(async (opts: {
+    background?: boolean;
+    open: boolean;
     headless: boolean;
     dryRun: boolean;
     once: boolean;
@@ -525,6 +536,25 @@ program
     ui: boolean;
     uiPort?: string;
   }) => {
+    if (opts.background) {
+      if (!opts.ui) throw new Error('--background는 데몬 연결을 위해 대시보드가 필요합니다. --no-open을 사용하세요.');
+      const daemon = fileURLToPath(new URL('../scripts/daemon.mjs', import.meta.url));
+      const { stdout } = await promisify(execFile)(process.execPath, [daemon, 'ensure', '--json'], { windowsHide: true })
+        .catch((e: Error & { stdout?: string }) => {
+          if (e.stdout) {
+            try { e.message = JSON.parse(e.stdout).error ?? e.message; } catch { /* 원래 실행 오류 유지 */ }
+          }
+          throw e;
+        });
+      const result = JSON.parse(stdout) as { ui: string; started: boolean; mode: string };
+      // URL은 연결한 데몬이 반환한 실제 포트다. 고정 포트나 현재 cwd로 추정하지 않는다.
+      const url = new URL(result.ui);
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || result.ui !== url.origin) throw new Error('잘못된 대시보드 주소');
+      console.log(`${result.started ? '데몬을 백그라운드로 시작했습니다' : '기존 데몬에 연결했습니다'} (${result.mode}) — ${result.ui}`);
+      console.log('터미널을 닫아도 계속 실행됩니다. 종료: 대시보드의 종료 버튼 또는 pr-review stop');
+      if (opts.open) openWithDefaultApp(result.ui);
+      return;
+    }
     banner();
     const cfg = loadConfig();
     if (!opts.observe) requireProjectUrl(cfg.chatgptProjectUrl);
@@ -1006,6 +1036,7 @@ program
     // (Snapshot.ready 주석 참고 — 로그인 만료 시 곧 죽을 프로세스를 정상으로
     // 보고하던 자리다).
     progress.patch({ ready: true });
+    if (ui && opts.open) openWithDefaultApp(ui.url);
 
     // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
     // 한 줄 찍고, 그 외에는 주기적 하트비트로만 살아있음을 알린다.
@@ -1632,7 +1663,7 @@ async function findDashboard(dataDir: string, recorded: string | null): Promise<
 
 program
   .command('stop')
-  .description('돌고 있는 watch 데몬을 종료한다 (진행 중인 라운드는 끝까지 마친다)')
+  .description('돌고 있는 리뷰 데몬을 종료한다 (진행 중인 라운드는 끝까지 마친다)')
   .option('--now', '라운드 종료를 기다리지 않고 즉시 끝낸다 (진행 중인 응답을 버린다)', false)
   .action(async (opts: { now: boolean }) => {
     const cfg = loadConfig();
@@ -1705,7 +1736,7 @@ program
 
 program
   .command('queue')
-  .description('리뷰 대기열 조회 — watch 가 처리할 순서대로')
+  .description('리뷰 대기열 조회 — 데몬이 처리할 순서대로')
   .option('--json', 'JSON 으로 출력 (UI/스크립트 연동용)', false)
   .action((opts: { json: boolean }) => {
     const cfg = loadConfig();

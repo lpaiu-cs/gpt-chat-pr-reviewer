@@ -12,19 +12,25 @@
 | `init` | 설정과 맞춤 지침 파일 생성 |
 | `instructions` | 맞춤 지침 파일 열기 |
 | `review <pr>` | PR 한 건 리뷰 |
-| `watch` | 감시 범위를 폴링하고 리뷰 대기열 실행 |
+| `serve` | 감시 범위를 폴링하고 리뷰 대기열 실행 |
 | `queue` | 리뷰 대기열 조회 |
 | `status [pr]` | 현재 PR 상태 조회 |
 | `rounds <pr>` | 리뷰 라운드 이력 조회 |
 | `graph [pr]` | 상태 정보를 Mermaid 텍스트로 출력 |
-| `stop` | 실행 중인 watch 종료 |
+| `stop` | 실행 중인 리뷰 데몬 종료 |
 
 각 명령의 전체 옵션은 `--help`로 확인할 수 있습니다.
 
 ```bash
 npm run dev -- review --help
-npm run dev -- watch --help
+npm run dev -- serve --help
 ```
+
+`pr-review serve -b` (`--background`)는 저장된 설정으로 백그라운드 데몬을
+시작하거나 기존 데몬에 연결합니다. 준비가 끝나면 실제 대시보드 주소를 기본
+브라우저로 엽니다. `--no-open`으로 자동 열기를 끌 수 있습니다.
+포그라운드 `serve`도 대시보드와 자동 열기가 기본이며, `--no-ui`로 UI를 끕니다.
+`--once`, `--observe`, `--dry-run`, `--headless`, `--ui-port`는 포그라운드 전용입니다.
 
 ## PR 한 건 리뷰
 
@@ -68,7 +74,7 @@ npm run dev -- review <pr-url> --from-cache
 ## 관측 모드
 
 ```bash
-npm run dev -- watch --observe
+npm run dev -- serve --observe
 ```
 
 GitHub 동기화와 대기열 계산만 하고 리뷰는 실행하지 않습니다. Chrome과 ChatGPT
@@ -81,9 +87,9 @@ GitHub 동기화와 대기열 계산만 하고 리뷰는 실행하지 않습니�
 ## 대시보드
 
 ```bash
-npm run dev -- watch --ui
-npm run dev -- watch --ui --observe
-npm run dev -- watch --ui --ui-port 9000
+npm run dev -- serve --ui
+npm run dev -- serve --ui --observe
+npm run dev -- serve --ui --ui-port 9000
 ```
 
 기본 주소는 `http://127.0.0.1:4478`입니다. 다음 정보를 실시간으로 보여줍니다.
@@ -116,7 +122,7 @@ npm run dev -- stop --now
 
 ## 이벤트 알림
 
-`watch --ui`의 이벤트 스트림을 구독해 리뷰 결과가 올라올 때 알림을 받을 수
+`serve --ui`의 이벤트 스트림을 구독해 리뷰 결과가 올라올 때 알림을 받을 수
 있습니다.
 
 ```bash

@@ -15,7 +15,7 @@ Codex 자동 리뷰를 모방한 **상태 머신 기반** 리뷰 라이프사이
 
 ```
 src/
-  cli.ts            — CLI 진입점 (setup/init/instructions/review/watch/queue/status/graph/rounds)
+  cli.ts            — CLI 진입점 (setup/init/instructions/review/serve/queue/status/graph/rounds)
   state/
     machine.ts      — 상태 머신: TRANSITIONS 선언 테이블 (단일 소스) + fire/canFire/toMermaid
     store.ts        — PR 컨텍스트 영속화 (data/state/<owner>__<repo>__<n>.json). 잠금 없음
@@ -179,7 +179,7 @@ merge-base 가 같다). `gh pr diff` 는 언제나 현재 head·현재 base 를 
 다툰다. 큐 대기는 GitHub 에서 관측된 PR 상태가 아니므로 `QUEUED` 같은 상태를
 `TRANSITIONS` 에 추가하지 않는다.
 
-## 대시보드 (`watch --ui`)
+## 대시보드 (`serve --ui`)
 
 **watch 프로세스 안에서** 돈다. 별도 프로세스가 아니고 `data/state/*.json` 을 읽지도
 않는다 — `progress.ts` 버스에 모인 루프의 메모리만 본다. 이유는 큐를 파일로 저장하지
@@ -395,8 +395,17 @@ start 에서는 UI 가 브라우저 기동보다 먼저 열려(로그인 안내�
 
 ## 핵심 흐름
 
+CLI 데몬 실행의 기본 이름은 `serve`다 (`watch`는 호환 별칭).
+`gpt-chat-pr-watch` 스킬은 읽기 전용 관측, `gpt-chat-pr-review` 스킬은 리뷰 요청이다.
+백그라운드 기동은 `npm run daemon -- ensure`, 포그라운드 기동은 `npm run dev -- serve --ui`다.
+사람용 `serve -b`/`--background`는 기존 `ensure --json`에 위임한 뒤 실제 UI 주소를 연다.
+`serve`는 대시보드·자동 열기가 기본이며 `--no-open`으로 자동 열기만 끈다.
+클라이언트가 띄우는 자식은 `--no-open`으로 실행해 스킬 호출이나 중복 기동이 창을 열지 않는다.
+백그라운드는 저장 설정을 사용하며 실행별 옵션(`--observe` 등)은 거부한다.
+설정 키(`watch`), 로그 파일(`watch.log`), 내부 모듈명은 그대로 유지한다.
+
 1. `setup` → Chrome 영속 프로필로 ChatGPT 수동 로그인 (1회)
-2. `watch` → 감시 범위 해석(`watch-scope.ts`) → 레포 폴링 → `syncPR` 이 GitHub
+2. `serve` → 감시 범위 해석(`watch-scope.ts`) → 레포 폴링 → `syncPR` 이 GitHub
    현황(스레드 resolve·head SHA·닫힘)을 상태 머신 이벤트로 변환
 3. 스캔이 끝나면 `buildQueue` 로 우선순위를 매기고 앞에서 `maxConcurrentReviews`
    만큼(기본 1건) `runRound` 실행 후 즉시 재스캔. 동시 실행은 라운드마다 탭이
@@ -498,12 +507,12 @@ npm install
 npm run smoke        # 상태 머신 테스트
 npm run dev -- init  # 설정 + instructions.md 생성
 npm run dev -- review <pr-url> [--dry-run|--force]
-npm run dev -- watch [--once|--headless|--observe|--ui|--ui-port <port>]
+npm run dev -- serve [--once|--headless|--observe|--ui|--ui-port <port>]
 npm run dev -- queue [--json]   # 리뷰 대기열
 npm run dev -- status [pr] [--json]
 npm run dev -- graph [pr]   # mermaid 다이어그램
 npm run dev -- stop [--now] # 데몬 종료 (기본은 현재 라운드를 마친 뒤)
-npm run notify       # 대시보드 이벤트 알림 (watch --ui 가 떠 있어야 한다)
+npm run notify       # 대시보드 이벤트 알림 (serve --ui 가 떠 있어야 한다)
 npm run install-skills      # skills/ → Codex·Claude Code skills 디렉터리
 npm run daemon -- ensure    # 스킬이 쓰는 클라이언트 (직접 쓸 일은 드물다)
 ```

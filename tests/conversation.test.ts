@@ -157,7 +157,7 @@ test('설정 없는 최초 실행은 프로젝트 등록을 안내하고 실제 
   const cli = fileURLToPath(new globalThis.URL('../src/cli.ts', import.meta.url));
   const tsx = new globalThis.URL('../node_modules/tsx/dist/loader.mjs', import.meta.url).href;
   try {
-    for (const args of [['setup'], ['setup', '--project-url', 'https://example.com'], ['watch', '--once']]) {
+    for (const args of [['setup'], ['setup', '--project-url', 'https://example.com'], ['serve', '--once'], ['watch', '--once']]) {
       const run = spawnSync(process.execPath, ['--import', tsx, cli, ...args], {
         cwd: dir, encoding: 'utf8', windowsHide: true, timeout: 10_000,
       });
