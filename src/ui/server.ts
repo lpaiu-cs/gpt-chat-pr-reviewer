@@ -53,6 +53,7 @@ export interface UIServerHandle {
  * 서버가 config 를 직접 알면 UI 계층이 설정 로딩까지 떠안게 된다.
  */
 export interface UIHooks {
+  requestAccountSwitch?: (action: 'start' | 'complete') => void;
   readInstructions: () => string;
   writeInstructions: (body: string) => string;
   /**
@@ -266,7 +267,7 @@ async function handle(
     // URL 을 **본문보다 먼저** 판별한다. 본문부터 읽으면 존재하지 않는 경로에
     // 깨진 JSON 을 보낸 요청이 404 가 아니라 400 으로 답해 상태코드가 거짓말을 한다.
     const known =
-      url === '/api/intent' || url === '/api/instructions' || url === '/api/shutdown';
+      url === '/api/intent' || url === '/api/instructions' || url === '/api/shutdown' || url === '/api/account';
     if (!known) {
       json(res, 404, { ok: false, error: 'not found' });
       return;
@@ -274,6 +275,15 @@ async function handle(
 
     try {
       const body = await readJson(req);
+
+      if (url === '/api/account') {
+        const action = (body as Record<string, unknown> | null)?.action;
+        if (action !== 'start' && action !== 'complete') throw new Error('action은 start 또는 complete여야 합니다.');
+        if (!hooks.requestAccountSwitch) throw new Error('이 데몬에서는 계정 변경을 지원하지 않습니다.');
+        hooks.requestAccountSwitch(action);
+        json(res, 202, { ok: true });
+        return;
+      }
 
       if (url === '/api/intent') {
         const intent = parseIntent(body);

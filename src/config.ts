@@ -135,6 +135,11 @@ export function loadConfig(configPath?: string): AppConfig {
       );
     }
     validateProjectUrl(user.chatgptProjectUrl);
+    if (user.accountSwitchPending != null &&
+        (typeof user.accountSwitchPending !== 'object' ||
+         typeof user.accountSwitchPending.previousUser !== 'string' || !user.accountSwitchPending.previousUser)) {
+      throw new Error('accountSwitchPending의 이전 계정 식별자가 올바르지 않습니다.');
+    }
     if (user.chatgptProjectName !== undefined && (typeof user.chatgptProjectName !== 'string' || !user.chatgptProjectName.trim())) {
       throw new Error('chatgptProjectName에는 비어 있지 않은 프로젝트 이름을 지정하세요.');
     }

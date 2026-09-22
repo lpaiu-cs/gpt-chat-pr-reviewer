@@ -192,6 +192,11 @@ export interface Snapshot {
   startedAt: number;
   scope: string;
   account: string | null;
+  project?: { url: string; name: string };
+  accountSwitch?: {
+    phase: 'idle' | 'queued' | 'opening' | 'login' | 'checking' | 'complete';
+    error?: string;
+  };
   dryRun: boolean;
   cycle: CycleInfo;
   /** 쿼터 쿨다운 해제 시각 (epoch ms) */

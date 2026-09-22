@@ -27,6 +27,7 @@ import { VERSION } from './version.js';
 
 import { loadConfig, initConfig, ensureDataDir, patchConfigFile, requireProjectUrl } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
+import { AccountSwitch } from './account-switch.js';
 import { parsePRInput, getPRInfo, fetchRepoProbe, takeGraphQLUsage, pollDelay } from './github.js';
 import {
   absorbReviewedMerge,
@@ -559,6 +560,7 @@ program
     banner();
     const cfg = loadConfig();
     if (!opts.observe) requireProjectUrl(cfg.chatgptProjectUrl);
+    if (cfg.accountSwitchPending && !opts.ui) throw new Error('계정 변경 중입니다. serve --ui로 대시보드에서 완료해 주세요.');
     if (opts.headless) cfg.headless = true;
     ensureDataDir(cfg);
 
@@ -600,6 +602,12 @@ program
 
     // ── 제어 상태 (UI 의도 큐가 바꾼다) ──
     let paused = false;
+    let driver: ChatGPTDriver | null = null;
+    let browserReady = false;
+    const accountSwitch = new AccountSwitch(cfg, () => {
+      if (!driver) throw new Error('ChatGPT 브라우저가 준비되지 않았습니다.');
+      return driver;
+    });
     /**
      * 종료 예약. `/api/shutdown` 이 넣은 의도를 applyIntents 가 여기로 옮긴다.
      *
@@ -696,7 +704,7 @@ program
      * 그 라운드가 끝나고 저장할 때 반쯤 낡은 기준으로 판정한 결과가 섞인다.
      * HTTP 핸들러가 여기까지 들어오지 않는 이유가 이것이다 (intents.ts 참고).
      */
-    const applyIntents = (): void => {
+    const applyIntents = async (): Promise<void> => {
       const queued = intents.drain();
       if (queued.length === 0) return;
 
@@ -741,6 +749,9 @@ program
           case 'resume':
             if (paused) console.log(chalk.green('    ▶ 재개'));
             paused = false;
+            break;
+          case 'account-switch':
+            if (await accountSwitch.apply(it.action)) quotaUntil = 0;
             break;
           case 'skip-add':
             editList('skip', it.ref, true);
@@ -933,6 +944,13 @@ program
       }
       try {
         ui = await startUIServer(port, {
+          requestAccountSwitch: (action) => {
+            if (opts.observe) throw new Error('관측 모드에서는 계정을 변경할 수 없습니다.');
+            if (opts.once) throw new Error('일회 실행에서는 계정을 변경할 수 없습니다. serve로 실행해 주세요.');
+            if (!browserReady) throw new Error('브라우저를 준비 중입니다. 잠시 기다려 주세요.');
+            if (stopRequested) throw new Error('데몬을 종료 중입니다.');
+            accountSwitch.request(action);
+          },
           readInstructions: () => readInstructionsRaw(cfg),
           writeInstructions: (body) => saveInstructions(cfg, body),
           // 형식은 서버가 보고, 뜻은 여기서 본다 — 감시 범위와 모드를 아는 쪽이다.
@@ -1007,7 +1025,6 @@ program
     // ── 관측 모드 ──
     // 리뷰를 실행하지 않으므로 브라우저를 아예 띄우지 않는다. ChatGPT 한도도,
     // Chrome 창도, 로그인도 필요 없다 — GitHub 폴링만 도는 완전한 무비용 모드다.
-    let driver: ChatGPTDriver | null = null;
     if (opts.observe) {
       console.log(
         chalk.cyan('  ◆ 관측 모드 — 리뷰를 실행하지 않습니다') +
@@ -1015,20 +1032,24 @@ program
       );
     } else {
       driver = new ChatGPTDriver(cfg);
-      await driver.launch();
+      await driver.launch(cfg.accountSwitchPending ? false : cfg.headless);
       await driver.navigateToChatGPT();
 
-      const user = await driver.getSessionUser();
-      if (!user) {
-        console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
-        await driver.close();
-        await ui?.close();
-        return;
+      if (!cfg.accountSwitchPending) {
+        const user = await driver.getSessionUser();
+        if (!user) {
+          console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
+          await driver.close();
+          await ui?.close();
+          return;
+        }
+        console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
+        progress.patch({ account: user.email ?? user.name ?? null });
+        await driver.startNewChat();
+        progress.patch({ project: await driver.projectEntry() });
+        console.log(chalk.dim('  프로젝트 자동 진입 확인 완료'));
       }
-      console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
-      progress.patch({ account: user.email ?? user.name ?? null });
-      await driver.startNewChat();
-      console.log(chalk.dim('  프로젝트 자동 진입 확인 완료'));
+      browserReady = true;
     }
 
     // 여기까지 왔으면 초기화가 끝났다 — 관측 모드는 띄울 것이 없고, 리뷰 모드는
@@ -1036,7 +1057,8 @@ program
     // 성공으로 보지 않는다. UI 는 이보다 한참 먼저 열리기 때문이다
     // (Snapshot.ready 주석 참고 — 로그인 만료 시 곧 죽을 프로세스를 정상으로
     // 보고하던 자리다).
-    progress.patch({ ready: true });
+    progress.patch({ ready: !cfg.accountSwitchPending });
+    accountSwitch.publish();
     if (ui && opts.open) openWithDefaultApp(ui.url);
 
     // 짧은 주기로 돌리면 매 사이클 출력은 소음이다. PR 상태가 바뀌었을 때만
@@ -1393,7 +1415,7 @@ program
       takeGraphQLUsage();
 
       // 제어 의도는 스캔 직전에만 적용한다 — 라운드가 돌지 않는 유일한 지점이다.
-      applyIntents();
+      await applyIntents();
 
       // 종료가 예약됐으면 **여기서 접는다.** 아래로 내려가면 이 사이클이 또
       // 라운드를 시작해 2~15분을 더 붙잡는다 — 사용자가 종료를 누른 뒤 그만큼
@@ -1430,7 +1452,7 @@ program
       }
 
       // ── 일시정지: 감시·동기화는 계속하고 실행만 멈춘다 ──
-      if (paused) {
+      if (paused || accountSwitch.blocked) {
         tally();
         if (queue.length > 0 && Date.now() - pauseNotified > HEARTBEAT_MS) {
           pauseNotified = Date.now();
@@ -1504,7 +1526,7 @@ program
           );
           break;
         }
-        if (!drain) break; // 한 배치만 돌리고 즉시 재스캔
+        if (!drain || intents.pending > 0) break; // 제어 요청은 다음 배치보다 먼저 적용
       }
 
       // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.

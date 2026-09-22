@@ -312,6 +312,8 @@ export interface AppConfig {
   chatgptProjectUrl?: string;
   /** 사이드바 탐색용 이름. 진입 후 URL의 프로젝트 ID를 반드시 대조한다. */
   chatgptProjectName?: string;
+  /** 계정 전환 중 크래시/재시작에도 이전 프로젝트로 리뷰를 재개하지 않는다. */
+  accountSwitchPending?: { previousUser: string } | null;
   /** 응답 대기 최대 시간 (ms) */
   responseTimeoutMs: number;
   selectors: ChatGPTSelectors;

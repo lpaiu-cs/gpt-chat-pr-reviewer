@@ -31,6 +31,8 @@ export type Intent =
   | { kind: 'review-now'; ref: string; seq?: number }
   | { kind: 'pause' }
   | { kind: 'resume' }
+  /** 대시보드 전용 경로에서만 예약하며 라운드 사이에 적용한다. */
+  | { kind: 'account-switch'; action: 'start' | 'complete' }
   /**
    * 동시에 돌릴 라운드 수 (`0` = 제한 없음).
    *

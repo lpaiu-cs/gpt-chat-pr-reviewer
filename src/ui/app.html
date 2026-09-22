@@ -254,6 +254,7 @@
     <span id="m-uptime"></span>
   </div>
   <button class="btn" id="btn-pause">⏸ 일시정지</button>
+  <button class="btn" id="btn-account">계정 변경</button>
   <label class="btn" id="lbl-conc" title="한 번에 몇 건까지 동시에 리뷰할지 — 같은 계정의 ChatGPT 한도를 그만큼 빨리 씁니다">
     동시
     <select id="sel-conc">
@@ -306,6 +307,26 @@
   <span id="f-quota" class="quota"></span>
   <span id="f-pending"></span>
 </footer>
+
+<dialog id="dlg-account" aria-labelledby="account-title">
+  <form method="dialog" class="dlg-h"><span id="account-title">ChatGPT 계정 변경</span><button class="btn" value="cancel">닫기</button></form>
+  <div class="dlg-b">
+    <p>진행 중인 리뷰를 마친 뒤 로그인용 Chrome 창을 엽니다. 새 계정과 리뷰 프로젝트 확인이 끝나면 리뷰를 재개합니다.</p>
+    <ol>
+      <li>아래 <b>계정 변경 시작</b>을 누릅니다.</li>
+      <li>열린 Chrome에서 현재 계정을 로그아웃하고 사용할 계정으로 로그인합니다.</li>
+      <li>새 계정의 리뷰용 프로젝트를 만들거나 열고 사이드바에 고정합니다. <b>프로젝트 홈</b>을 연 상태로 돌아오세요.</li>
+      <li><b>로그인·프로젝트 확인</b>을 누르면 계정과 프로젝트 이름·URL을 자동으로 읽고 저장합니다.</li>
+    </ol>
+    <div id="account-project" style="overflow-wrap:anywhere"></div>
+    <p id="account-status" role="status" aria-live="polite"></p>
+    <div class="dlg-f">
+      <button class="btn lg" id="btn-account-start">계정 변경 시작</button>
+      <button class="btn lg on" id="btn-account-complete" disabled>로그인·프로젝트 확인</button>
+    </div>
+    <div class="hint-s">이 창을 닫아도 계정 변경은 계속 대기합니다. 로그인과 프로젝트 확인 전에는 리뷰가 실행되지 않습니다.</div>
+  </div>
+</dialog>
 
 <dialog id="dlg-scope">
   <form method="dialog" class="dlg-h">감시 범위<button class="btn" value="cancel">닫기</button></form>
@@ -647,6 +668,62 @@ $('sel-conc').addEventListener('change', (e) => {
   sendIntent({ kind: 'concurrency-set', value }, [['conc', value]]);
 });
 
+let accountRequestPending = false;
+let accountRequestError = '';
+$('btn-account').addEventListener('click', () => {
+  renderAccount();
+  $('dlg-account').showModal();
+});
+async function requestAccount(action) {
+  accountRequestPending = true;
+  accountRequestError = '';
+  renderAccount();
+  try {
+    const res = await fetch('/api/account', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }),
+    });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || res.status);
+  } catch (error) { accountRequestError = error.message; }
+  finally { accountRequestPending = false; renderAccount(); }
+}
+$('btn-account-start').addEventListener('click', () => requestAccount('start'));
+$('btn-account-complete').addEventListener('click', () => requestAccount('complete'));
+function renderAccount() {
+  const state = snap && snap.accountSwitch || { phase: 'idle' };
+  const phase = state.phase;
+  const active = !['idle', 'complete'].includes(phase);
+  const busy = accountRequestPending || ['queued', 'opening', 'checking'].includes(phase);
+  const available = !!(snap && snap.accountSwitch && snap.mode !== 'observe');
+  $('btn-account').disabled = !available;
+  $('btn-account').textContent = active ? '계정 변경 중…' : '계정 변경';
+  $('btn-account-start').disabled = !available || busy || (!snap.ready && !active);
+  $('btn-account-start').textContent = phase === 'login' ? '로그인 창 다시 열기' : '계정 변경 시작';
+  $('btn-account-complete').disabled = !available || busy || phase !== 'login';
+  const messages = {
+    idle: '계정과 프로젝트를 함께 변경합니다.',
+    queued: '진행 중인 리뷰가 끝나기를 기다리고 있습니다.',
+    opening: '로그인용 Chrome 창을 여는 중입니다.',
+    login: 'Chrome에서 사용할 계정으로 로그인하고 리뷰 프로젝트 홈을 연 뒤 확인을 눌러 주세요.',
+    checking: '새 계정과 프로젝트 접근을 확인하고 저장하는 중입니다.',
+    complete: '계정과 프로젝트 URL을 저장했습니다.' + (snap && snap.control.paused ? ' 리뷰는 일시정지 상태입니다.' : ' 리뷰를 재개합니다.'),
+  };
+  $('account-status').textContent = accountRequestError || state.error || messages[phase];
+  const project = snap && snap.project;
+  $('account-project').replaceChildren();
+  if (project) {
+    const link = document.createElement('a');
+    link.textContent = project.name + ' — ' + project.url;
+    if (/^https:\/\/chatgpt\.com\/g\/g-p-[a-f0-9]+[^/]*\/project\/?$/.test(project.url)) {
+      link.href = project.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+    }
+    $('account-project').append('등록된 프로젝트: ', link);
+  }
+  $('btn-pause').disabled = active;
+}
+
 // 종료 — /api/intent 가 아니라 전용 엔드포인트다 (intents.ts 의 INTENT_KINDS 참고).
 // 여러 세션이 이 데몬 하나를 함께 쓰므로 되묻고, 즉시 끊지 않는다는 것도 알린다.
 $('btn-stop').addEventListener('click', async () => {
@@ -766,6 +843,7 @@ function renderControl() {
 
 function renderMeta() {
   if (!snap) return;
+  renderAccount();
   $('m-scope').textContent = snap.scope;
   $('m-account').innerHTML = snap.account
     ? '계정 <b>' + esc(snap.account) + '</b>' + (snap.dryRun ? ' · <b>dry-run</b>' : '') : '';

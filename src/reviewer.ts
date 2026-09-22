@@ -1129,6 +1129,7 @@ export async function runRound(
   ctx: PRContext,
   opts: RunRoundOptions = {},
 ): Promise<RoundOutcome> {
+  if (cfg.accountSwitchPending) throw new Error('계정 변경 중입니다. 대시보드에서 로그인과 프로젝트 등록을 완료해 주세요.');
   const round = ctx.round + 1;
   const instructions = loadInstructions(cfg, opts.instructionsFile);
 

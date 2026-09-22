@@ -472,10 +472,10 @@ export class ChatGPTDriver {
 
   // ── 라이프사이클 ──────────────────────────────────────────
 
-  async launch(): Promise<void> {
+  async launch(headless = this.cfg.headless): Promise<void> {
     this.ctx = await chromium.launchPersistentContext(this.cfg.browserProfileDir, {
       channel: this.cfg.browserChannel as any,
-      headless: this.cfg.headless,
+      headless,
       viewport: { width: 1280, height: 900 },
       args: [
         '--disable-blink-features=AutomationControlled',
@@ -648,6 +648,14 @@ export class ChatGPTDriver {
 
   // ── 로그인 ────────────────────────────────────────────────
 
+  /** 라운드가 모두 끝난 뒤에만 호출한다. 로그인은 사용자가 직접 수행한다. */
+  async openAccountBrowser(): Promise<void> {
+    await this.close();
+    await this.launch(false);
+    await this.navigateToChatGPT();
+    await this.requirePage().bringToFront();
+  }
+
   async navigateToChatGPT(): Promise<void> {
     const p = this.requirePage();
     await p.goto(this.cfg.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
@@ -682,7 +690,7 @@ export class ChatGPTDriver {
    * 로그인된 계정 정보를 반환한다 (로그아웃이면 null).
    * ChatGPT 오리진에 있을 때만 조회 가능하다.
    */
-  async getSessionUser(): Promise<{ email?: string; name?: string } | null> {
+  async getSessionUser(): Promise<{ id?: string; email?: string; name?: string } | null> {
     const p = this.requirePage();
     if (!this.isOnChatGPT(p)) return null;
     try {
@@ -691,7 +699,7 @@ export class ChatGPTDriver {
         if (!r.ok) return null;
         const j = (await r.json().catch(() => null)) as any;
         if (!j?.user) return null;
-        return { email: j.user.email, name: j.user.name };
+        return { id: j.user.id, email: j.user.email, name: j.user.name };
       });
     } catch {
       return null; // 네비게이션 중 등
