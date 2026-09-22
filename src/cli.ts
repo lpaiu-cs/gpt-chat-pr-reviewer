@@ -23,6 +23,7 @@ import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Command, Option } from 'commander';
 import chalk from 'chalk';
+import { VERSION } from './version.js';
 
 import { loadConfig, initConfig, ensureDataDir, patchConfigFile, requireProjectUrl } from './config.js';
 import { ChatGPTDriver } from './chatgpt.js';
@@ -270,7 +271,7 @@ function openWithDefaultApp(file: string): void {
 const program = new Command()
   .name('pr-review')
   .description('상태 머신 기반 ChatGPT PR 자동 리뷰')
-  .version('0.4.1');
+  .version(VERSION);
 
 // ── setup ──
 
@@ -1513,7 +1514,7 @@ program
       if (!reviewRan && Date.now() - lastHeartbeat > HEARTBEAT_MS) {
         lastHeartbeat = Date.now();
         const at = new Date().toLocaleTimeString('ko-KR');
-        const budget = lastRemaining >= 0 ? ` · 잔여 한도 ${lastRemaining.toLocaleString()}` : '';
+        const budget = lastRemaining >= 0 ? ` · 시간당 한도 ${lastRemaining.toLocaleString()}` : '';
         console.log(
           chalk.dim(
             `    ${at} · 감시 중 (레포 ${watchedRepos} · 열린 PR ${openCount}건, ${cost} point)${budget}`,
@@ -1542,7 +1543,7 @@ program
       if (scaled <= base) return base;
       console.log(
         chalk.yellow(
-          `    ⚠ 잔여 한도 ${lastRemaining.toLocaleString()} — 주기를 ${formatDuration(scaled)} 로 자동 상향`,
+          `    ⚠ 시간당 한도 ${lastRemaining.toLocaleString()} — 주기를 ${formatDuration(scaled)} 로 자동 상향`,
         ),
       );
       return scaled;

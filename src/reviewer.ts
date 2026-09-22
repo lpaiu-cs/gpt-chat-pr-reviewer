@@ -1062,7 +1062,14 @@ async function obtainRaw(
   }
   target.mergeBaseSha = await fetchMergeBase(ctx.owner, ctx.repo, target.baseRef, target.headSha);
   const diff = await fetchDiffAt(ctx.owner, ctx.repo, target.mergeBaseSha, target.headSha);
-  const prompt = bindPromptTarget(buildPrompt(cfg, ctx, round, instructions, continued), ctx, target, diff);
+  // ponytail: 100k자는 편집기 부하를 피하는 전환점이지 서비스 한도가 아니다.
+  // 큰 diff도 생략 없이 전달한다. 첨부 한도에 걸리면 PR을 나누어야 한다.
+  const attachment = diff.length > 100_000 ? {
+    name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}.txt`, buffer: Buffer.from(diff, 'utf8'),
+  } : undefined;
+  const prompt = bindPromptTarget(buildPrompt(cfg, ctx, round, instructions, continued), ctx, target,
+    attachment ? `고정 diff 전문은 첨부 파일 ${attachment.name}에 있습니다 (${attachment.buffer.length}바이트).\n`
+      + '첨부 파일 전체를 읽고 검토하세요. 일부만 읽거나 첨부에 접근할 수 없으면 summary=ACCESS_FAILED로 응답하세요.' : diff);
 
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
@@ -1083,7 +1090,7 @@ async function obtainRaw(
       ctx.pendingSend = { round, ...target, at: new Date().toISOString() };
       saveContext(cfg, ctx);
     }
-  });
+  }, attachment);
 
   const saved = saveResponse(cfg, ctx, round, raw, {
     conversationUrl,

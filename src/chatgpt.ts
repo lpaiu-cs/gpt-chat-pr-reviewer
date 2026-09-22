@@ -35,6 +35,11 @@ export class ResponseTimeoutError extends Error {
   }
 }
 
+export interface PromptAttachment { name: string; buffer: Buffer }
+
+/** 미전송 첨부만 찾는다. 대화에 이미 전송된 파일은 포함하지 않는다. */
+const REMOVE_FILE_BUTTON = /^(Remove file|파일 제거|파일 삭제)/;
+
 /** 대화에서 읽어온 메시지 하나 (역할 + 본문). */
 export interface ConversationMessage {
   role: string;
@@ -879,6 +884,7 @@ export class ChatGPTDriver {
   async sendAndCollect(
     prompt: string,
     onSent?: (conversationUrl: string | null) => void,
+    attachment?: PromptAttachment,
   ): Promise<string> {
     const p = this.requirePage();
 
@@ -904,23 +910,66 @@ export class ChatGPTDriver {
 
     // ── 프롬프트 입력 ──
     this.assertProjectPage(p);
-    await this.inputStep(`프롬프트 입력 (${prompt.length}자, ${prompt.split('\n').length}줄)`, () => this.fillPrompt(p, prompt));
-
-    // ── 전송 ──
-    // 이번 라운드의 생성만 근거로 쓴다. 이 값이 드라이버 수명 동안 남아 있으면
-    // 지난 라운드에서 본 요청을 "지금 관측되는 생성" 의 근거로 삼게 된다.
-    this.sawGeneration = false;
-    this.assertProjectPage(p);
-    await this.inputStep('전송 버튼', () => this.clickSend(p));
-
-    // ── 전송 성공 검증 ──
-    // 클릭이 끝나도 전송 성공은 아니다. 실제로 안 됐으면 우리 질문 노드가 영영 안
-    // 붙어 수집 루프가 예산(responseTimeoutMs, 기본 15분)을 전부 태운 뒤
-    // 타임아웃으로 접힌다. 몇 초짜리 검증으로 그 비용을 줄인다 — 실패 시에는
-    // pendingSend 기록(onSent) 전이라 상태도 깨끗하다.
-    if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, lastUserBefore, beforeUserCount)))) {
-      throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
+    const input = p.locator(this.cfg.selectors.textInput).first();
+    const composer = input.locator('xpath=ancestor::form[1]');
+    if ((await input.innerText()).trim() || await composer.getByRole('button', { name: REMOVE_FILE_BUTTON }).count()) {
+      throw new Error('입력창에 작성 중인 내용 또는 첨부가 있습니다 — 기존 초안을 보존합니다.');
     }
+    try {
+      if (attachment) {
+        await this.inputStep(`고정 diff 첨부 (${attachment.buffer.length}바이트)`, async () => {
+          // 현재 composer의 메뉴가 연 file chooser를 사용한다.
+          await composer.locator('#composer-plus-btn').click();
+          const [chooser] = await Promise.all([
+            p.waitForEvent('filechooser', { timeout: 10_000 }),
+            p.getByText(/^(Add photos & files|사진 및 파일 추가|사진과 파일 추가)$/).click(),
+          ]);
+          await chooser.setFiles({ ...attachment, mimeType: 'text/plain' });
+          // 파일 이름이 나타나는 것만으로 업로드 성공은 아니다. 처리 중에는 이 아이콘이 숨겨져 있다.
+          try {
+            await composer.getByRole('group', { name: attachment.name, exact: true })
+              .getByTestId('library-file-icon').waitFor({ state: 'visible', timeout: 120_000 });
+          } catch (cause) {
+            const files = await composer.getByRole('group').allTextContents().catch(() => []);
+            throw new Error(`고정 diff 첨부 완료를 확인하지 못했습니다: ${files.join(' / ').slice(0, 160) || '첨부 카드 없음'}`, { cause });
+          }
+        });
+      }
+      await this.inputStep(`프롬프트 입력 (${prompt.length}자, ${prompt.split('\n').length}줄)`, () => this.fillPrompt(p, prompt), false);
+      if (attachment) await composer.getByRole('group', { name: attachment.name, exact: true })
+        .getByTestId('library-file-icon').waitFor({ state: 'visible', timeout: 3_000 });
+
+      // 이번 라운드의 생성만 근거로 쓴다.
+      this.sawGeneration = false;
+      this.assertProjectPage(p);
+      await this.inputStep('전송 버튼', () => this.clickSend(p));
+      if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, lastUserBefore, beforeUserCount)))) {
+        throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
+      }
+    } catch (error) {
+      // 입력 검증뿐 아니라 업로드·클릭·전송 확인 실패도 정리한다. 프로젝트 초안은
+      // 탭 사이에 공유되므로 남기면 다른 PR까지 막힌다. 전송/사용자 편집 흔적이 있으면 보존한다.
+      try {
+        if (!(await this.isStreaming(p)) && await this.lastUserMessageId(p) === lastUserBefore
+          && await this.countUserMessages(p) === beforeUserCount) {
+          const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
+          const text = normalize(await input.innerText());
+          if (!text || text === normalize(prompt)) {
+            if (attachment) {
+              const remove = composer.getByRole('group', { name: attachment.name, exact: true })
+                .getByRole('button', { name: REMOVE_FILE_BUTTON });
+              if (await remove.count()) {
+                await composer.getByRole('group', { name: attachment.name, exact: true }).hover();
+                await remove.click();
+              }
+            }
+            await input.fill('');
+          }
+        }
+      } catch { console.log(chalk.yellow('  ⚠ 미전송 초안을 정리하지 못했습니다 — 프로젝트 입력창을 확인하세요.')); }
+      throw error;
+    }
+    progress.stream('질문 전송 확인됨', 0);
 
     // ── 대화 주소 확보 ──
     // **응답을 기다리기 전에** 알린다. 대기 구간이 2~15분이라 그 사이에 프로세스가
@@ -1144,13 +1193,12 @@ export class ChatGPTDriver {
   }
 
   /** 타임아웃으로 입력을 겹쳐 실행하지 않는다. 느린 호출은 경고만 남긴다. */
-  private async inputStep<T>(label: string, action: () => Promise<T>): Promise<T> {
+  private async inputStep<T>(label: string, action: () => Promise<T>, reportCompletion = true): Promise<T> {
     const since = Date.now();
-    console.log(chalk.dim(`  입력 단계 시작: ${label}`));
     const timer = setTimeout(() => console.log(chalk.yellow(`  ⚠ ${label} 10초째 진행 중`)), 10_000);
     try {
       const result = await action();
-      console.log(chalk.dim(`  입력 단계 완료: ${label} (${Date.now() - since}ms)`));
+      if (reportCompletion) console.log(chalk.dim(`  입력 단계 완료: ${label} (${Date.now() - since}ms)`));
       return result;
     } catch (e) {
       console.log(chalk.yellow(`  입력 단계 실패: ${label} (${Date.now() - since}ms)`));
@@ -1199,7 +1247,8 @@ export class ChatGPTDriver {
 
   /** ProseMirror contenteditable 에 텍스트를 삽입한다. */
   private async fillPrompt(page: Page, text: string): Promise<void> {
-    await this.inputStep('입력창 포커스', () => this.focusInput(page));
+    const since = Date.now();
+    await this.inputStep('입력창 포커스', () => this.focusInput(page), false);
     await page.keyboard.press('Control+A');
     await page.keyboard.press('Delete');
 
@@ -1211,7 +1260,7 @@ export class ChatGPTDriver {
     const chars = Array.from(text.replace(/\r\n/g, '\n'));
     const grew: number[] = [];
     for (let at = 0; at < chars.length; at += 4000) {
-      await this.inputStep('붙여넣기', () => input.evaluate(
+      await this.inputStep(`붙여넣기 ${grew.length + 1}/${Math.ceil(chars.length / 4000)}조각`, () => input.evaluate(
       (el, t: string) => {
         (el as HTMLElement).focus();
         const dt = new DataTransfer();
@@ -1228,7 +1277,7 @@ export class ChatGPTDriver {
         );
       },
       chars.slice(at, at + 4000).join(''),
-    ));
+    ), false);
       // 조각마다 입력창이 실제로 얼마나 자랐는지 남긴다. 실패했을 때 원인을
       // 가르는 유일한 증거다 — 누적이 멈추면 재마운트·첨부 전환, 조각 길이보다
       // 조금씩 크면 경계마다 줄바꿈이 끼는 것이다.
@@ -1238,10 +1287,14 @@ export class ChatGPTDriver {
     // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
     const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
     const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
-    if (await this.inputStep('붙여넣기 검증', matches)) return;
-    if ((await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
+    let matched = await this.inputStep('붙여넣기 검증', matches, false);
+    if (!matched && (await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
       await this.inputStep('짧은 입력 폴백', () => page.keyboard.insertText(text));
-      if (await matches()) return;
+      matched = await matches();
+    }
+    if (matched) {
+      console.log(chalk.dim(`  입력 완료: ${text.length}자 · ${text.split('\n').length}줄 · ${grew.length}조각 · 검증 통과 (${Date.now() - since}ms)`));
+      return;
     }
     // 비우기 전에 무엇이 들어갔는지부터 읽는다 — 이게 원인을 가르는 증거다.
     const actual = normalize(await input.innerText({ timeout: 3_000 }));
@@ -1274,7 +1327,13 @@ export class ChatGPTDriver {
     // 동일 버튼을 셀렉터마다 다시 기다리지 않는다. 중지 버튼은 명시적으로 제외한다.
     const buttons = candidates.map(c => page.locator(c)).reduce((all, next) => all.or(next));
     const enabledSend = page.locator(':visible:not(:disabled):not([data-testid="stop-button"]):not([aria-label*="Stop"])');
-    await buttons.and(enabledSend).first().click({ timeout: 10_000 });
+    try {
+      await buttons.and(enabledSend).first().click({ timeout: 10_000 });
+    } catch (cause) {
+      const button = buttons.and(page.locator(':visible')).first();
+      const disabled = await button.isDisabled().catch(() => false);
+      throw new Error(`전송 버튼 클릭 실패${disabled ? ' — ChatGPT가 전송을 비활성화했습니다 (입력 크기·첨부 처리 상태 확인)' : ''}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    }
   }
 
   /**
@@ -1414,9 +1473,10 @@ export class ChatGPTDriver {
     let misses = 0;
     let recoveries = 0;
     let lastLogAt = Date.now();
+    let lastLoggedPhase = '';
     let lastQuotaCheckAt = Date.now();
     let lastChangeAt = Date.now();
-    let lastDumpAt = Date.now();
+    let stallNoted = false;
     const t0 = Date.now();
 
     while (Date.now() - t0 < timeout) {
@@ -1482,7 +1542,10 @@ export class ChatGPTDriver {
       // **덮어쓰기 전에** 변경 여부를 잡는다. 아래에서 lastText = cur 을 해버리면
       // 그 뒤에는 언제나 같아 보여서, 정상 스트리밍도 "변화 없음" 으로 기록된다.
       const changed = cur !== lastText;
-      if (changed) lastChangeAt = Date.now();
+      if (changed) {
+        lastChangeAt = Date.now();
+        stallNoted = false;
+      }
 
       if (cur.length > 0 && !changed) {
         stable++;
@@ -1495,25 +1558,28 @@ export class ChatGPTDriver {
       // 남기는 용도이고, 무트래픽 시간으로 대기를 끊으면 오래 걸리는 추론의
       // 부분 응답을 완성본으로 게시하게 된다 (이슈 #1 이 경계한 조기 절단).
       const streaming = await this.isStreaming(page);
-      const phase = streaming ? '생성 중' : lastText ? '대기' : '추론 중';
+      // 본문이 없다는 이유만으로 추론 중이라고 단정하지 않는다. 중지 버튼이
+      // 보여 주는 생성 상태와 실제 답변 본문의 수신 여부를 따로 설명한다.
+      const phase = streaming
+        ? lastText ? '답변 수신 중' : '생성 중 · 본문 대기'
+        : lastText ? '완료 확인 중' : '응답 대기 · 생성 표시 없음';
 
       // ── 정체 진단 (이슈 #1) ──
-      // 화면이 멎었는데 계속 "생성 중" 이면, 그 순간의 근거를 남긴다. 재현될 때
-      // 사람이 붙어 있지 않아도 (a) 스트림 사망 / (b) 셀렉터 오탐 / (c) 실제 생성
-      // 중을 사후에 가릴 수 있어야 한다.
+      // 여기서 관측하는 것은 답변 본문뿐이다. 추론 UI 전체를 관측한 것처럼
+      // "화면 변화 없음"으로 경고하지 않는다. 생성 활동이 확인되면 정상 대기다.
       const stalledMs = Date.now() - lastChangeAt;
+      const evidence = this.stallEvidence(streaming);
       if (
         streaming &&
         stalledMs > STALL_DUMP_EVERY_MS &&
-        Date.now() - lastDumpAt > STALL_DUMP_EVERY_MS
+        evidence !== 'generating' &&
+        !stallNoted
       ) {
-        lastDumpAt = Date.now();
-        const quiet = this.lastNetAt ? Math.round((Date.now() - this.lastNetAt) / 1000) : -1;
+        stallNoted = true;
+        const reason = evidence === 'network-quiet' ? '생성 통신도 오래 관측되지 않음' : '생성 통신 관측 없음';
         console.log(
           chalk.yellow(
-            `  ⚠ ${Math.round(stalledMs / 1000)}초째 화면 변화 없음 · 근거=${this.stallEvidence(true)} · ` +
-              `생성요청 ${this.netInFlight}건 진행 · 네트워크 ${quiet}초째 조용 · ` +
-              `중지버튼 ${await this.dumpStopButtons(page)}`,
+            `  ⚠ 답변 본문 ${Math.round(stalledMs / 1000)}초째 미갱신 · ${reason} · 생성 중지 표시는 유지됨 — 계속 기다립니다.`,
           ),
         );
       }
@@ -1527,7 +1593,7 @@ export class ChatGPTDriver {
         if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
       }
 
-      // 터미널은 30초마다 한 줄이지만 UI 는 폴링마다 갱신한다 — 이 구간이 2~15분
+      // 터미널은 상태 전환 또는 2분마다 한 줄, UI 는 폴링마다 갱신한다 — 이 구간이 2~15분
       // 이라 "멈춘 건지 도는 건지" 를 실시간으로 보여주는 게 관측의 핵심이다.
       // (이슈 #1 의 원인 미상 타임아웃도 여기 기록이 남아야 나중에 짚을 수 있다.)
       progress.stream(phase, lastText.length);
@@ -1557,7 +1623,7 @@ export class ChatGPTDriver {
         console.log(
           chalk.yellow(
             `  ⚠ 중지 버튼이 ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 남아 있는데 ` +
-              '생성 요청은 없고 화면도 멎었습니다 — 버튼 고장으로 보고 완료 처리합니다.',
+              '생성 통신과 답변 본문 갱신이 없습니다 — 버튼 고장으로 보고 완료 처리합니다.',
           ),
         );
         console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
@@ -1596,12 +1662,13 @@ export class ChatGPTDriver {
         continue;
       }
 
-      // 진행 상황 — 멈춘 것처럼 보이지 않게 30초마다 출력
-      if (Date.now() - lastLogAt > 30_000) {
+      // 같은 상태는 2분에 한 번만 알리고, 상태 전환은 바로 알린다.
+      if (phase !== lastLoggedPhase || Date.now() - lastLogAt > 120_000) {
         lastLogAt = Date.now();
+        lastLoggedPhase = phase;
         const sec = Math.round((Date.now() - t0) / 1000);
         console.log(
-          chalk.dim(`    …${sec}초 경과 · ${phase} · ${lastText.length.toLocaleString()}자`),
+          chalk.dim(`    …${sec}초 경과 · ${phase}${lastText ? ` · ${lastText.length.toLocaleString()}자` : ''}`),
         );
       }
     }
@@ -1623,6 +1690,7 @@ export class ChatGPTDriver {
 
     const quota = await this.detectQuotaLimit(page);
     if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
+    console.log(chalk.dim(`  응답 타임아웃 진단 · 근거=${this.stallEvidence(stillGenerating)} · 중지버튼 ${await this.dumpStopButtons(page)}`));
     throw new ResponseTimeoutError(
       lastText.trim().length > 0
         ? `${minutes}분 안에 응답이 끝나지 않았습니다 (${lastText.length.toLocaleString()}자까지 생성). ` +

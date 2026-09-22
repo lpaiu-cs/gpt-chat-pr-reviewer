@@ -15,6 +15,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { PRState } from './types.js';
+import { VERSION } from './version.js';
 
 // ── 데이터 모델 ─────────────────────────────────────────────
 
@@ -151,6 +152,8 @@ export interface ControlState {
 }
 
 export interface Snapshot {
+  /** 이 데몬이 시작할 때 읽은 패키지 버전. */
+  version: string;
   /**
    * 이 프로세스의 고유 id. 로그 seq 는 프로세스마다 1부터 다시 시작하므로,
    * 이게 없으면 watch 를 재시작했을 때 클라이언트의 seq 중복 제거가 새 로그를
@@ -262,6 +265,7 @@ const LOG_CAP = 600;
 
 function emptySnapshot(session: string): Snapshot {
   return {
+    version: VERSION,
     session,
     instance: null,
     mode: 'review',

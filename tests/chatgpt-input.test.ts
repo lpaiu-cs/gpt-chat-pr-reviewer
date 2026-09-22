@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { ChatGPTDriver } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 
-test('paste success is determined by complete content, with no large or partial-input fallback', async () => {
+test('paste success is determined by complete content, with no large or partial-input fallback', async (t) => {
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (line: string) => logs.push(line));
   const driver = new ChatGPTDriver(loadConfig()) as any;
   driver.focusInput = async () => {};
   let content = '';
@@ -36,14 +38,18 @@ test('paste success is determined by complete content, with no large or partial-
   await driver.fillPrompt(page, text);
   assert.equal(inserts, 0);
   assert.equal(chunks.join(''), text);
+  assert.equal(logs.length, 1, 'normal chunked input emits one summary');
+  assert.match(logs[0], /입력 완료: .*7조각 · 검증 통과/);
   chunks = [];
   const unicode = '😀'.repeat(3999) + '\r\n' + '😀'.repeat(4001);
   pasted = unicode.replace(/\r\n/g, '\n');
   await driver.fillPrompt(page, unicode);
   assert.equal(chunks.join(''), pasted);
   pasted = text.slice(0, -10);
+  logs.length = 0;
   // 실패는 무엇이 들어갔는지를 숫자로 말해야 한다 — 그게 원인을 가르는 증거다.
   await assert.rejects(driver.fillPrompt(page, text), /첫 불일치 \d+ .*조각별 누적 \d/s);
+  assert.ok(logs.every(line => !line.includes('검증 통과')));
   // 실패한 입력은 비워둔다 — 남으면 다음 라운드의 프로젝트 진입 가드에 걸린다.
   assert.equal(content, '');
   pasted = '';

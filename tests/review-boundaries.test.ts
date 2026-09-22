@@ -10,7 +10,7 @@ import { createContext, saveContext, loadContext, listContexts } from '../src/st
 import { runRound, syncPR, applySyncEvents } from '../src/reviewer.js';
 import { parseGPTResponse } from '../src/parser.js';
 import type { AppConfig, PRContext } from '../src/types.js';
-import type { ChatGPTDriver } from '../src/chatgpt.js';
+import type { ChatGPTDriver, PromptAttachment } from '../src/chatgpt.js';
 
 const head = 'a'.repeat(40), base = 'b'.repeat(40);
 const diff = 'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-old\n+new\n';
@@ -18,20 +18,20 @@ const pr = { owner: 'o', repo: 'r', number: 1, url: 'https://github.com/o/r/pull
 
 async function fixture(fn: (f: {
   cfg: AppConfig; ctx: PRContext; driver: ChatGPTDriver; posts: any[];
-  controls: { failSync: boolean; losePostResponse: boolean; wrongTarget: boolean; rejectPost: boolean; prompts: string[] };
+  controls: { failSync: boolean; losePostResponse: boolean; wrongTarget: boolean; rejectPost: boolean; diff: string; prompts: string[]; attachments: (PromptAttachment | undefined)[] };
 }) => Promise<void>) {
   const dir = fs.mkdtempSync(path.join(tmpdir(), 'review-boundary-'));
   const cfg = { ...loadConfig(path.join(dir, 'absent.json')), dataDir: dir, customInstructionsFile: path.join(dir, 'instructions.md') };
   const ctx = createContext(pr);
   const posts: any[] = [];
-  const controls = { failSync: false, losePostResponse: false, wrongTarget: false, rejectPost: false, prompts: [] as string[] };
+  const controls = { failSync: false, losePostResponse: false, wrongTarget: false, rejectPost: false, diff, prompts: [] as string[], attachments: [] as (PromptAttachment | undefined)[] };
   const original = cp.execFile;
   const respond = (file: string, args: string[], opts: any) => {
     assert.equal(file, 'gh');
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 1, url: pr.url, title: pr.title, author: { login: 'author' }, baseRefName: 'main', headRefName: 'topic', headRefOid: head });
     if (args[1] === 'user') return 'bot';
     if (args[1]?.includes('/reactions')) return '[]';
-    if (args[1]?.includes('/compare/')) return args.includes('-q') ? base : diff;
+    if (args[1]?.includes('/compare/')) return args.includes('-q') ? base : controls.diff;
     if (args[1]?.includes('/reviews?')) return JSON.stringify([posts]);
     if (args[1]?.endsWith('/reviews')) {
       if (controls.rejectPost) throw Object.assign(new Error('Validation Failed'), {
@@ -66,8 +66,9 @@ async function fixture(fn: (f: {
   syncBuiltinESMExports();
   const driver = {
     ensureAlive: async () => false, startNewChat: async () => {},
-    sendAndCollect: async (prompt: string, onSent: (url: string) => void) => {
+    sendAndCollect: async (prompt: string, onSent: (url: string) => void, attachment?: PromptAttachment) => {
       controls.prompts.push(prompt);
+      controls.attachments.push(attachment);
       onSent('https://chatgpt.com/c/fixture');
       return JSON.stringify({ summary: 'issue', approval: 'request_changes',
         reviewedHeadSha: controls.wrongTarget ? 'c'.repeat(40) : head, reviewedBaseSha: base,
@@ -83,6 +84,21 @@ test('고정 diff를 실제 전송하고 같은 head에만 게시한다', async 
   assert(f.controls.prompts[0].includes(diff));
   assert(f.controls.prompts[0].includes(head));
   assert(f.controls.prompts[0].includes(base));
+  assert.equal(f.posts[0].commit_id, head);
+  assert.equal(f.controls.attachments[0], undefined);
+}));
+
+test('큰 고정 diff는 잘리지 않은 UTF-8 첨부로 전송하고 대상 SHA를 유지한다', async () => fixture(async f => {
+  f.controls.diff = diff + '+한글 evidence\n'.repeat(100_000);
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'posted');
+  const file = f.controls.attachments[0]!;
+  assert(file.name.length < 64, '파일 이름은 짧게, 전체 대상 SHA는 프롬프트에 보존한다');
+  assert.equal(file.buffer.toString('utf8'), f.controls.diff);
+  const prompt = f.controls.prompts[0];
+  assert(prompt.includes(file.name));
+  assert(prompt.includes(head) && prompt.includes(base));
+  assert(prompt.includes('리뷰 라운드: 1차'));
+  assert(prompt.length < 10_000);
   assert.equal(f.posts[0].commit_id, head);
 }));
 
