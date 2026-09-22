@@ -41,6 +41,25 @@ import {
 import { progress } from './progress.js';
 import { chatgptProjectId } from './config.js';
 
+const RESPONSE_RECOVERY_INTERVAL_MS = 60_000;
+// 중지 버튼이 DOM에 남은 경우 완료 판정은 본문 정지 120초가 필요하다.
+const RESPONSE_RECOVERY_WAIT_MS = 150_000;
+
+/** 전송 대상과 대화가 남아 있는 타임아웃만 자동 회수할 수 있다. */
+function canRecoverResponse(cfg: AppConfig, ctx: PRContext): boolean {
+  const sent = ctx.pendingSend;
+  return !!(ctx.conversationUrl && sent?.round === ctx.round + 1 &&
+    sent.headSha && sent.baseRef && sent.mergeBaseSha && sent.at && Number.isFinite(Date.parse(sent.at)) &&
+    (sent.marker || roundMarker(cfg, ctx, sent.round)));
+}
+
+/** 구버전에서 재시도 횟수를 소진한 타임아웃도 회수한다. 로그의 다른 실패는 승격하지 않는다. */
+function restoreResponseRecovery(cfg: AppConfig, ctx: PRContext): void {
+  if (canRecoverResponse(cfg, ctx) && !ctx.pendingSend!.recoverAfter && ctx.lastError?.startsWith('타임아웃 — ')) {
+    ctx.pendingSend!.recoverAfter = ctx.updatedAt;
+  }
+}
+
 async function addReactionToPullRequest(ctx: PRContext, content: PullRequestReaction): Promise<void> {
   try {
     await addPullRequestReaction(ctx.owner, ctx.repo, ctx.prNumber, content);
@@ -216,8 +235,14 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
     fire(ctx, 'REVIEW_FAILED', { note: '중단된 리뷰 감지 — 복구' });
   }
 
-  // 3. ERROR 자동 재시도
-  if (ctx.state === 'ERROR' && ctx.retryCount < cfg.maxAutoRetries) {
+  // 이미 보낸 질문의 완료 확인은 일반 실패 재시도 횟수를 소비하지 않는다.
+  restoreResponseRecovery(cfg, ctx);
+  // 이전 버전에서 식별자 없이 예약된 회수도 무한 반복시키지 않는다.
+  if (ctx.pendingSend?.recoverAfter && !canRecoverResponse(cfg, ctx)) delete ctx.pendingSend.recoverAfter;
+  const recovery = ctx.pendingSend?.recoverAfter;
+  if (ctx.state === 'ERROR' && recovery) {
+    if (Date.now() >= Date.parse(recovery)) fire(ctx, 'RETRY', { note: '타임아웃 응답 회수 — 재전송 없음' });
+  } else if (ctx.state === 'ERROR' && ctx.retryCount < cfg.maxAutoRetries) {
     fire(ctx, 'RETRY', {
       note: `자동 재시도 ${ctx.retryCount + 1}/${cfg.maxAutoRetries}`,
       patch: { retryCount: ctx.retryCount + 1 },
@@ -844,7 +869,7 @@ export interface RunRoundOptions {
  * 응답 대기는 2~15분이다. 그 사이에 죽으면 질문은 대화에 남았는데 우리는 응답을
  * 못 받은 상태다. 그대로 다시 보내면 같은 질문이 한 번 더 들어가 대화 한도를 버린다.
  *
- * 회수하지 않는 경우(전부 null → 평소 경로로 다시 묻는다):
+ * 회수하지 않는 경우(일반 경로는 null → 다시 묻기, 타임아웃 회수는 재전송 금지):
  *  - dry-run          저장된 대화를 건드리지 않는 것이 목적이다
  *  - 마커 없음         템플릿에 {{round}} 가 없어 라운드를 식별할 수 없다
  *  - 대기 중인 전송 기록 없음  언제·무엇을 보고 물었는지 모른다
@@ -866,7 +891,7 @@ async function reclaimRound(
   const url = ctx.conversationUrl;
   if (!url) return null;
 
-  const marker = roundMarker(cfg, ctx, round);
+  const marker = ctx.pendingSend?.marker ?? roundMarker(cfg, ctx, round);
   if (!marker) return null;
 
   // 대화 + 라운드 번호는 "무엇을 보고 만든 답인가" 를 말해주지 않는다. 죽어 있는
@@ -881,6 +906,11 @@ async function reclaimRound(
 
   const verdict = judgeReclaim(ctx, round, await currentTarget(ctx));
   if (verdict !== 'ok') {
+    if (ctx.pendingSend?.recoverAfter) {
+      if (verdict === 'unknown-current') throw new Error('현재 리뷰 대상을 확인하지 못했습니다');
+      delete ctx.pendingSend.recoverAfter;
+      throw new Error(`${RECLAIM_REFUSAL[verdict]} — 지연 응답 회수를 중단합니다. 리뷰 대상을 확인한 뒤 다시 요청하세요.`);
+    }
     if (verdict !== 'no-record') {
       console.log(chalk.yellow(`  ⚠ ${RECLAIM_REFUSAL[verdict]} — 회수하지 않고 다시 묻습니다.`));
     }
@@ -890,7 +920,9 @@ async function reclaimRound(
   // **이 전송** 이후 저장된 응답이 있으면 이미 받아본 것이다. 라운드 단위로 보면
   // 앞선 시도의 실패 응답이 새 전송의 회수까지 막아 같은 질문이 또 나간다.
   const sentAt = ctx.pendingSend?.at ? Date.parse(ctx.pendingSend.at) : NaN;
-  if (hasResponseSince(cfg, ctx, round, Number.isFinite(sentAt) ? sentAt : null)) return null;
+  // 회수 표식은 응답 확보 후 지운다. 표식이 남았다면 캐시 저장 직후 크래시한 경우도
+  // 포함하므로 같은 응답을 다시 확보해도 된다 (파싱 실패 응답에는 표식이 없다).
+  if (!ctx.pendingSend?.recoverAfter && hasResponseSince(cfg, ctx, round, Number.isFinite(sentAt) ? sentAt : null)) return null;
 
   // 재전송하지 않으므로 어시스턴트 메시지가 없어도 된다 — 응답 전에 죽은 대화가
   // 정확히 그 모습이고, 여기서 실패로 보면 이 복구가 통째로 무의미해진다.
@@ -903,7 +935,8 @@ async function reclaimRound(
   progress.phase('waiting');
   // 기준점을 findRound 가 준 값으로 넘긴다. 완료 판정(스트리밍 종료 + 안정)은
   // collectResponse 가 하므로, 이미 와 있는 답이면 즉시, 생성 중이면 끝까지 기다린다.
-  const raw = await driver.collectFrom(baseline);
+  const raw = await driver.collectFrom(baseline, ctx.pendingSend?.recoverAfter
+    ? Math.min(cfg.responseTimeoutMs, RESPONSE_RECOVERY_WAIT_MS) : cfg.responseTimeoutMs);
   const saved = saveResponse(cfg, ctx, round, raw, {
     conversationUrl: url,
     ...targetMeta(sent),
@@ -1034,6 +1067,7 @@ async function obtainRaw(
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
+  if (!opts.dryRun) restoreResponseRecovery(cfg, ctx);
 
   // ── 이미 보낸 라운드 회수 ──
   // **enterConversation 보다 먼저** 해야 한다. 회전 판정이나 복귀 실패가 저장된
@@ -1044,6 +1078,9 @@ async function obtainRaw(
   if (reclaimed !== null) {
     clearPendingSend(cfg, ctx, opts);
     return reclaimed;
+  }
+  if (!opts.dryRun && ctx.pendingSend?.recoverAfter) {
+    throw new Error('기존 질문의 응답을 아직 확인하지 못했습니다');
   }
 
   const continued = await enterConversation(cfg, driver, ctx, round, opts);
@@ -1067,9 +1104,12 @@ async function obtainRaw(
   const attachment = diff.length > 100_000 ? {
     name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}.txt`, buffer: Buffer.from(diff, 'utf8'),
   } : undefined;
+  const templateMarker = roundMarker(cfg, ctx, round);
+  const marker = templateMarker ?? `Review request: ${ctx.owner}/${ctx.repo}#${ctx.prNumber} round ${round}`;
   const prompt = bindPromptTarget(buildPrompt(cfg, ctx, round, instructions, continued), ctx, target,
     attachment ? `고정 diff 전문은 첨부 파일 ${attachment.name}에 있습니다 (${attachment.buffer.length}바이트).\n`
-      + '첨부 파일 전체를 읽고 검토하세요. 일부만 읽거나 첨부에 접근할 수 없으면 summary=ACCESS_FAILED로 응답하세요.' : diff);
+      + '첨부 파일 전체를 읽고 검토하세요. 일부만 읽거나 첨부에 접근할 수 없으면 summary=ACCESS_FAILED로 응답하세요.' : diff)
+    + (templateMarker ? '' : `\n\n${marker}`);
 
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
@@ -1087,7 +1127,7 @@ async function obtainRaw(
     conversationUrl = url ?? undefined;
     if (!opts.dryRun) {
       rememberConversation(ctx, conversationUrl, round);
-      ctx.pendingSend = { round, ...target, at: new Date().toISOString() };
+      ctx.pendingSend = { round, ...target, at: new Date().toISOString(), marker };
       saveContext(cfg, ctx);
     }
   }, attachment);
@@ -1133,17 +1173,13 @@ export async function runRound(
   const round = ctx.round + 1;
   const instructions = loadInstructions(cfg, opts.instructionsFile);
 
-  // 창이 닫혔거나 크래시했으면 여기서 되살린다. 이 한 줄이 없으면 죽은 페이지
-  // 핸들이 계속 재사용되어, 사람이 데몬을 재기동할 때까지 모든 라운드가
-  // "Target page, context or browser has been closed" 로 실패한다 (#109).
-  if (driver && !ctx.pendingReview) await driver.ensureAlive();
-
   console.log(chalk.bold(`\n  📋 ${ctx.title}`));
   console.log(chalk.dim(`     ${ctx.prUrl}  (${round}차 리뷰${opts.dryRun ? ' · dry-run' : ''})`));
 
   // ── dry-run: 상태 전이 없이 결과만 ──
   if (opts.dryRun) {
     try {
+      if (driver && !ctx.pendingReview) await driver.ensureAlive();
       const { raw, target } = await obtainRaw(cfg, driver, ctx, round, instructions, opts);
       progress.phase('parsing');
       const result = parseGPTResponse(raw);
@@ -1180,6 +1216,8 @@ export async function runRound(
   await addReactionToPullRequest(ctx, 'eyes');
 
   try {
+    // 브라우저 복구 실패도 회수 주기를 지켜 재시도한다.
+    if (driver && !ctx.pendingReview) await driver.ensureAlive();
     const pending = ctx.pendingReview;
     if (pending && pending.round !== round) throw new Error('미확정 게시 기록의 라운드가 현재 라운드와 다릅니다');
     const { raw, target: reviewed } = pending
@@ -1293,15 +1331,21 @@ export async function runRound(
     // (같은 답을 다시 써도 결과가 같다)와 같은 붉은 "리뷰 실패" 로 뭉치면, 로그만
     // 보고는 무엇이 잘못됐는지 구분할 수 없다. 상태 전이는 같지만 표기를 나눈다.
     const timedOut = e instanceof ResponseTimeoutError;
+    const recovering = canRecoverResponse(cfg, ctx) && (timedOut || !!ctx.pendingSend?.recoverAfter);
+    if (recovering) {
+      ctx.pendingSend!.recoverAfter = new Date(Date.now() + RESPONSE_RECOVERY_INTERVAL_MS).toISOString();
+    }
     const raw = (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 280);
-    const msg = timedOut ? `타임아웃 — ${raw}` : raw;
+    const msg = recovering ? `응답 회수 대기 — ${raw}` : timedOut ? `타임아웃 — ${raw}` : raw;
     // 검증 거부는 리뷰가 생성되지 않았다. 다음 시도는 새 응답/수정 캐시를 받는다.
     // 응답 유실·타임아웃·조회 실패는 기존 UUID를 유지한다.
     if (e instanceof ReviewValidationError) delete ctx.pendingReview;
     fire(ctx, 'REVIEW_FAILED', { note: msg, patch: { lastError: msg } });
     saveContext(cfg, ctx);
     await removeReactionFromPullRequest(ctx, 'eyes');
-    if (timedOut) {
+    if (recovering) {
+      console.log(chalk.yellow('  ⏱ 응답 회수 대기: 1분 후 기존 대화를 다시 확인합니다 (재전송 없음).'), raw);
+    } else if (timedOut) {
       console.log(chalk.yellow('  ⏱ 응답 타임아웃:'), raw);
     } else {
       console.error(chalk.red('  ✗ 리뷰 실패:'), raw);
