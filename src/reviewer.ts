@@ -42,18 +42,20 @@ import { progress } from './progress.js';
 import { chatgptProjectId } from './config.js';
 
 const RESPONSE_RECOVERY_INTERVAL_MS = 60_000;
-const RESPONSE_RECOVERY_WAIT_MS = 30_000;
+// 중지 버튼이 DOM에 남은 경우 완료 판정은 본문 정지 120초가 필요하다.
+const RESPONSE_RECOVERY_WAIT_MS = 150_000;
 
 /** 전송 대상과 대화가 남아 있는 타임아웃만 자동 회수할 수 있다. */
-function canRecoverResponse(ctx: PRContext): boolean {
+function canRecoverResponse(cfg: AppConfig, ctx: PRContext): boolean {
   const sent = ctx.pendingSend;
   return !!(ctx.conversationUrl && sent?.round === ctx.round + 1 &&
-    sent.headSha && sent.baseRef && sent.mergeBaseSha && sent.at && Number.isFinite(Date.parse(sent.at)));
+    sent.headSha && sent.baseRef && sent.mergeBaseSha && sent.at && Number.isFinite(Date.parse(sent.at)) &&
+    (sent.marker || roundMarker(cfg, ctx, sent.round)));
 }
 
 /** 구버전에서 재시도 횟수를 소진한 타임아웃도 회수한다. 로그의 다른 실패는 승격하지 않는다. */
-function restoreResponseRecovery(ctx: PRContext): void {
-  if (canRecoverResponse(ctx) && !ctx.pendingSend!.recoverAfter && ctx.lastError?.startsWith('타임아웃 — ')) {
+function restoreResponseRecovery(cfg: AppConfig, ctx: PRContext): void {
+  if (canRecoverResponse(cfg, ctx) && !ctx.pendingSend!.recoverAfter && ctx.lastError?.startsWith('타임아웃 — ')) {
     ctx.pendingSend!.recoverAfter = ctx.updatedAt;
   }
 }
@@ -234,7 +236,9 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
   }
 
   // 이미 보낸 질문의 완료 확인은 일반 실패 재시도 횟수를 소비하지 않는다.
-  restoreResponseRecovery(ctx);
+  restoreResponseRecovery(cfg, ctx);
+  // 이전 버전에서 식별자 없이 예약된 회수도 무한 반복시키지 않는다.
+  if (ctx.pendingSend?.recoverAfter && !canRecoverResponse(cfg, ctx)) delete ctx.pendingSend.recoverAfter;
   const recovery = ctx.pendingSend?.recoverAfter;
   if (ctx.state === 'ERROR' && recovery) {
     if (Date.now() >= Date.parse(recovery)) fire(ctx, 'RETRY', { note: '타임아웃 응답 회수 — 재전송 없음' });
@@ -887,7 +891,7 @@ async function reclaimRound(
   const url = ctx.conversationUrl;
   if (!url) return null;
 
-  const marker = roundMarker(cfg, ctx, round);
+  const marker = ctx.pendingSend?.marker ?? roundMarker(cfg, ctx, round);
   if (!marker) return null;
 
   // 대화 + 라운드 번호는 "무엇을 보고 만든 답인가" 를 말해주지 않는다. 죽어 있는
@@ -1063,7 +1067,7 @@ async function obtainRaw(
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
-  if (!opts.dryRun) restoreResponseRecovery(ctx);
+  if (!opts.dryRun) restoreResponseRecovery(cfg, ctx);
 
   // ── 이미 보낸 라운드 회수 ──
   // **enterConversation 보다 먼저** 해야 한다. 회전 판정이나 복귀 실패가 저장된
@@ -1100,9 +1104,12 @@ async function obtainRaw(
   const attachment = diff.length > 100_000 ? {
     name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}.txt`, buffer: Buffer.from(diff, 'utf8'),
   } : undefined;
+  const templateMarker = roundMarker(cfg, ctx, round);
+  const marker = templateMarker ?? `Review request: ${ctx.owner}/${ctx.repo}#${ctx.prNumber} round ${round}`;
   const prompt = bindPromptTarget(buildPrompt(cfg, ctx, round, instructions, continued), ctx, target,
     attachment ? `고정 diff 전문은 첨부 파일 ${attachment.name}에 있습니다 (${attachment.buffer.length}바이트).\n`
-      + '첨부 파일 전체를 읽고 검토하세요. 일부만 읽거나 첨부에 접근할 수 없으면 summary=ACCESS_FAILED로 응답하세요.' : diff);
+      + '첨부 파일 전체를 읽고 검토하세요. 일부만 읽거나 첨부에 접근할 수 없으면 summary=ACCESS_FAILED로 응답하세요.' : diff)
+    + (templateMarker ? '' : `\n\n${marker}`);
 
   // 전송하는 순간 프롬프트는 대화에 남는다. 이후 파싱·게시가 실패해 ctx.round 가
   // 늘지 않아도 컨텍스트는 이미 소비된 상태이므로, 보내기 직전에 센다.
@@ -1120,7 +1127,7 @@ async function obtainRaw(
     conversationUrl = url ?? undefined;
     if (!opts.dryRun) {
       rememberConversation(ctx, conversationUrl, round);
-      ctx.pendingSend = { round, ...target, at: new Date().toISOString() };
+      ctx.pendingSend = { round, ...target, at: new Date().toISOString(), marker };
       saveContext(cfg, ctx);
     }
   }, attachment);
@@ -1324,7 +1331,7 @@ export async function runRound(
     // (같은 답을 다시 써도 결과가 같다)와 같은 붉은 "리뷰 실패" 로 뭉치면, 로그만
     // 보고는 무엇이 잘못됐는지 구분할 수 없다. 상태 전이는 같지만 표기를 나눈다.
     const timedOut = e instanceof ResponseTimeoutError;
-    const recovering = canRecoverResponse(ctx) && (timedOut || !!ctx.pendingSend?.recoverAfter);
+    const recovering = canRecoverResponse(cfg, ctx) && (timedOut || !!ctx.pendingSend?.recoverAfter);
     if (recovering) {
       ctx.pendingSend!.recoverAfter = new Date(Date.now() + RESPONSE_RECOVERY_INTERVAL_MS).toISOString();
     }

@@ -208,6 +208,8 @@ export interface PRContext {
     mergeBaseSha?: string | null;
     /** 전송 시각 (ISO) — "이 전송이 이미 답을 받았는가" 를 라운드가 아니라 전송 단위로 본다 */
     at?: string;
+    /** 실제 전송된 질문을 찾는 한 줄. 사용자 프롬프트 템플릿 변경 뒤에도 유지한다. */
+    marker?: string;
     /** 타임아웃 후 다음 응답 회수 시각. 재전송 없이 일반 실패 재시도와 별도로 확인한다. */
     recoverAfter?: string;
   };

@@ -5,7 +5,7 @@ import { loadConfig } from '../src/config.js';
 import { progress } from '../src/progress.js';
 import { VERSION } from '../src/version.js';
 
-test('짧은 회수 예산도 생성 중 부분 응답은 반환하지 않고 완료 응답만 수집한다', async t => {
+test('회수 예산은 생성 중 부분 응답을 거부하고 고장난 중지 버튼의 120초 판정도 허용한다', async t => {
   let now = 1000;
   t.mock.method(Date, 'now', () => now);
   const cfg = { ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 };
@@ -23,6 +23,10 @@ test('짧은 회수 예산도 생성 중 부분 응답은 반환하지 않고 �
   await assert.rejects(driver.collectFrom(0, 30_000), ResponseTimeoutError);
   assert(now < 60_000);
   assert.equal(cfg.responseTimeoutMs, 25 * 60_000);
+  driver.sawGeneration = true;
+  driver.netInFlight = 0;
+  driver.lastNetAt = 1000;
+  assert.equal(await driver.collectFrom(0, 150_000), 'response');
   streaming = false;
   assert.equal(await driver.collectFrom(0, 30_000), 'response');
 });

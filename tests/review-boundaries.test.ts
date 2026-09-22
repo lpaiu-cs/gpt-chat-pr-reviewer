@@ -89,7 +89,7 @@ test('고정 diff를 실제 전송하고 같은 head에만 게시한다', async 
   assert.equal(f.controls.attachments[0], undefined);
 }));
 
-test('재시도 소진 후 25분 타임아웃도 재시작/짧은 회수 확인을 거쳐 재전송 없이 한 번 게시한다', async () => fixture(async f => {
+test('재시도 소진 후 25분 타임아웃도 재시작/완료 판정 가능한 회수 확인을 거쳐 재전송 없이 한 번 게시한다', async () => fixture(async f => {
   f.cfg.responseTimeoutMs = 25 * 60_000;
   f.ctx.retryCount = f.cfg.maxAutoRetries;
   const send = f.driver.sendAndCollect.bind(f.driver);
@@ -110,7 +110,7 @@ test('재시도 소진 후 25분 타임아웃도 재시작/짧은 회수 확인�
   let checks = 0;
   f.driver.collectFrom = async (baseline, timeoutMs) => {
     assert.equal(baseline, 2);
-    assert.equal(timeoutMs, 30_000, '회수 확인으로 다음 배치를 25분 붙잡지 않는다');
+    assert.equal(timeoutMs, 150_000, '중지 버튼 고장 판정의 120초 관측 시간을 확보한다');
     if (++checks === 1) throw new ResponseTimeoutError('아직 생성 중');
     return answer;
   };
@@ -128,6 +128,45 @@ test('재시도 소진 후 25분 타임아웃도 재시작/짧은 회수 확인�
   assert.equal(ctx.round, 1);
   assert.equal(ctx.pendingSend, undefined);
   assert.equal(ctx.lastError, undefined);
+}));
+
+test('사용자 템플릿에 라운드 마커가 없어도 실제 전송한 식별자로 회수한다', async () => fixture(async f => {
+  f.cfg.promptTemplate = 'PR {{url}} {{instructions}}\n리뷰를 진행하세요.';
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  const send = f.driver.sendAndCollect.bind(f.driver);
+  let answer = '';
+  f.driver.sendAndCollect = async (...args) => {
+    answer = await send(...args);
+    throw new ResponseTimeoutError('25분 동안 응답을 받지 못했습니다.');
+  };
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  const marker = f.ctx.pendingSend?.marker;
+  assert(marker && f.controls.prompts[0].includes(marker));
+  f.cfg.promptTemplate = '템플릿이 전송 이후 바뀌었습니다.';
+  f.ctx.pendingSend!.recoverAfter = new Date(Date.now() - 1).toISOString();
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  f.driver.resumeChat = async () => true;
+  f.driver.findRound = async found => { assert.equal(found, marker); return 0; };
+  f.driver.collectFrom = async () => answer;
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'posted');
+  assert.equal(f.controls.prompts.length, 1);
+  assert.equal(f.posts.length, 1);
+}));
+
+test('식별자 없는 구버전 사용자 템플릿 타임아웃은 무한 회수로 예약하지 않는다', async () => fixture(async f => {
+  f.cfg.promptTemplate = 'PR {{url}} {{instructions}}';
+  f.ctx.state = 'ERROR';
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  f.ctx.lastError = '타임아웃 — 25분 동안 응답을 받지 못했습니다.';
+  f.ctx.conversationUrl = 'https://chatgpt.com/c/fixture';
+  f.ctx.pendingSend = { round: 1, headSha: head, baseRef: 'main', mergeBaseSha: base, at: new Date().toISOString() };
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  assert.equal(f.ctx.state, 'ERROR');
+  assert.equal(f.ctx.pendingSend.recoverAfter, undefined);
+  f.ctx.pendingSend.recoverAfter = new Date(Date.now() - 1).toISOString();
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  assert.equal(f.ctx.state, 'ERROR');
+  assert.equal(f.ctx.pendingSend.recoverAfter, undefined);
 }));
 
 test('구버전 타임아웃과 복귀/마커/브라우저 오류는 새 질문 없이 회수를 예약한다', async () => fixture(async f => {
