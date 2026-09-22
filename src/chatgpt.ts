@@ -1080,8 +1080,8 @@ export class ChatGPTDriver {
    * 완료 판정(스트리밍 종료 + 내용 안정)은 collectResponse 가 그대로 맡는다 —
    * 그래서 스트리밍 중인 부분 응답을 완성본으로 오인하지 않는다.
    */
-  async collectFrom(assistantBefore: number): Promise<string> {
-    return this.collectResponse(this.requirePage(), assistantBefore);
+  async collectFrom(assistantBefore: number, timeoutMs = this.cfg.responseTimeoutMs): Promise<string> {
+    return this.collectResponse(this.requirePage(), assistantBefore, null, timeoutMs);
   }
 
   /**
@@ -1352,9 +1352,9 @@ export class ChatGPTDriver {
     page: Page,
     messageCountBefore: number,
     afterUserId: string | null = null,
+    timeout = this.cfg.responseTimeoutMs,
   ): Promise<string> {
     const sel = this.cfg.selectors;
-    const timeout = this.cfg.responseTimeoutMs;
 
     // 응답 시작을 **따로 기다리지 않는다.** 예전에는 여기서 60초 안에 어시스턴트
     // 노드가 안 뜨면 실패로 던졌는데, 추론 모드는 첫 노드가 뜨기까지 몇 분이 걸린다
@@ -1687,7 +1687,7 @@ export class ChatGPTDriver {
     // 로 둔갑한다. 원인은 타임아웃인데 표기는 붉은 "리뷰 실패" 가 되어, 이 구분이
     // 느린 생성에서 통째로 우회된다.
     const stillGenerating = await this.isStreaming(page);
-    const minutes = Math.round(timeout / 60_000);
+    const duration = timeout < 60_000 ? `${Math.ceil(timeout / 1000)}초` : `${Math.round(timeout / 60_000)}분`;
 
     if (!stillGenerating && lastText.trim().length > 0) {
       // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
@@ -1701,9 +1701,9 @@ export class ChatGPTDriver {
     console.log(chalk.dim(`  응답 타임아웃 진단 · 근거=${this.stallEvidence(stillGenerating)} · 중지버튼 ${await this.dumpStopButtons(page)}`));
     throw new ResponseTimeoutError(
       lastText.trim().length > 0
-        ? `${minutes}분 안에 응답이 끝나지 않았습니다 (${lastText.length.toLocaleString()}자까지 생성). ` +
+        ? `${duration} 안에 응답이 끝나지 않았습니다 (${lastText.length.toLocaleString()}자까지 생성). ` +
           '잘린 응답은 게시하지 않습니다 — responseTimeoutMs 를 늘리거나 다음 라운드에서 다시 시도합니다.'
-        : `${minutes}분 동안 응답을 받지 못했습니다. ` +
+        : `${duration} 동안 응답을 받지 못했습니다. ` +
           '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
     );
   }

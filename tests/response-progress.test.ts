@@ -1,9 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatGPTDriver } from '../src/chatgpt.js';
+import { ChatGPTDriver, ResponseTimeoutError } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import { progress } from '../src/progress.js';
 import { VERSION } from '../src/version.js';
+
+test('짧은 회수 예산도 생성 중 부분 응답은 반환하지 않고 완료 응답만 수집한다', async t => {
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const cfg = { ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 };
+  const driver = new ChatGPTDriver(cfg) as any;
+  let streaming = true;
+  driver.isStreaming = async () => streaming;
+  driver.interruptedBanner = async () => null;
+  driver.detectQuotaLimit = async () => null;
+  driver.dumpStopButtons = async () => 'fixture';
+  driver.page = {
+    waitForTimeout: async (ms: number) => { now += ms; },
+    evaluate: async () => [{ role: 'user', id: 'question' }, { role: 'assistant', id: 'answer' }],
+    locator: () => ({ locator: () => ({ count: async () => 1, allInnerTexts: async () => ['response'] }) }),
+  };
+  await assert.rejects(driver.collectFrom(0, 30_000), ResponseTimeoutError);
+  assert(now < 60_000);
+  assert.equal(cfg.responseTimeoutMs, 25 * 60_000);
+  streaming = false;
+  assert.equal(await driver.collectFrom(0, 30_000), 'response');
+});
 
 test('본문 전 생성 대기는 정상 진행으로 표시하고 관측 한계 경고는 한 번만 남긴다', async (t) => {
   let now = 1_000;

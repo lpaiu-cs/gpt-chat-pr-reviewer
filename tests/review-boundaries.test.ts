@@ -11,6 +11,7 @@ import { runRound, syncPR, applySyncEvents } from '../src/reviewer.js';
 import { parseGPTResponse } from '../src/parser.js';
 import type { AppConfig, PRContext } from '../src/types.js';
 import type { ChatGPTDriver, PromptAttachment } from '../src/chatgpt.js';
+import { ResponseTimeoutError } from '../src/chatgpt.js';
 
 const head = 'a'.repeat(40), base = 'b'.repeat(40);
 const diff = 'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-old\n+new\n';
@@ -86,6 +87,103 @@ test('고정 diff를 실제 전송하고 같은 head에만 게시한다', async 
   assert(f.controls.prompts[0].includes(base));
   assert.equal(f.posts[0].commit_id, head);
   assert.equal(f.controls.attachments[0], undefined);
+}));
+
+test('재시도 소진 후 25분 타임아웃도 재시작/짧은 회수 확인을 거쳐 재전송 없이 한 번 게시한다', async () => fixture(async f => {
+  f.cfg.responseTimeoutMs = 25 * 60_000;
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  const send = f.driver.sendAndCollect.bind(f.driver);
+  let answer = '';
+  f.driver.sendAndCollect = async (...args) => {
+    answer = await send(...args);
+    throw new ResponseTimeoutError('25분 동안 응답을 받지 못했습니다.');
+  };
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  assert(f.ctx.pendingSend?.recoverAfter);
+  let ctx = loadContext(f.cfg, 'o', 'r', 1)!;
+  const snapshot = { status: 'OPEN' as const, headSha: head, baseRef: 'main' };
+  applySyncEvents(f.cfg, ctx, snapshot);
+  assert.equal(ctx.state, 'ERROR', '1분 간격 전에 일반 재시도로 우회하면 안 된다');
+  assert.equal(ctx.retryCount, f.cfg.maxAutoRetries);
+  f.driver.resumeChat = async () => true;
+  f.driver.findRound = async () => 2;
+  let checks = 0;
+  f.driver.collectFrom = async (baseline, timeoutMs) => {
+    assert.equal(baseline, 2);
+    assert.equal(timeoutMs, 30_000, '회수 확인으로 다음 배치를 25분 붙잡지 않는다');
+    if (++checks === 1) throw new ResponseTimeoutError('아직 생성 중');
+    return answer;
+  };
+  for (const expected of ['failed', 'posted']) {
+    ctx.pendingSend!.recoverAfter = new Date(Date.now() - 1).toISOString();
+    applySyncEvents(f.cfg, ctx, snapshot);
+    assert.equal(ctx.state, 'REVIEW_DUE');
+    assert.equal(ctx.retryCount, f.cfg.maxAutoRetries);
+    assert.equal(await runRound(f.cfg, f.driver, ctx), expected);
+    ctx = loadContext(f.cfg, 'o', 'r', 1)!;
+  }
+  assert.equal(f.controls.prompts.length, 1);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].commit_id, head);
+  assert.equal(ctx.round, 1);
+  assert.equal(ctx.pendingSend, undefined);
+  assert.equal(ctx.lastError, undefined);
+}));
+
+test('구버전 타임아웃과 복귀/마커/브라우저 오류는 새 질문 없이 회수를 예약한다', async () => fixture(async f => {
+  f.ctx.state = 'ERROR';
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  f.ctx.lastError = '타임아웃 — 25분 동안 응답을 받지 못했습니다.';
+  f.ctx.conversationUrl = 'https://chatgpt.com/c/fixture';
+  f.ctx.pendingSend = { round: 1, headSha: head, baseRef: 'main', mergeBaseSha: base, at: new Date().toISOString() };
+  const snapshot = { status: 'OPEN' as const, headSha: head, baseRef: 'main' };
+  for (const failure of ['resume', 'marker', 'browser']) {
+    if (f.ctx.pendingSend?.recoverAfter) f.ctx.pendingSend.recoverAfter = new Date(Date.now() - 1).toISOString();
+    applySyncEvents(f.cfg, f.ctx, snapshot);
+    assert.equal(f.ctx.state, 'REVIEW_DUE');
+    f.driver.resumeChat = async () => failure !== 'resume';
+    f.driver.findRound = async () => null;
+    f.driver.ensureAlive = async () => { if (failure === 'browser') throw new Error('browser unavailable'); return false; };
+    assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+    assert(f.ctx.pendingSend?.recoverAfter);
+    assert.equal(f.ctx.retryCount, f.cfg.maxAutoRetries);
+    assert.equal(f.controls.prompts.length, 0);
+    assert.equal(f.posts.length, 0);
+  }
+}));
+
+test('회수 대상이 변경되거나 완성 답의 SHA가 틀리면 게시하지 않는다', async () => fixture(async f => {
+  for (const kind of ['head', 'base', 'answer']) {
+    const ctx = createContext(pr);
+    ctx.conversationUrl = 'https://chatgpt.com/c/fixture';
+    ctx.pendingSend = { round: 1, headSha: kind === 'head' ? 'd'.repeat(40) : head,
+      baseRef: kind === 'base' ? 'release' : 'main', mergeBaseSha: base,
+      at: new Date().toISOString(), recoverAfter: new Date().toISOString() };
+    f.driver.resumeChat = async () => true;
+    f.driver.findRound = async () => 0;
+    f.driver.collectFrom = async () => JSON.stringify({ summary: 'clean', approval: 'approve', comments: [],
+      reviewedHeadSha: 'e'.repeat(40), reviewedBaseSha: base });
+    assert.equal(await runRound(f.cfg, f.driver, ctx), 'failed');
+    assert.equal(ctx.pendingSend?.recoverAfter, undefined);
+    assert.equal(f.controls.prompts.length, 0);
+    assert.equal(f.posts.length, 0);
+  }
+}));
+
+test('전송 기록 없는 타임아웃/파싱 실패는 기존 재시도 한도를 따르고 닫힌 PR의 회수는 해제한다', async () => fixture(async f => {
+  for (const message of ['타임아웃 — 응답 없음', 'GPT 가 PR 에 접근하지 못했습니다']) {
+    f.ctx.state = 'ERROR';
+    f.ctx.retryCount = f.cfg.maxAutoRetries;
+    f.ctx.lastError = message;
+    applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+    assert.equal(f.ctx.state, 'ERROR');
+  }
+  f.ctx.pendingSend = { round: 1, headSha: head, baseRef: 'main', mergeBaseSha: base,
+    at: new Date().toISOString(), recoverAfter: new Date().toISOString() };
+  f.ctx.conversationUrl = 'https://chatgpt.com/c/fixture';
+  applySyncEvents(f.cfg, f.ctx, { status: 'CLOSED', headSha: head, baseRef: 'main' });
+  assert.equal(f.ctx.pendingSend, undefined);
+  assert.equal(f.ctx.state, 'CLOSED');
 }));
 
 test('큰 고정 diff는 잘리지 않은 UTF-8 첨부로 전송하고 대상 SHA를 유지한다', async () => fixture(async f => {
