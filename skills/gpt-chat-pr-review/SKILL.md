@@ -57,26 +57,33 @@ node "{{DAEMON}}" wait owner/repo#12 --since-seq 7
 
 | 이벤트 | 뜻 | 할 일 |
 |---|---|---|
-| `posted` | 지적 사항이 인라인 코멘트로 게시됨 | 읽고 대응 → **4번(스레드 답변·resolve)까지 반드시** |
+| `posted` | 지적 사항이 인라인 코멘트로 게시됨 | 읽고 대응 → **4번(답변·push·resolve)까지 반드시** |
 | `converged` | approve — 더 지적할 것 없음 | 사용자에게 알린다 |
 | `failed` | 라운드 실패 (파싱 실패·리뷰 거부 등) | 데몬이 자동 재시도한다. 반복되면 사용자에게 알린다 |
 | `quota` | ChatGPT 대화 한도 도달 | 쿨다운(기본 3시간) 후 자동 재개. 사용자에게 알린다 |
 | `closed` | PR 이 닫히거나 머지됨 | 대기 종료 |
 | `timeout` | 지정 시간 안에 아무 일도 없었음 | `status` 로 현황 확인 |
 
-**4. 스레드 답변 + resolve** — **순서가 중요하다.**
+**4. 스레드 답변 → push → resolve** — **순서가 중요하다.**
 
 ```
 1) 코드 수정 → git commit      (아직 push 하지 않는다)
-2) 스레드에 답변 + 고친 것만 resolve   (커밋 해시를 인용할 수 있다)
+2) 스레드에 답변               (커밋 해시를 인용할 수 있다)
 3) git push
+4) 고친 스레드만 resolve
 ```
 
-**push 를 마지막에 하는 이유.** 상태 머신은 **새 커밋 하나만으로**
+**답변을 push 보다 먼저 하는 이유.** 상태 머신은 **새 커밋 하나만으로**
 `AUTHOR_RESPONDED` 를 발화하고 watch 는 기본 10초 주기로 폴링한다. push 를
 먼저 하면 답변을 쓰는 동안 다음 라운드가 시작될 수 있고, 그 프롬프트는
 **답변이 없는 스레드**를 읽는다 — 이 절차가 막으려던 바로 그 상황이다.
 커밋만 해두면 해시를 답변에 인용하면서도 그 창을 만들지 않는다.
+
+**resolve 를 push 뒤에 하는 이유.** 상태 머신은 **스레드 전체 resolve** 로도
+`AUTHOR_RESPONDED` 를 발화한다. push 전에 마지막 스레드를 resolve 하면 다음
+라운드가 **push 전의 head** 로 고정되어 시작되고, 리뷰어는 반영 전 스냅샷에서
+같은 지적을 다시 올린다 — 실제로 관측됐다. push 가 새 커밋으로 라운드를 일으키고,
+resolve 는 그 뒤에 "이 지적은 끝났다" 를 표시한다.
 
 ```bash
 # 열려 있는 스레드 목록 (스레드 id · 첫 코멘트 id · 제목)
@@ -91,12 +98,15 @@ query { repository(owner:"OWNER", name:"REPO") { pullRequest(number:N) {
 # 각 스레드에 답변 (무엇을 어떻게 고쳤는지 + 커밋 해시)
 gh api repos/OWNER/REPO/pulls/N/comments/<comment_id>/replies -f body='반영했습니다 (abc1234). ...'
 
-# 그리고 resolve
+# push — 다음 라운드는 이 커밋으로 돈다
+git push
+
+# 그다음 고친 스레드만 resolve
 gh api graphql -f query='mutation {
   resolveReviewThread(input:{threadId:"<thread_id>"}) { thread { isResolved } } }'
 ```
 
-건수가 많으면 위 세 단계를 스크립트로 묶어 한 번에 돈다.
+건수가 많으면 답변과 resolve 를 각각 스크립트로 묶어 돈다 — 그 사이에 push 한다.
 
 **왜 생략하면 안 되는가**
 
@@ -129,7 +139,8 @@ node "{{DAEMON}}" review owner/repo#12
 일부라도 고쳤으면 그 커밋이 다음 라운드를 일으키므로 따로 요청할 필요가 없다.
 
 대응 커밋을 push 하면 데몬이 새 커밋을 감지해 **다음 라운드를 자동으로 돈다.**
-`status --pr <ref> --json` 의 `seq` 를 읽어 그 값으로 다시 `wait` 를 건다.
+resolve 까지 마친 뒤 `status --pr <ref> --json` 의 `seq` 를 읽어 그 값으로 다시
+`wait` 를 건다.
 approve 가 날 때까지 이 왕복이 반복된다.
 
 ## 그 밖의 동사
