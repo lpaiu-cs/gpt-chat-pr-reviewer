@@ -24,14 +24,21 @@ export async function enterProject(page: Page, entry: ProjectEntry, input: strin
     }
     const openSidebar = page.getByRole('button', { name: /^(Open sidebar|사이드바 열기)$/i });
     if (await openSidebar.isVisible()) await openSidebar.press('Enter');
-    const row = page.getByRole('button', { name: entry.name, exact: true });
-    try { await row.waitFor({ state: 'visible', timeout: 15_000 }); }
+    // 2026-09 개편 사이드바는 행에 프로젝트 ID 가 붙는다 — 그때는 ID 로 찾는다. 프로젝트 홈에는
+    // 이름이 같은 버튼(제목)이 하나 더 있어 이름으로는 둘이 걸린다. 옛 사이드바는 이름뿐이다.
+    const byId = page.locator(`[data-app-action-sidebar-project-id="${expected}"]`);
+    const byName = page.getByRole('button', { name: entry.name, exact: true });
+    try { await byId.or(byName).first().waitFor({ state: 'visible', timeout: 15_000 }); }
     catch (cause) {
-      const visible = await page.locator('[data-sidebar-item][role="button"], a[href*="/g/g-p-"]').allTextContents();
+      const visible = await page.locator('[data-sidebar-item][role="button"], [data-app-action-sidebar-project-row], a[href*="/g/g-p-"]').allTextContents();
       throw new Error(`사이드바에서 프로젝트 "${entry.name}"을 찾지 못했습니다. 표시된 항목: ${visible.map(s => s.trim()).filter(Boolean).slice(0,20).join(', ')}`, { cause });
     }
-    // 숨겨진 trailing button은 pointer-events:none일 수 있다. Enter는 호버나 OS 포커스를 요구하지 않는다.
-    await row.locator('..').getByRole('button', { name: /^(Open project( home)?|프로젝트 홈 열기)$/i }).press('Enter');
+    const row = (await byId.count()) > 0 ? byId : byName;
+    // 숨겨진 버튼은 pointer-events:none일 수 있다. Enter는 호버나 OS 포커스를 요구하지 않는다.
+    // 옛 사이드바는 행 옆의 "Open project home", 개편 사이드바는 행 안의 "New chat in <이름>" 이다
+    // (개편된 행 자체는 펼치기 버튼이라 눌러도 이동하지 않는다).
+    const openHome = row.locator('..').getByRole('button', { name: /^(Open project( home)?|프로젝트 홈 열기)$/i });
+    await openHome.or(row.getByRole('button', { name: /^New chat in /i })).first().press('Enter');
     await page.waitForURL(url => chatgptProjectId(url.href) !== null && /\/project\/?$/.test(url.pathname), { timeout: 15_000 });
     await editor.waitFor({ state: 'visible', timeout: 15_000 });
   }

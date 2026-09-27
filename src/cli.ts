@@ -308,10 +308,10 @@ program
       }
 
       console.log(chalk.cyan('\n  리뷰 전용 프로젝트 설정'));
-      console.log('  1. 열린 ChatGPT의 사이드바에서 새 프로젝트를 만들거나 기존 리뷰 전용 프로젝트를 여세요.');
-      console.log('  2. 프로젝트를 사이드바에 고정하고, 새 채팅 입력창이 보이는 프로젝트 홈을 여세요.');
-      console.log('  3. Enter를 누르면 이름과 URL을 자동으로 읽고, 다시 찾아 들어갈 수 있는지 검증합니다.');
       if (process.stdin.isTTY && opts.projectUrl === undefined) {
+        console.log('  1. 열린 ChatGPT의 사이드바에서 새 프로젝트를 만들거나 기존 리뷰 전용 프로젝트를 여세요.');
+        console.log('  2. 프로젝트를 사이드바에 고정하고, 새 채팅 입력창이 보이는 프로젝트 홈을 여세요.');
+        console.log('  3. Enter를 누르면 이름과 URL을 자동으로 읽고, 다시 찾아 들어갈 수 있는지 검증합니다.');
         const rl = createInterface({ input: process.stdin, output: process.stdout });
         try {
           for (;;) {
@@ -320,6 +320,9 @@ program
             catch (e) { console.log(chalk.yellow(`  ${e instanceof Error ? e.message : String(e)}`)); }
           }
         } finally { rl.close(); }
+      } else {
+        // 입력을 받지 않는 실행이다 — 손으로 할 일을 안내하면 기다리는 줄 알고 멈춰 있게 된다.
+        console.log(chalk.dim(`  등록된 프로젝트로 자동 진입을 확인합니다: ${cfg.chatgptProjectName ?? cfg.chatgptProjectUrl}`));
       }
       // 접근 확인이 끝나야 설정 완료다. 로그인만 됐거나 잘못된 URL이면 저장하지 않는다.
       await driver.startNewChat();
@@ -1031,12 +1034,24 @@ program
           chalk.dim(' (브라우저 미실행 · ChatGPT 한도 소비 없음)'),
       );
     } else {
+      // 기동은 수십 초 걸리고 어디서든 막힐 수 있다. 단계마다 한 줄 남긴다 — 로그는
+      // 대시보드에도 흐르므로, 멈춘 자리가 사용자에게 바로 보인다 (조용하다가 끝에
+      // 한 줄만 나오면 진입 실패가 어느 단계였는지 알 수 없었다).
+      const stage = async <T>(label: string, run: () => Promise<T>): Promise<T> => {
+        console.log(chalk.dim(`  ${label}…`));
+        try { return await run(); }
+        catch (e) {
+          console.log(chalk.red(`  ✗ ${label} 실패: ${(e instanceof Error ? e.message : String(e)).split('\n')[0]}`));
+          throw e;
+        }
+      };
       driver = new ChatGPTDriver(cfg);
-      await driver.launch(cfg.accountSwitchPending ? false : cfg.headless);
-      await driver.navigateToChatGPT();
+      const d = driver;
+      await stage('브라우저 시작', () => d.launch(cfg.accountSwitchPending ? false : cfg.headless));
+      await stage('ChatGPT 여는 중', () => d.navigateToChatGPT());
 
       if (!cfg.accountSwitchPending) {
-        const user = await driver.getSessionUser();
+        const user = await stage('로그인 확인', () => d.getSessionUser());
         if (!user) {
           console.log(chalk.red('  ✗ ChatGPT 로그인이 필요합니다. 먼저 setup 을 실행하세요.'));
           await driver.close();
@@ -1045,8 +1060,8 @@ program
         }
         console.log(chalk.dim(`  계정: ${user.email ?? user.name}`));
         progress.patch({ account: user.email ?? user.name ?? null });
-        await driver.startNewChat();
-        progress.patch({ project: await driver.projectEntry() });
+        await stage(`리뷰 프로젝트 진입 (${cfg.chatgptProjectName ?? cfg.chatgptProjectUrl})`, () => d.startNewChat());
+        progress.patch({ project: await d.projectEntry() });
         console.log(chalk.dim('  프로젝트 자동 진입 확인 완료'));
       }
       browserReady = true;

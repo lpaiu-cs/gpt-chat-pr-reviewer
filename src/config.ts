@@ -5,12 +5,14 @@ const CONFIG_FILE = 'pr-review.config.json';
 
 // ── 기본 셀렉터 (ChatGPT DOM 변경 시 여기를 수정) ─────────
 
+// 앞쪽은 옛 화면, 뒤쪽은 2026-09 개편 화면이다 (입력창 id 와 메시지 역할 속성이 없어졌다).
+// 개편은 계정마다 따로 오므로 둘 다 둔다.
 const DEFAULT_SELECTORS: ChatGPTSelectors = {
-  textInput: '#prompt-textarea',
+  textInput: '#prompt-textarea, form[data-chatgpt-composer] [contenteditable="true"]',
   sendButton: 'button[data-testid="send-button"]',
   stopButton: 'button[data-testid="stop-button"], button[aria-label*="Stop"]',
-  assistantMessage: '[data-message-author-role="assistant"]',
-  messageContent: '.markdown',
+  assistantMessage: '[data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":assistant"]',
+  messageContent: '.markdown, [data-chatgpt-selection-message-id]',
 };
 
 // ── 기본 프롬프트 ───────────────────────────────────────────

@@ -53,3 +53,119 @@ test('실제 Chrome: 직접 로딩 실패·호버 비활성 버튼에서도 Ente
     await assert.rejects(enterProject(page, { ...entry, name: '' }, '#prompt-textarea'), /setup/);
   } finally { await browser.close(); }
 });
+
+// 2026-09 개편 화면: 입력창 id 가 없고, 사이드바 행은 펼치기 버튼이며, 프로젝트 새 채팅 버튼이
+// 행 안에 있다. 메시지는 data-message-author-role 대신 검색 단위 속성으로 그려진다.
+// 실측: 새로 연 탭은 전부 이 화면만 받았고, 옛 셀렉터로는 홈 입력창부터 찾지 못했다.
+const NEW_UI = `
+<nav>
+  <!-- 이름이 같은 다른 프로젝트가 먼저 나온다 — 이름으로 고르면 여기로 들어간다. -->
+  <div role="button" tabindex="0" data-app-action-sidebar-project-row data-app-action-sidebar-project-id="g-p-9999"
+    aria-label="Reviews"><button aria-label="New chat in Reviews"
+    onclick="history.pushState({}, '', '/g/g-p-9999/project')">+</button></div>
+  <div data-sidebar-project-container-id="project:g-p-1234"><div>
+    <div role="button" tabindex="0" aria-expanded="true" data-app-action-sidebar-project-row
+      data-app-action-sidebar-project-id="g-p-1234" aria-labelledby="label"><span id="label">Reviews</span>
+      <button aria-label="Project actions for Reviews" aria-haspopup="menu">…</button>
+      <button aria-label="New chat in Reviews" style="pointer-events:none;opacity:0" onclick="openProject()">+</button>
+    </div>
+    <div role="list" aria-label="Chats in Reviews"></div>
+  </div></div>
+</nav>
+<main id="main"></main>
+<script>
+  const composer = '<form data-chatgpt-composer><div contenteditable="true" role="textbox"></div></form>';
+  // 이름이 같은 버튼(추천 칩)이 하나 더 있다 — 이름으로 찾으면 둘이 걸린다.
+  main.innerHTML = '<h1>Ready when you are.</h1><button>Reviews</button>' + composer;
+  function openProject() {
+    history.pushState({}, '', '/g/g-p-1234/project');
+    main.innerHTML = '<h1>Reviews</h1>' + composer
+      + '<a href="/g/g-p-1234/c/abcd" onclick="event.preventDefault(); openChat()">Existing review</a>';
+  }
+  const turn = (n, user, answerId, answer) => '<div data-turn-key="u' + n + '">'
+    + '<div data-chatgpt-search-unit-key="fallback-turn-' + n + ':0:user" data-chatgpt-search-message-ids="u' + n + '">'
+    + '<div data-user-message-bubble="true">' + user + '</div></div><span hidden data-chatgpt-agent-turn-start></span>'
+    + '<div data-chatgpt-search-unit-key="fallback-turn-' + n + ':2:assistant" data-chatgpt-search-message-ids="' + answerId + ' ' + answerId + '-x">'
+    + '<h4 data-conversation-role="assistant">ChatGPT said:</h4><div data-chatgpt-selection-message-id="' + answerId + '">' + answer + '</div></div></div>';
+  function openChat() {
+    history.pushState({}, '', '/g/g-p-1234/c/abcd');
+    // 본문에 안내 문구와 같은 글자가 있다 — 화면 안내로 읽히면 새로고침 복구로 빠진다.
+    main.innerHTML = turn(1, '리뷰 라운드: 1차', 'a1', 'Connection interrupted 는 리뷰 본문이다')
+      + turn(2, '리뷰 라운드: 2차 · Connection interrupted', 'a2', '{"summary":"ok"}') + composer;
+  }
+</script>`;
+
+test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기·응답 수집', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const page = await browser.newPage();
+  const entry = { url: 'https://chatgpt.com/g/g-p-1234/project', name: 'Reviews' };
+  let deepLoads = 0;
+  await page.route('https://chatgpt.com/**', async (route) => {
+    if (new URL(route.request().url()).pathname !== '/') {
+      deepLoads++;
+      return route.fulfill({ status: 500, body: 'Try again' });
+    }
+    await route.fulfill({ contentType: 'text/html; charset=utf-8', body: NEW_UI });
+  });
+  try {
+    const cfg = { ...loadConfig('tests/__missing__.json'), chatgptProjectUrl: entry.url, chatgptProjectName: entry.name };
+    await page.goto('https://chatgpt.com/');
+    await enterProject(page, entry, cfg.selectors.textInput);
+    assert.deepEqual(await readProjectEntry(page, cfg.selectors.textInput), entry);
+
+    const driver = new ChatGPTDriver(cfg) as any;
+    driver.page = page;
+    const chat = entry.url.replace('/project', '/c/abcd');
+    assert.equal(await driver.resumeChat(chat, { requireAssistant: false }), true);
+    assert.equal(deepLoads, 0, '개편 화면에서도 전체 문서 로딩을 피해야 한다');
+
+    assert.equal(await driver.lastUserMessageId(page), 'u2');
+    assert.equal(await driver.countUserMessages(page), 2);
+    const baseline = await driver.findRound('리뷰 라운드: 2차');
+    assert.equal(baseline, 1);
+    page.waitForTimeout = async () => {}; // 폴링 간격만 없앤다 — 판정은 실제 화면으로 한다
+    assert.equal(await driver.collectFrom(baseline, 60_000), '{"summary":"ok"}');
+
+    // 생성 중인 답은 식별자도 턴 키 조상도 없다(실측) — 우리가 찍은 표식으로 고정해야
+    // 위치 읽기의 축소 오인을 피한다. 같은 노드면 표식이 유지되고, 다시 그려지면 새로 찍힌다.
+    await page.evaluate(() => {
+      const unit = document.querySelector('[data-chatgpt-search-message-ids^="a2"]')!;
+      unit.setAttribute('data-chatgpt-search-message-ids', '');
+      unit.closest('[data-turn-key]')!.removeAttribute('data-turn-key');
+    });
+    const { readMessagesInPage, messageByIdSelector, readComposerInPage } = await import('../src/chatgpt.js');
+
+    // 줄 중간 URL 이 링크 위젯이 되면 innerText 는 아이콘 자리에 줄바꿈을 그린다(platelog#3 실측).
+    // 검증은 장식을 뺀 글자로 한다.
+    const editor = page.locator(cfg.selectors.textInput).first();
+    await editor.evaluate((el) => { el.innerHTML = '<p>로컬 (<span data-rich-text-generated-autolink=""><span aria-hidden="true" contenteditable="false" style="display:block">⊕</span>http://10.0.2.2:54321</span>, 디버그)<br>다음 줄<br class="ProseMirror-trailingBreak"></p>'; });
+    assert.notEqual((await editor.innerText()).split('\n')[0], '로컬 (http://10.0.2.2:54321, 디버그)', 'innerText 는 줄을 가른다');
+    assert.equal(await editor.evaluate(readComposerInPage), '로컬 (http://10.0.2.2:54321, 디버그)\n다음 줄\n');
+    await editor.evaluate((el) => { el.innerHTML = ''; });
+    const first = (await page.evaluate(readMessagesInPage, null)).at(-1)!;
+    assert.match(first.id!, /^anchor-/);
+    assert.equal((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '같은 노드는 같은 표식');
+    assert.equal(await page.locator(messageByIdSelector(first.id!)).innerText(), 'ChatGPT said:\n{"summary":"ok"}');
+    await page.evaluate(() => { const u = document.querySelector('[data-pr-review-anchor]')!; u.replaceWith(u.cloneNode(true) as Element); document.querySelector('[data-pr-review-anchor]')!.removeAttribute('data-pr-review-anchor'); });
+    assert.notEqual((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '다시 그린 노드는 새 표식');
+  } finally { await browser.close(); }
+});
+
+test('실제 Chrome: 위치로 읽는 답이 완료 때 같은 노드에서 줄어도 받아들인다', async () => {
+  // 실측(platelog#3): 새 대화의 생성 중 화면에서는 질문을 못 읽어 답 위치를 전송 시점 기준으로
+  // 읽었고, 완료 때 코드블록을 다시 그리며 977→963자로 줄자 "다른 노드" 로 보고 라운드를 버렸다.
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const page = await browser.newPage();
+  try {
+    await page.setContent('<main><div data-chatgpt-search-unit-key="t:2:assistant"><div data-chatgpt-selection-message-id="a">```json {"summary":"ok"} ```</div></div></main>');
+    const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
+    driver.page = page;
+    driver.isStreaming = async () => false;
+    // 질문이 안 보이는 화면이다 — 앵커를 못 잡아 위치로 물러선다.
+    let polls = 0;
+    page.waitForTimeout = async () => {
+      if (++polls === 5) await page.locator('[data-chatgpt-selection-message-id]').evaluate((el) => { el.textContent = '{"summary":"ok"}'; });
+    };
+    assert.equal(await driver.collectFrom(0, 60_000), '{"summary":"ok"}');
+  } finally { await browser.close(); }
+});

@@ -47,6 +47,84 @@ export interface ConversationMessage {
 }
 
 /**
+ * 화면의 대화 메시지를 순서대로 읽는다 — **브라우저 안에서 실행된다** (`page.evaluate`
+ * 로 넘기므로 바깥 변수를 못 쓴다). `contentSel` 이 null 이면 본문은 읽지 않는다.
+ *
+ * 2026-09 개편 화면은 `data-message-author-role`·`data-message-id` 를 없앴다. 질문과
+ * 답이 `data-chatgpt-search-unit-key`("…:user" / "…:assistant") 단위로 그려지고
+ * 식별자는 `data-chatgpt-search-message-ids` 의 첫 값이다. 옛 속성만 보던 판정에는
+ * 대화가 통째로 비어 보였다. 옛 화면도 계속 읽는다 — 개편은 계정마다 따로 온다.
+ */
+export function readMessagesInPage(contentSel: string | null): { role: string; id: string | null; text: string }[] {
+  const legacy = [...document.querySelectorAll('[data-message-author-role]')];
+  if (legacy.length > 0) {
+    return legacy.map((el) => ({
+      role: el.getAttribute('data-message-author-role') ?? '',
+      id: el.getAttribute('data-message-id'),
+      text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
+    }));
+  }
+  return [...document.querySelectorAll('[data-chatgpt-search-unit-key]')].flatMap((el) => {
+    const key = el.getAttribute('data-chatgpt-search-unit-key') ?? '';
+    const role = key.slice(key.lastIndexOf(':') + 1);
+    if (role !== 'user' && role !== 'assistant') return [];
+    // 생성 중인 답은 식별자 목록도 턴 키 조상도 없다(실측). 그동안 위치로 읽으면 완료 때
+    // 코드블록을 다시 그리며 글자가 줄어 "다른 노드" 로 오인하고 라운드를 버렸다. 그래서
+    // **우리가 노드에 표식을 찍어** 식별자로 쓴다. 노드가 새로 그려지면 표식이 사라지고
+    // 새 표식이 찍히므로, 재고정(judgeRebind)이 같은 질문의 새 노드로 옮겨 탄다.
+    let id = (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null;
+    if (!id && role === 'assistant') {
+      id = el.getAttribute('data-pr-review-anchor');
+      if (!id) { id = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; el.setAttribute('data-pr-review-anchor', id); }
+    }
+    return [{
+      role,
+      id,
+      text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
+    }];
+  });
+}
+
+/**
+ * 입력창에 실제로 들어 있는 글 — **브라우저 안에서 실행된다.** innerText 를 쓰지 않는다.
+ *
+ * 개편 입력창은 URL 을 링크 위젯으로 바꾸며 아이콘(`contenteditable=false`·`aria-hidden`)을
+ * 끼워 넣는데, innerText 는 그 아이콘 자리에 줄바꿈을 그린다. 줄 중간의 URL 이면 그 줄이
+ * 둘로 보여 같은 글인데도 검증이 막혔다(platelog#3). 장식을 빼고 글자만 읽는다.
+ */
+export function readComposerInPage(el: Element): string {
+  const copy = el.cloneNode(true) as Element;
+  copy.querySelectorAll('[contenteditable="false"], [aria-hidden="true"]').forEach((n) => n.remove());
+  copy.querySelectorAll('br').forEach((br) => br.replaceWith('\n'));
+  // 블록 경계는 줄바꿈이다 — 맨글자와 블록이 섞여 있어도 앞 글자를 잃지 않는다.
+  copy.querySelectorAll('p, div, pre, h1, h2, h3, h4, h5, h6, li, blockquote').forEach((b) => { if (b.previousSibling) b.before('\n'); });
+  return copy.textContent ?? '';
+}
+
+/**
+ * 입력창의 글을 보낸 글과 비교할 형태로 편다.
+ *
+ * **줄바꿈 개수는 보지 않는다.** 개편 입력창은 블록 앞뒤와 끝에 줄바꿈을 더 그린다 — 같은
+ * 글인데 달라 보여 전송이 매번 막혔다. 글자는 전부 대조하므로 잘림과 칩 치환(URL 이
+ * owner/repo#N 으로 바뀌던 사고)은 여전히 잡힌다.
+ */
+export function composerText(s: string): string {
+  return s.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
+}
+
+/**
+ * 어시스턴트 메시지를 **안정적 식별자**로 고정하는 셀렉터 (옛 화면 · 개편 화면).
+ *
+ * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
+ * 9차 라운드가 7차 응답을 게시한 경로가 그것이다. 노드가 뜨는 즉시 이 값으로
+ * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
+ */
+export function messageByIdSelector(id: string): string {
+  if (id.startsWith('anchor-')) return `[data-pr-review-anchor="${id}"]`;
+  return `[data-message-id="${id}"], [data-chatgpt-search-message-ids~="${id}"]`;
+}
+
+/**
  * 이 대화에서 그 라운드 질문이 **마지막 질문**인지 보고, 맞으면 그 질문 직전까지의
  * 어시스턴트 메시지 수를 돌려준다 (없으면 null).
  *
@@ -220,15 +298,6 @@ const QUOTA_RECHECK_MS = 30_000;
 
 /** 전송 전, 진행 중인 생성이 끝나기를 기다리는 폴링 간격. */
 const IDLE_POLL_MS = 3_000;
-
-/**
- * 어시스턴트 메시지의 **안정적 식별자**.
- *
- * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
- * 9차 라운드가 7차 응답을 게시한 경로가 그것이다. 노드가 뜨는 즉시 이 값으로
- * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
- */
-const MESSAGE_ID_ATTR = 'data-message-id';
 
 /** 식별자를 못 잡았을 때, 축소 관측을 이만큼 연속으로 보면 수집 실패로 본다. */
 const SHRINK_TOLERANCE = 3;
@@ -895,10 +964,13 @@ export class ChatGPTDriver {
           if (chatgptProjectId(want) !== chatgptProjectId(this.cfg.chatgptProjectUrl ?? '')) return false;
           await this.startNewChat();
           const id = new URL(want).pathname.split('/c/')[1];
-          const link = p.locator(`a[href$="/c/${id}"]`).first();
+          // 개편 사이드바는 프로젝트 아래에도 같은 대화 링크를 둔다 — 접혀 숨은 쪽을 집지 않는다.
+          const link = p.locator(`a[href$="/c/${id}"]:visible`).first();
           // ponytail: 최근 200개까지 탐색. 더 오래된 대화는 새 대화로 회전한다.
           for (let i = 0; i < 10 && !(await link.isVisible()); i++) {
-            const more = p.getByRole('button', { name: /^(Load more conversations|더 많은 대화 불러오기)$/i });
+            // 개편 화면은 프로젝트 홈 목록의 "Show more" 다. 사이드바·긴 질문에도 같은 이름이 있어 본문 것만 쓴다.
+            const more = p.getByRole('button', { name: /^(Load more conversations|더 많은 대화 불러오기)$/i })
+              .or(p.locator('main').getByRole('button', { name: /^Show more$/i })).first();
             if (!(await more.isVisible())) break;
             const before = await p.locator('a[href*="/c/"]').count();
             await more.press('Enter');
@@ -996,13 +1068,11 @@ export class ChatGPTDriver {
     try {
       if (attachment) {
         await this.inputStep(`고정 diff 첨부 (${attachment.buffer.length}바이트)`, async () => {
-          // 현재 composer의 메뉴가 연 file chooser를 사용한다.
-          await composer.locator('#composer-plus-btn').click();
-          const [chooser] = await Promise.all([
-            p.waitForEvent('filechooser', { timeout: 10_000 }),
-            p.getByText(/^(Add photos & files|사진 및 파일 추가|사진과 파일 추가)$/).click(),
-          ]);
-          await chooser.setFiles({ ...attachment, mimeType: 'text/plain' });
+          // 메뉴를 거치지 않고 현재 composer 의 일반 파일 입력(accept 없음)에 직접 넣는다.
+          // 첨부 메뉴는 개편 때 이름과 구조가 바뀌었고(#composer-plus-btn → "Add files and more"),
+          // 옆에는 이미지 전용 입력도 있다.
+          await composer.locator('input[type="file"]:not([accept])').first()
+            .setInputFiles({ ...attachment, mimeType: 'text/plain' });
           // 파일 이름이 나타나는 것만으로 업로드 성공은 아니다. 처리 중에는 이 아이콘이 숨겨져 있다.
           try {
             await composer.getByRole('group', { name: attachment.name, exact: true })
@@ -1030,8 +1100,8 @@ export class ChatGPTDriver {
       try {
         if (!(await this.isStreaming(p)) && await this.lastUserMessageId(p) === lastUserBefore
           && await this.countUserMessages(p) === beforeUserCount) {
-          const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
-          const text = normalize(await input.innerText());
+          const normalize = composerText;
+          const text = normalize(await input.evaluate(readComposerInPage));
           if (!text || text === normalize(prompt)) {
             if (attachment) {
               const remove = composer.getByRole('group', { name: attachment.name, exact: true })
@@ -1059,13 +1129,16 @@ export class ChatGPTDriver {
     return this.collectResponse(p, before, lastUserBefore);
   }
 
+  /** 화면에 그려져 있는 질문들 (역할·식별자만 — 본문은 크므로 읽지 않는다). */
+  private async userMessages(page: Page): Promise<MessageRef[]> {
+    const msgs = await page.evaluate(readMessagesInPage, null);
+    return msgs.filter((m) => m.role === 'user');
+  }
+
   /** 화면에 그려져 있는 마지막 질문의 식별자 (없으면 null). */
   private async lastUserMessageId(page: Page): Promise<string | null> {
     try {
-      return await page.evaluate(() => {
-        const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
-        return els.length > 0 ? els[els.length - 1].getAttribute('data-message-id') : null;
-      });
+      return (await this.userMessages(page)).at(-1)?.id ?? null;
     } catch {
       return null;
     }
@@ -1073,9 +1146,7 @@ export class ChatGPTDriver {
 
   private async countUserMessages(page: Page): Promise<number> {
     try {
-      return await page.evaluate(
-        () => document.querySelectorAll('[data-message-author-role="user"]').length,
-      );
+      return (await this.userMessages(page)).length;
     } catch {
       return 0;
     }
@@ -1097,18 +1168,14 @@ export class ChatGPTDriver {
   ): Promise<boolean> {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      const sent = await page
-        .evaluate(
-          ({ prevId, before }) => {
-            const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
-            if (prevId) {
-              const idx = els.findIndex((el) => el.getAttribute('data-message-id') === prevId);
-              if (idx !== -1) return idx + 1 < els.length;
-            }
-            return els.length > before;
-          },
-          { prevId: lastUserIdBefore, before: beforeCount },
-        )
+      const sent = await this.userMessages(page)
+        .then((users) => {
+          if (lastUserIdBefore) {
+            const idx = users.findIndex((m) => m.id === lastUserIdBefore);
+            if (idx !== -1) return idx + 1 < users.length;
+          }
+          return users.length > beforeCount;
+        })
         .catch(() => false);
       if (sent) return true;
       await page.waitForTimeout(500);
@@ -1130,12 +1197,7 @@ export class ChatGPTDriver {
     // selectors.assistantMessage 를 일반화한 형태다 — 역할별로 나눠 읽어야
     // "그 질문이 마지막인가" 를 판정할 수 있다.
     try {
-      const msgs = await p.evaluate((contentSel) => {
-        return [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
-          role: el.getAttribute('data-message-author-role') ?? '',
-          text: (el.querySelector(contentSel) ?? el).textContent ?? '',
-        }));
-      }, this.cfg.selectors.messageContent);
+      const msgs = await p.evaluate(readMessagesInPage, this.cfg.selectors.messageContent);
       return findRoundBaseline(msgs, marker);
     } catch {
       return null;
@@ -1230,7 +1292,8 @@ export class ChatGPTDriver {
             if (!raw || !raw.trim()) continue;
             const el = node.parentElement as HTMLElement | null;
             if (!el) continue;
-            if (el.closest('[data-message-author-role]')) continue;
+            // 옛 화면의 메시지 노드와 개편 화면의 질문·답 단위·본문 — 빠뜨리면 리뷰 본문이 안내로 읽힌다.
+            if (el.closest('[data-message-author-role], [data-chatgpt-search-unit-key], [data-user-message-bubble], [data-chatgpt-selection-message-id]')) continue;
             if (el.closest('script, style, noscript, template')) continue;
             // 조상까지 포함해 실제 표시 여부를 판정한다 — 직접 부모는 보여도
             // 상위 패널이 display:none/visibility:hidden/opacity:0이면 숨김이고,
@@ -1348,8 +1411,11 @@ export class ChatGPTDriver {
         // PM의 plain-text paste는 연속 개행을 문단 하나로 합친다. 자체 clipboard
         // 형식으로 공백 보존을 요청하고, 개행은 hard break로 전달한다.
         const escaped = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        // PM이 마지막 BR을 표시용으로 버리므로 실제 마지막 개행과 구분한다.
-        dt.setData('text/html', `<p data-pm-slice="1 1 []">${escaped.replace(/\r?\n/g, '<br>')}<br></p>`);
+        // 옛 입력창(PM)은 마지막 BR을 표시용으로 버리므로 실제 마지막 개행과 구분한다.
+        // 개편 입력창은 그 BR을 줄바꿈으로 남긴다 — 붙이면 4000자 조각 경계마다 줄
+        // 한가운데가 끊겨 diff 줄이 쪼개진다(실측). 그쪽에서는 붙이지 않는다.
+        const tail = (el as HTMLElement).closest?.('form[data-chatgpt-composer]') ? '' : '<br>';
+        dt.setData('text/html', `<p data-pm-slice="1 1 []">${escaped.replace(/\r?\n/g, '<br>')}${tail}</p>`);
         el.dispatchEvent(
           new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
         );
@@ -1363,8 +1429,8 @@ export class ChatGPTDriver {
     }
     // 처리된 paste는 preventDefault로 false를 반환할 수 있다. 이벤트 반환값이
     // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
-    const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
-    const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
+    const normalize = composerText;
+    const matches = async () => normalize(await input.evaluate(readComposerInPage, undefined, { timeout: 3_000 })) === normalize(text);
     let matched = await this.inputStep('붙여넣기 검증', matches, false);
     if (!matched && (await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
       await this.inputStep('짧은 입력 폴백', () => page.keyboard.insertText(text));
@@ -1375,7 +1441,7 @@ export class ChatGPTDriver {
       return;
     }
     // 비우기 전에 무엇이 들어갔는지부터 읽는다 — 이게 원인을 가르는 증거다.
-    const actual = normalize(await input.innerText({ timeout: 3_000 }));
+    const actual = normalize(await input.evaluate(readComposerInPage, undefined, { timeout: 3_000 }));
     const want = normalize(text);
     let diffAt = 0;
     while (diffAt < actual.length && diffAt < want.length && actual[diffAt] === want[diffAt]) diffAt++;
@@ -1471,7 +1537,7 @@ export class ChatGPTDriver {
      * 통과해 직전 라운드의 답이 이번 응답으로 저장된다.
      */
     const targetLocator = (): Locator | null => {
-      if (bound) return page.locator(`[${MESSAGE_ID_ATTR}="${bound.id}"]`);
+      if (bound) return page.locator(messageByIdSelector(bound.id));
       if (readyNth !== null) return page.locator(sel.assistantMessage).nth(readyNth);
       if (fellBack) return page.locator(sel.assistantMessage).nth(messageCountBefore);
       return null;
@@ -1481,12 +1547,7 @@ export class ChatGPTDriver {
     // "마지막 질문 뒤" 를 판정할 수 있다.
     const readMessages = async (): Promise<MessageRef[] | null> => {
       try {
-        return await page.evaluate(() =>
-          [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
-            role: el.getAttribute('data-message-author-role') ?? '',
-            id: el.getAttribute('data-message-id'),
-          })),
-        );
+        return await page.evaluate(readMessagesInPage, null);
       } catch {
         return null; // 네비게이션 중 등
       }
@@ -1529,7 +1590,11 @@ export class ChatGPTDriver {
       // 앵커 판별 불가 (셀렉터 커스터마이즈 등) — 종전대로 전송 시점 기준 위치.
       // 전송 직후 우리 질문이 아직 안 그려진 한순간도 여기로 떨어지는데, 그때
       // 물러서면 직전 라운드의 답을 고정한다. 계속 못 잡을 때만 물러선다.
-      if (unknowns >= UNKNOWN_TOLERANCE) fellBack = true;
+      if (unknowns >= UNKNOWN_TOLERANCE && !fellBack) {
+        fellBack = true;
+        // 개편 화면에서 실제로 여기로 떨어졌다 — 다음에 원인을 짚을 근거를 남긴다.
+        console.log(chalk.dim(`  답 위치를 화면에서 못 잡아 전송 시점 위치로 읽습니다 (메시지 ${msgs ? msgs.map((m) => m.role[0] ?? '?').join('') || '없음' : '조회 실패'})`));
+      }
       return null;
     };
 
@@ -1537,9 +1602,19 @@ export class ChatGPTDriver {
     // 본문(.markdown)이 있으면 그쪽을 읽는다. 한 메시지 안에 본문 블록이 여러 개면
     // (산문 + 코드블록 + 산문) **전부 이어 붙인다** — 마지막 하나만 집으면 JSON 이
     // 앞에 있을 때 통째로 잃는다.
+    /** 위치로 읽은 노드의 표식 (이번 읽기 · 마지막으로 받아들인 읽기). */
+    let readStamp: string | null = null;
+    let lastStamp: string | null = null;
     const readTarget = async (): Promise<string> => {
       const target = targetLocator();
       if (!target) return ''; // 어느 노드가 이번 답인지 아직 모른다
+      // 위치로 읽을 때는 그 노드에 표식을 찍어 **같은 노드인지** 안다. 개편 화면은 완료 때
+      // 코드블록을 다시 그리며 글자가 줄어드는데, 같은 노드의 축소는 정상이다.
+      readStamp = bound ? null : await Promise.resolve().then(() => target.evaluate((el) => {
+        let s = el.getAttribute('data-pr-review-anchor');
+        if (!s) { s = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; el.setAttribute('data-pr-review-anchor', s); }
+        return s;
+      })).catch(() => null);
       const bodies = target.locator(sel.messageContent);
       if ((await bodies.count().catch(() => 0)) > 0) {
         const parts = await bodies.allInnerTexts().catch(() => [] as string[]);
@@ -1603,7 +1678,8 @@ export class ChatGPTDriver {
       // 식별자를 못 잡아 위치로 읽는 중이라면, **짧아진 값을 채택하지 않는다.**
       // 생성 중인 응답은 길어지기만 하므로 축소는 다른 노드를 읽었다는 신호다.
       // (경고만 하고 덮어쓰면 그 값이 3회 안정 관측을 통과해 그대로 게시된다.)
-      if (!bound && lastText.length > 0 && cur.length < lastText.length) {
+      const sameNode = readStamp !== null && readStamp === lastStamp;
+      if (!bound && !sameNode && lastText.length > 0 && cur.length < lastText.length) {
         shrinks++;
         console.log(
           chalk.yellow(
@@ -1619,6 +1695,7 @@ export class ChatGPTDriver {
         continue;
       }
       shrinks = 0;
+      lastStamp = readStamp;
 
       // **덮어쓰기 전에** 변경 여부를 잡는다. 아래에서 lastText = cur 을 해버리면
       // 그 뒤에는 언제나 같아 보여서, 정상 스트리밍도 "변화 없음" 으로 기록된다.

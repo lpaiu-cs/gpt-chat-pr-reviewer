@@ -70,9 +70,8 @@ test('실제 Chrome: 전송 실패 초안 회수와 첨부 완료 경계', async
     });
     await t.test('업로드 실패 시 클릭하지 않고 자기 초안을 회수한다', async () => {
       const d = await driver();
-      const mocked = t.mock.method(page, 'waitForEvent', (async () => ({
-        setFiles: async () => { throw new Error('upload failed'); },
-      })) as typeof page.waitForEvent);
+      const mocked = t.mock.method(Object.getPrototypeOf(page.locator('body')), 'setInputFiles',
+        async () => { throw new Error('upload failed'); });
       d.clickSend = async () => assert.fail('upload failed; must not send');
       try { await assert.rejects(d.sendAndCollect(prompt, undefined, file), /upload failed/); }
       finally { mocked.mock.restore(); }
