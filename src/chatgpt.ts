@@ -47,6 +47,47 @@ export interface ConversationMessage {
 }
 
 /**
+ * 화면의 대화 메시지를 순서대로 읽는다 — **브라우저 안에서 실행된다** (`page.evaluate`
+ * 로 넘기므로 바깥 변수를 못 쓴다). `contentSel` 이 null 이면 본문은 읽지 않는다.
+ *
+ * 2026-09 개편 화면은 `data-message-author-role`·`data-message-id` 를 없앴다. 질문과
+ * 답이 `data-chatgpt-search-unit-key`("…:user" / "…:assistant") 단위로 그려지고
+ * 식별자는 `data-chatgpt-search-message-ids` 의 첫 값이다. 옛 속성만 보던 판정에는
+ * 대화가 통째로 비어 보였다. 옛 화면도 계속 읽는다 — 개편은 계정마다 따로 온다.
+ */
+export function readMessagesInPage(contentSel: string | null): { role: string; id: string | null; text: string }[] {
+  const legacy = [...document.querySelectorAll('[data-message-author-role]')];
+  if (legacy.length > 0) {
+    return legacy.map((el) => ({
+      role: el.getAttribute('data-message-author-role') ?? '',
+      id: el.getAttribute('data-message-id'),
+      text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
+    }));
+  }
+  return [...document.querySelectorAll('[data-chatgpt-search-unit-key]')].flatMap((el) => {
+    const key = el.getAttribute('data-chatgpt-search-unit-key') ?? '';
+    const role = key.slice(key.lastIndexOf(':') + 1);
+    if (role !== 'user' && role !== 'assistant') return [];
+    return [{
+      role,
+      id: (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null,
+      text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
+    }];
+  });
+}
+
+/**
+ * 어시스턴트 메시지를 **안정적 식별자**로 고정하는 셀렉터 (옛 화면 · 개편 화면).
+ *
+ * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
+ * 9차 라운드가 7차 응답을 게시한 경로가 그것이다. 노드가 뜨는 즉시 이 값으로
+ * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
+ */
+export function messageByIdSelector(id: string): string {
+  return `[data-message-id="${id}"], [data-chatgpt-search-message-ids~="${id}"]`;
+}
+
+/**
  * 이 대화에서 그 라운드 질문이 **마지막 질문**인지 보고, 맞으면 그 질문 직전까지의
  * 어시스턴트 메시지 수를 돌려준다 (없으면 null).
  *
@@ -220,15 +261,6 @@ const QUOTA_RECHECK_MS = 30_000;
 
 /** 전송 전, 진행 중인 생성이 끝나기를 기다리는 폴링 간격. */
 const IDLE_POLL_MS = 3_000;
-
-/**
- * 어시스턴트 메시지의 **안정적 식별자**.
- *
- * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
- * 9차 라운드가 7차 응답을 게시한 경로가 그것이다. 노드가 뜨는 즉시 이 값으로
- * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
- */
-const MESSAGE_ID_ATTR = 'data-message-id';
 
 /** 식별자를 못 잡았을 때, 축소 관측을 이만큼 연속으로 보면 수집 실패로 본다. */
 const SHRINK_TOLERANCE = 3;
@@ -895,10 +927,13 @@ export class ChatGPTDriver {
           if (chatgptProjectId(want) !== chatgptProjectId(this.cfg.chatgptProjectUrl ?? '')) return false;
           await this.startNewChat();
           const id = new URL(want).pathname.split('/c/')[1];
-          const link = p.locator(`a[href$="/c/${id}"]`).first();
+          // 개편 사이드바는 프로젝트 아래에도 같은 대화 링크를 둔다 — 접혀 숨은 쪽을 집지 않는다.
+          const link = p.locator(`a[href$="/c/${id}"]:visible`).first();
           // ponytail: 최근 200개까지 탐색. 더 오래된 대화는 새 대화로 회전한다.
           for (let i = 0; i < 10 && !(await link.isVisible()); i++) {
-            const more = p.getByRole('button', { name: /^(Load more conversations|더 많은 대화 불러오기)$/i });
+            // 개편 화면은 프로젝트 홈 목록의 "Show more" 다. 사이드바·긴 질문에도 같은 이름이 있어 본문 것만 쓴다.
+            const more = p.getByRole('button', { name: /^(Load more conversations|더 많은 대화 불러오기)$/i })
+              .or(p.locator('main').getByRole('button', { name: /^Show more$/i })).first();
             if (!(await more.isVisible())) break;
             const before = await p.locator('a[href*="/c/"]').count();
             await more.press('Enter');
@@ -996,13 +1031,11 @@ export class ChatGPTDriver {
     try {
       if (attachment) {
         await this.inputStep(`고정 diff 첨부 (${attachment.buffer.length}바이트)`, async () => {
-          // 현재 composer의 메뉴가 연 file chooser를 사용한다.
-          await composer.locator('#composer-plus-btn').click();
-          const [chooser] = await Promise.all([
-            p.waitForEvent('filechooser', { timeout: 10_000 }),
-            p.getByText(/^(Add photos & files|사진 및 파일 추가|사진과 파일 추가)$/).click(),
-          ]);
-          await chooser.setFiles({ ...attachment, mimeType: 'text/plain' });
+          // 메뉴를 거치지 않고 현재 composer 의 일반 파일 입력(accept 없음)에 직접 넣는다.
+          // 첨부 메뉴는 개편 때 이름과 구조가 바뀌었고(#composer-plus-btn → "Add files and more"),
+          // 옆에는 이미지 전용 입력도 있다.
+          await composer.locator('input[type="file"]:not([accept])').first()
+            .setInputFiles({ ...attachment, mimeType: 'text/plain' });
           // 파일 이름이 나타나는 것만으로 업로드 성공은 아니다. 처리 중에는 이 아이콘이 숨겨져 있다.
           try {
             await composer.getByRole('group', { name: attachment.name, exact: true })
@@ -1059,13 +1092,16 @@ export class ChatGPTDriver {
     return this.collectResponse(p, before, lastUserBefore);
   }
 
+  /** 화면에 그려져 있는 질문들 (역할·식별자만 — 본문은 크므로 읽지 않는다). */
+  private async userMessages(page: Page): Promise<MessageRef[]> {
+    const msgs = await page.evaluate(readMessagesInPage, null);
+    return msgs.filter((m) => m.role === 'user');
+  }
+
   /** 화면에 그려져 있는 마지막 질문의 식별자 (없으면 null). */
   private async lastUserMessageId(page: Page): Promise<string | null> {
     try {
-      return await page.evaluate(() => {
-        const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
-        return els.length > 0 ? els[els.length - 1].getAttribute('data-message-id') : null;
-      });
+      return (await this.userMessages(page)).at(-1)?.id ?? null;
     } catch {
       return null;
     }
@@ -1073,9 +1109,7 @@ export class ChatGPTDriver {
 
   private async countUserMessages(page: Page): Promise<number> {
     try {
-      return await page.evaluate(
-        () => document.querySelectorAll('[data-message-author-role="user"]').length,
-      );
+      return (await this.userMessages(page)).length;
     } catch {
       return 0;
     }
@@ -1097,18 +1131,14 @@ export class ChatGPTDriver {
   ): Promise<boolean> {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      const sent = await page
-        .evaluate(
-          ({ prevId, before }) => {
-            const els = [...document.querySelectorAll('[data-message-author-role="user"]')];
-            if (prevId) {
-              const idx = els.findIndex((el) => el.getAttribute('data-message-id') === prevId);
-              if (idx !== -1) return idx + 1 < els.length;
-            }
-            return els.length > before;
-          },
-          { prevId: lastUserIdBefore, before: beforeCount },
-        )
+      const sent = await this.userMessages(page)
+        .then((users) => {
+          if (lastUserIdBefore) {
+            const idx = users.findIndex((m) => m.id === lastUserIdBefore);
+            if (idx !== -1) return idx + 1 < users.length;
+          }
+          return users.length > beforeCount;
+        })
         .catch(() => false);
       if (sent) return true;
       await page.waitForTimeout(500);
@@ -1130,12 +1160,7 @@ export class ChatGPTDriver {
     // selectors.assistantMessage 를 일반화한 형태다 — 역할별로 나눠 읽어야
     // "그 질문이 마지막인가" 를 판정할 수 있다.
     try {
-      const msgs = await p.evaluate((contentSel) => {
-        return [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
-          role: el.getAttribute('data-message-author-role') ?? '',
-          text: (el.querySelector(contentSel) ?? el).textContent ?? '',
-        }));
-      }, this.cfg.selectors.messageContent);
+      const msgs = await p.evaluate(readMessagesInPage, this.cfg.selectors.messageContent);
       return findRoundBaseline(msgs, marker);
     } catch {
       return null;
@@ -1230,7 +1255,8 @@ export class ChatGPTDriver {
             if (!raw || !raw.trim()) continue;
             const el = node.parentElement as HTMLElement | null;
             if (!el) continue;
-            if (el.closest('[data-message-author-role]')) continue;
+            // 옛 화면의 메시지 노드와 개편 화면의 질문·답 단위·본문 — 빠뜨리면 리뷰 본문이 안내로 읽힌다.
+            if (el.closest('[data-message-author-role], [data-chatgpt-search-unit-key], [data-user-message-bubble], [data-chatgpt-selection-message-id]')) continue;
             if (el.closest('script, style, noscript, template')) continue;
             // 조상까지 포함해 실제 표시 여부를 판정한다 — 직접 부모는 보여도
             // 상위 패널이 display:none/visibility:hidden/opacity:0이면 숨김이고,
@@ -1471,7 +1497,7 @@ export class ChatGPTDriver {
      * 통과해 직전 라운드의 답이 이번 응답으로 저장된다.
      */
     const targetLocator = (): Locator | null => {
-      if (bound) return page.locator(`[${MESSAGE_ID_ATTR}="${bound.id}"]`);
+      if (bound) return page.locator(messageByIdSelector(bound.id));
       if (readyNth !== null) return page.locator(sel.assistantMessage).nth(readyNth);
       if (fellBack) return page.locator(sel.assistantMessage).nth(messageCountBefore);
       return null;
@@ -1481,12 +1507,7 @@ export class ChatGPTDriver {
     // "마지막 질문 뒤" 를 판정할 수 있다.
     const readMessages = async (): Promise<MessageRef[] | null> => {
       try {
-        return await page.evaluate(() =>
-          [...document.querySelectorAll('[data-message-author-role]')].map((el) => ({
-            role: el.getAttribute('data-message-author-role') ?? '',
-            id: el.getAttribute('data-message-id'),
-          })),
-        );
+        return await page.evaluate(readMessagesInPage, null);
       } catch {
         return null; // 네비게이션 중 등
       }

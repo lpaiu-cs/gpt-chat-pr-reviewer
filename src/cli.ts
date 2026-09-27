@@ -308,10 +308,10 @@ program
       }
 
       console.log(chalk.cyan('\n  리뷰 전용 프로젝트 설정'));
-      console.log('  1. 열린 ChatGPT의 사이드바에서 새 프로젝트를 만들거나 기존 리뷰 전용 프로젝트를 여세요.');
-      console.log('  2. 프로젝트를 사이드바에 고정하고, 새 채팅 입력창이 보이는 프로젝트 홈을 여세요.');
-      console.log('  3. Enter를 누르면 이름과 URL을 자동으로 읽고, 다시 찾아 들어갈 수 있는지 검증합니다.');
       if (process.stdin.isTTY && opts.projectUrl === undefined) {
+        console.log('  1. 열린 ChatGPT의 사이드바에서 새 프로젝트를 만들거나 기존 리뷰 전용 프로젝트를 여세요.');
+        console.log('  2. 프로젝트를 사이드바에 고정하고, 새 채팅 입력창이 보이는 프로젝트 홈을 여세요.');
+        console.log('  3. Enter를 누르면 이름과 URL을 자동으로 읽고, 다시 찾아 들어갈 수 있는지 검증합니다.');
         const rl = createInterface({ input: process.stdin, output: process.stdout });
         try {
           for (;;) {
@@ -320,6 +320,9 @@ program
             catch (e) { console.log(chalk.yellow(`  ${e instanceof Error ? e.message : String(e)}`)); }
           }
         } finally { rl.close(); }
+      } else {
+        // 입력을 받지 않는 실행이다 — 손으로 할 일을 안내하면 기다리는 줄 알고 멈춰 있게 된다.
+        console.log(chalk.dim(`  등록된 프로젝트로 자동 진입을 확인합니다: ${cfg.chatgptProjectName ?? cfg.chatgptProjectUrl}`));
       }
       // 접근 확인이 끝나야 설정 완료다. 로그인만 됐거나 잘못된 URL이면 저장하지 않는다.
       await driver.startNewChat();
