@@ -301,6 +301,16 @@ test('같은 대상을 다시 보내도 첨부 이름은 매번 다르다 (ChatG
   assert(f.controls.prompts[1].includes(second.name), '프롬프트는 실제 첨부 이름을 가리킨다');
 }));
 
+test('첨부 인용 표식이 JSON 문자열에 섞여도 파싱하고 본문에서 걷어낸다 (platelog#4)', () => {
+  const raw = 'JSON\n{\n  "summary": "요약",\n  "approval": "request_changes",\n  "comments": [{ "path": "a.kt", "line": 37, ' +
+    '"body": "수정해 주세요. :chatgpt-content-reference{index="0"} :chatgpt-content-reference{index="1"} " }],\n' +
+    '  "reviewedHeadSha": "h", "reviewedBaseSha": "b"\n}';
+  const r = parseGPTResponse(raw);
+  assert.equal(r.parsed, true);
+  assert.equal(r.comments[0].body.trim(), '수정해 주세요.');
+  assert.equal(r.raw, raw, '원본은 그대로 남긴다');
+});
+
 test('잘못된 판정/코멘트는 전체 리뷰를 거부한다', () => {
   for (const approval of ['disapprove', 'not approved', 'APPROVE', null, {}]) {
     assert.equal(parseGPTResponse(JSON.stringify({ summary: 'x', approval, comments: [] })).parsed, false);

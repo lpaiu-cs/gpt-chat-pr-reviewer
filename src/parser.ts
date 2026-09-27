@@ -6,8 +6,15 @@
 
 import type { ReviewResult, ReviewComment } from './types.js';
 
+/**
+ * 첨부를 인용하면 답 본문에 `:chatgpt-content-reference{index="0"}` 같은 표식이 글자로
+ * 섞인다. JSON 문자열 안에 들어오면 그 큰따옴표가 JSON 을 깨뜨린다 (platelog#4 — Pro 가
+ * 12분 걸려 만든 지적을 파싱 실패로 버렸다). GitHub 에서 의미가 없으므로 걷어낸다.
+ */
+const CITATION = /\s*:(?:chatgpt-content-reference|contentReference)(?:\[[^\]]*\])?\{[^}]*\}/g;
+
 export function parseGPTResponse(raw: string): ReviewResult {
-  const json = extractJSON(raw);
+  const json = extractJSON(raw.replace(CITATION, ''));
   if (json) {
     try {
       const obj = JSON.parse(json);
