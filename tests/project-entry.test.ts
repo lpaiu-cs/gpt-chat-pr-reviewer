@@ -150,3 +150,22 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
     assert.notEqual((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '다시 그린 노드는 새 표식');
   } finally { await browser.close(); }
 });
+
+test('실제 Chrome: 위치로 읽는 답이 완료 때 같은 노드에서 줄어도 받아들인다', async () => {
+  // 실측(platelog#3): 새 대화의 생성 중 화면에서는 질문을 못 읽어 답 위치를 전송 시점 기준으로
+  // 읽었고, 완료 때 코드블록을 다시 그리며 977→963자로 줄자 "다른 노드" 로 보고 라운드를 버렸다.
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const page = await browser.newPage();
+  try {
+    await page.setContent('<main><div data-chatgpt-search-unit-key="t:2:assistant"><div data-chatgpt-selection-message-id="a">```json {"summary":"ok"} ```</div></div></main>');
+    const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
+    driver.page = page;
+    driver.isStreaming = async () => false;
+    // 질문이 안 보이는 화면이다 — 앵커를 못 잡아 위치로 물러선다.
+    let polls = 0;
+    page.waitForTimeout = async () => {
+      if (++polls === 5) await page.locator('[data-chatgpt-selection-message-id]').evaluate((el) => { el.textContent = '{"summary":"ok"}'; });
+    };
+    assert.equal(await driver.collectFrom(0, 60_000), '{"summary":"ok"}');
+  } finally { await browser.close(); }
+});

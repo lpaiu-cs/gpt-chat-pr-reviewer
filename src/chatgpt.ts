@@ -75,7 +75,7 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
     let id = (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null;
     if (!id && role === 'assistant') {
       id = el.getAttribute('data-pr-review-anchor');
-      if (!id) { id = `anchor-${crypto.randomUUID()}`; el.setAttribute('data-pr-review-anchor', id); }
+      if (!id) { id = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; el.setAttribute('data-pr-review-anchor', id); }
     }
     return [{
       role,
@@ -1590,7 +1590,11 @@ export class ChatGPTDriver {
       // 앵커 판별 불가 (셀렉터 커스터마이즈 등) — 종전대로 전송 시점 기준 위치.
       // 전송 직후 우리 질문이 아직 안 그려진 한순간도 여기로 떨어지는데, 그때
       // 물러서면 직전 라운드의 답을 고정한다. 계속 못 잡을 때만 물러선다.
-      if (unknowns >= UNKNOWN_TOLERANCE) fellBack = true;
+      if (unknowns >= UNKNOWN_TOLERANCE && !fellBack) {
+        fellBack = true;
+        // 개편 화면에서 실제로 여기로 떨어졌다 — 다음에 원인을 짚을 근거를 남긴다.
+        console.log(chalk.dim(`  답 위치를 화면에서 못 잡아 전송 시점 위치로 읽습니다 (메시지 ${msgs ? msgs.map((m) => m.role[0] ?? '?').join('') || '없음' : '조회 실패'})`));
+      }
       return null;
     };
 
@@ -1598,9 +1602,19 @@ export class ChatGPTDriver {
     // 본문(.markdown)이 있으면 그쪽을 읽는다. 한 메시지 안에 본문 블록이 여러 개면
     // (산문 + 코드블록 + 산문) **전부 이어 붙인다** — 마지막 하나만 집으면 JSON 이
     // 앞에 있을 때 통째로 잃는다.
+    /** 위치로 읽은 노드의 표식 (이번 읽기 · 마지막으로 받아들인 읽기). */
+    let readStamp: string | null = null;
+    let lastStamp: string | null = null;
     const readTarget = async (): Promise<string> => {
       const target = targetLocator();
       if (!target) return ''; // 어느 노드가 이번 답인지 아직 모른다
+      // 위치로 읽을 때는 그 노드에 표식을 찍어 **같은 노드인지** 안다. 개편 화면은 완료 때
+      // 코드블록을 다시 그리며 글자가 줄어드는데, 같은 노드의 축소는 정상이다.
+      readStamp = bound ? null : await Promise.resolve().then(() => target.evaluate((el) => {
+        let s = el.getAttribute('data-pr-review-anchor');
+        if (!s) { s = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; el.setAttribute('data-pr-review-anchor', s); }
+        return s;
+      })).catch(() => null);
       const bodies = target.locator(sel.messageContent);
       if ((await bodies.count().catch(() => 0)) > 0) {
         const parts = await bodies.allInnerTexts().catch(() => [] as string[]);
@@ -1664,7 +1678,8 @@ export class ChatGPTDriver {
       // 식별자를 못 잡아 위치로 읽는 중이라면, **짧아진 값을 채택하지 않는다.**
       // 생성 중인 응답은 길어지기만 하므로 축소는 다른 노드를 읽었다는 신호다.
       // (경고만 하고 덮어쓰면 그 값이 3회 안정 관측을 통과해 그대로 게시된다.)
-      if (!bound && lastText.length > 0 && cur.length < lastText.length) {
+      const sameNode = readStamp !== null && readStamp === lastStamp;
+      if (!bound && !sameNode && lastText.length > 0 && cur.length < lastText.length) {
         shrinks++;
         console.log(
           chalk.yellow(
@@ -1680,6 +1695,7 @@ export class ChatGPTDriver {
         continue;
       }
       shrinks = 0;
+      lastStamp = readStamp;
 
       // **덮어쓰기 전에** 변경 여부를 잡는다. 아래에서 lastText = cur 을 해버리면
       // 그 뒤에는 언제나 같아 보여서, 정상 스트리밍도 "변화 없음" 으로 기록된다.
