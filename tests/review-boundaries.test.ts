@@ -66,7 +66,7 @@ async function fixture(fn: (f: {
   })) as any;
   syncBuiltinESMExports();
   const driver = {
-    ensureAlive: async () => false, startNewChat: async () => {},
+    ensureAlive: async () => false, startNewChat: async () => {}, withTurn: (fn: () => Promise<unknown>) => fn(),
     sendAndCollect: async (prompt: string, onSent: (url: string) => void, attachment?: PromptAttachment) => {
       controls.prompts.push(prompt);
       controls.attachments.push(attachment);

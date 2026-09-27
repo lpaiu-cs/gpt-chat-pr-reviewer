@@ -1067,6 +1067,19 @@ async function obtainRaw(
   }
 
   if (!driver) throw new Error('브라우저 드라이버가 없습니다');
+  // 진입부터 전송까지는 탭끼리 겹치지 않는다 — 응답 대기만 겹친다 (ChatGPTDriver.withTurn).
+  return driver.withTurn(() => askChatGPT(cfg, driver, ctx, round, instructions, opts));
+}
+
+/** 브라우저에서 응답을 얻는다 — 이미 보낸 라운드면 회수하고, 아니면 묻는다. */
+async function askChatGPT(
+  cfg: AppConfig,
+  driver: ChatGPTDriver,
+  ctx: PRContext,
+  round: number,
+  instructions: string,
+  opts: RunRoundOptions,
+): Promise<RawResult> {
   if (!opts.dryRun) restoreResponseRecovery(cfg, ctx);
 
   // ── 이미 보낸 라운드 회수 ──

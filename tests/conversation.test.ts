@@ -150,6 +150,14 @@ test('프로젝트 입력창 실패는 원인과 최신 URL 등록 방법을 함
     assert.ok(error.message.includes(PROJECT));
     return true;
   });
+  // Playwright 오류는 호출 기록이 여러 줄이다. 상태·로그는 첫 줄만 남기므로 주소도 첫 줄에 있어야 한다.
+  driver.page.locator = () => ({ isVisible: async () => { throw new Error('locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n  - waiting'); } });
+  await assert.rejects(driver.startNewChat(), (error: Error) => {
+    const first = error.message.split('\n')[0];
+    assert.match(first, /Timeout 15000ms/);
+    assert.ok(first.includes(PROJECT), first);
+    return true;
+  });
 });
 
 test('설정 없는 최초 실행은 프로젝트 등록을 안내하고 실제 리뷰를 시작하지 않는다', () => {

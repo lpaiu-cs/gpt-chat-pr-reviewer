@@ -1482,7 +1482,19 @@ program
         // 탭은 **시작 전에** 순서대로 빌린다. 실행 중에 빌리면 두 슬롯이 같은
         // 순간에 같은 탭을 만들려 들어 어느 쪽이 어느 탭을 받았는지 흐려진다.
         const tabs: (ChatGPTDriver | null)[] = [];
-        for (let slot = 0; slot < batch.length; slot++) tabs.push(await leaseTab(slot));
+        for (let slot = 0; slot < batch.length; slot++) {
+          try {
+            tabs.push(await leaseTab(slot));
+          } catch (e) {
+            // 추가 탭을 못 열면 남은 PR 은 **라운드를 시작하지 않고** 다음 배치로 미룬다
+            // (슬롯 0 은 처음 띄운 탭이라 여기서 실패하지 않는다). 라운드 안에서 실패하면
+            // 탭 사정인데도 PR 이 오류·재시도 횟수·5분 대기를 떠안는다.
+            const why = (e instanceof Error ? e.message : String(e)).split('\n')[0];
+            console.log(chalk.yellow(`  ⚠ 추가 탭 준비 실패 — ${batch.length - slot}건은 다음 배치로 미룹니다: ${why}`));
+            batch.splice(slot);
+            break;
+          }
+        }
 
         batchSize = batch.length; // 1보다 크면 로그에 어느 PR 의 줄인지 꼬리표가 붙는다
 
