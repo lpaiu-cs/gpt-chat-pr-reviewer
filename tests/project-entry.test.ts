@@ -125,5 +125,12 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
     assert.equal(baseline, 1);
     page.waitForTimeout = async () => {}; // 폴링 간격만 없앤다 — 판정은 실제 화면으로 한다
     assert.equal(await driver.collectFrom(baseline, 60_000), '{"summary":"ok"}');
+
+    // 생성 중인 답은 식별자 목록이 비어 있다(실측) — 턴 키로 고정해야 위치 읽기의 축소 오인을 피한다.
+    await page.evaluate(() => document.querySelector('[data-chatgpt-search-message-ids^="a2"]')!.setAttribute('data-chatgpt-search-message-ids', ''));
+    const { readMessagesInPage, messageByIdSelector } = await import('../src/chatgpt.js');
+    const answer = (await page.evaluate(readMessagesInPage, null)).at(-1)!;
+    assert.deepEqual(answer, { role: 'assistant', id: 'turn:u2', text: '' });
+    assert.equal(await page.locator(messageByIdSelector(answer.id!)).innerText(), 'ChatGPT said:\n{"summary":"ok"}');
   } finally { await browser.close(); }
 });

@@ -68,9 +68,12 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
     const key = el.getAttribute('data-chatgpt-search-unit-key') ?? '';
     const role = key.slice(key.lastIndexOf(':') + 1);
     if (role !== 'user' && role !== 'assistant') return [];
+    // 생성 중인 답은 식별자 목록이 비어 있다(실측). 그동안은 턴 키(= 질문 식별자)로 고정한다 —
+    // 위치로 읽으면 완료 때 코드블록을 다시 그리며 글자가 줄어 "다른 노드" 로 오인된다.
+    const turn = role === 'assistant' ? el.closest('[data-turn-key]')?.getAttribute('data-turn-key') : null;
     return [{
       role,
-      id: (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null,
+      id: (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || (turn ? `turn:${turn}` : null),
       text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
     }];
   });
@@ -96,6 +99,7 @@ export function composerText(s: string): string {
  * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
  */
 export function messageByIdSelector(id: string): string {
+  if (id.startsWith('turn:')) return `[data-turn-key="${id.slice(5)}"] [data-chatgpt-search-unit-key$=":assistant"]`;
   return `[data-message-id="${id}"], [data-chatgpt-search-message-ids~="${id}"]`;
 }
 
