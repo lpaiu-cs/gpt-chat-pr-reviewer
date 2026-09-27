@@ -152,8 +152,8 @@ export function parseIntent(body: unknown): Intent | string {
     }
     case 'review-now': {
       if (typeof b.ref !== 'string' || !b.ref.trim()) return 'ref 가 필요합니다';
-      // seq 는 선택이다 — 대시보드 버튼은 사람이 지금 화면을 보고 누르므로
-      // 굳이 조건을 달지 않는다. 지연 적용되는 클라이언트만 보낸다.
+      // seq 는 선택이다 (없으면 무조건 적용). 대시보드 버튼도 화면에서 본 값을 보낸다 —
+      // 요청은 진행 중인 라운드가 끝난 뒤 적용되므로, 사람이 누른 것도 지연 적용이다.
       if (b.seq === undefined) return { kind, ref: b.ref.trim() };
       const seq = Number(b.seq);
       if (!Number.isInteger(seq) || seq < 0) return 'seq 는 0 이상의 정수여야 합니다';

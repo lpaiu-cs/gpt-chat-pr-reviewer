@@ -643,7 +643,13 @@ $('contexts').addEventListener('click', (ev) => {
   const skipOn = pick('skip:' + key, inList(ctl.skip, key));
   const only = pick('only', ctl.only || []);
 
-  if (act === 'review-now') sendIntent({ kind: 'review-now', ref: key }, [['now:' + key, true]]);
+  // 요청은 진행 중인 라운드가 끝난 뒤에 적용된다. 화면에서 본 상태 번호를 같이 보내
+  // "그 뒤로 아무 일도 없었으면" 리뷰하게 한다 — 안 보내면 리뷰가 도는 동안 누른
+  // 버튼이 끝나자마자 같은 커밋을 한 번 더 리뷰한다 (platelog#3 2차 실측).
+  if (act === 'review-now') {
+    const card = (snap && snap.contexts || []).find((c) => c.key === key);
+    sendIntent({ kind: 'review-now', ref: key, ...(card ? { seq: card.seq } : {}) }, [['now:' + key, true]]);
+  }
   else if (act === 'skip') {
     sendIntent({ kind: skipOn ? 'skip-remove' : 'skip-add', ref: key }, [['skip:' + key, !skipOn]]);
   } else if (act === 'only') {
