@@ -68,12 +68,18 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
     const key = el.getAttribute('data-chatgpt-search-unit-key') ?? '';
     const role = key.slice(key.lastIndexOf(':') + 1);
     if (role !== 'user' && role !== 'assistant') return [];
-    // 생성 중인 답은 식별자 목록이 비어 있다(실측). 그동안은 턴 키(= 질문 식별자)로 고정한다 —
-    // 위치로 읽으면 완료 때 코드블록을 다시 그리며 글자가 줄어 "다른 노드" 로 오인된다.
-    const turn = role === 'assistant' ? el.closest('[data-turn-key]')?.getAttribute('data-turn-key') : null;
+    // 생성 중인 답은 식별자 목록도 턴 키 조상도 없다(실측). 그동안 위치로 읽으면 완료 때
+    // 코드블록을 다시 그리며 글자가 줄어 "다른 노드" 로 오인하고 라운드를 버렸다. 그래서
+    // **우리가 노드에 표식을 찍어** 식별자로 쓴다. 노드가 새로 그려지면 표식이 사라지고
+    // 새 표식이 찍히므로, 재고정(judgeRebind)이 같은 질문의 새 노드로 옮겨 탄다.
+    let id = (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null;
+    if (!id && role === 'assistant') {
+      id = el.getAttribute('data-pr-review-anchor');
+      if (!id) { id = `anchor-${crypto.randomUUID()}`; el.setAttribute('data-pr-review-anchor', id); }
+    }
     return [{
       role,
-      id: (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || (turn ? `turn:${turn}` : null),
+      id,
       text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
     }];
   });
@@ -99,7 +105,7 @@ export function composerText(s: string): string {
  * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
  */
 export function messageByIdSelector(id: string): string {
-  if (id.startsWith('turn:')) return `[data-turn-key="${id.slice(5)}"] [data-chatgpt-search-unit-key$=":assistant"]`;
+  if (id.startsWith('anchor-')) return `[data-pr-review-anchor="${id}"]`;
   return `[data-message-id="${id}"], [data-chatgpt-search-message-ids~="${id}"]`;
 }
 

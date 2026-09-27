@@ -126,11 +126,19 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
     page.waitForTimeout = async () => {}; // 폴링 간격만 없앤다 — 판정은 실제 화면으로 한다
     assert.equal(await driver.collectFrom(baseline, 60_000), '{"summary":"ok"}');
 
-    // 생성 중인 답은 식별자 목록이 비어 있다(실측) — 턴 키로 고정해야 위치 읽기의 축소 오인을 피한다.
-    await page.evaluate(() => document.querySelector('[data-chatgpt-search-message-ids^="a2"]')!.setAttribute('data-chatgpt-search-message-ids', ''));
+    // 생성 중인 답은 식별자도 턴 키 조상도 없다(실측) — 우리가 찍은 표식으로 고정해야
+    // 위치 읽기의 축소 오인을 피한다. 같은 노드면 표식이 유지되고, 다시 그려지면 새로 찍힌다.
+    await page.evaluate(() => {
+      const unit = document.querySelector('[data-chatgpt-search-message-ids^="a2"]')!;
+      unit.setAttribute('data-chatgpt-search-message-ids', '');
+      unit.closest('[data-turn-key]')!.removeAttribute('data-turn-key');
+    });
     const { readMessagesInPage, messageByIdSelector } = await import('../src/chatgpt.js');
-    const answer = (await page.evaluate(readMessagesInPage, null)).at(-1)!;
-    assert.deepEqual(answer, { role: 'assistant', id: 'turn:u2', text: '' });
-    assert.equal(await page.locator(messageByIdSelector(answer.id!)).innerText(), 'ChatGPT said:\n{"summary":"ok"}');
+    const first = (await page.evaluate(readMessagesInPage, null)).at(-1)!;
+    assert.match(first.id!, /^anchor-/);
+    assert.equal((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '같은 노드는 같은 표식');
+    assert.equal(await page.locator(messageByIdSelector(first.id!)).innerText(), 'ChatGPT said:\n{"summary":"ok"}');
+    await page.evaluate(() => { const u = document.querySelector('[data-pr-review-anchor]')!; u.replaceWith(u.cloneNode(true) as Element); document.querySelector('[data-pr-review-anchor]')!.removeAttribute('data-pr-review-anchor'); });
+    assert.notEqual((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '다시 그린 노드는 새 표식');
   } finally { await browser.close(); }
 });
