@@ -86,12 +86,27 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
 }
 
 /**
+ * 입력창에 실제로 들어 있는 글 — **브라우저 안에서 실행된다.** innerText 를 쓰지 않는다.
+ *
+ * 개편 입력창은 URL 을 링크 위젯으로 바꾸며 아이콘(`contenteditable=false`·`aria-hidden`)을
+ * 끼워 넣는데, innerText 는 그 아이콘 자리에 줄바꿈을 그린다. 줄 중간의 URL 이면 그 줄이
+ * 둘로 보여 같은 글인데도 검증이 막혔다(platelog#3). 장식을 빼고 글자만 읽는다.
+ */
+export function readComposerInPage(el: Element): string {
+  const copy = el.cloneNode(true) as Element;
+  copy.querySelectorAll('[contenteditable="false"], [aria-hidden="true"]').forEach((n) => n.remove());
+  copy.querySelectorAll('br').forEach((br) => br.replaceWith('\n'));
+  // 블록 경계는 줄바꿈이다 — 맨글자와 블록이 섞여 있어도 앞 글자를 잃지 않는다.
+  copy.querySelectorAll('p, div, pre, h1, h2, h3, h4, h5, h6, li, blockquote').forEach((b) => { if (b.previousSibling) b.before('\n'); });
+  return copy.textContent ?? '';
+}
+
+/**
  * 입력창의 글을 보낸 글과 비교할 형태로 편다.
  *
- * **줄바꿈 개수는 보지 않는다.** 개편 입력창은 GitHub URL 을 링크 위젯으로 바꾸고(글자는
- * 남는다) 그 앞과 끝에 줄바꿈을 더 그린다 — 같은 글인데 innerText 가 달라 전송이 매번
- * 막혔다. 글자는 전부 대조하므로 잘림과 칩 치환(URL 이 owner/repo#N 으로 바뀌던 사고)은
- * 여전히 잡힌다.
+ * **줄바꿈 개수는 보지 않는다.** 개편 입력창은 블록 앞뒤와 끝에 줄바꿈을 더 그린다 — 같은
+ * 글인데 달라 보여 전송이 매번 막혔다. 글자는 전부 대조하므로 잘림과 칩 치환(URL 이
+ * owner/repo#N 으로 바뀌던 사고)은 여전히 잡힌다.
  */
 export function composerText(s: string): string {
   return s.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
@@ -1086,7 +1101,7 @@ export class ChatGPTDriver {
         if (!(await this.isStreaming(p)) && await this.lastUserMessageId(p) === lastUserBefore
           && await this.countUserMessages(p) === beforeUserCount) {
           const normalize = composerText;
-          const text = normalize(await input.innerText());
+          const text = normalize(await input.evaluate(readComposerInPage));
           if (!text || text === normalize(prompt)) {
             if (attachment) {
               const remove = composer.getByRole('group', { name: attachment.name, exact: true })
@@ -1415,7 +1430,7 @@ export class ChatGPTDriver {
     // 처리된 paste는 preventDefault로 false를 반환할 수 있다. 이벤트 반환값이
     // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
     const normalize = composerText;
-    const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
+    const matches = async () => normalize(await input.evaluate(readComposerInPage, undefined, { timeout: 3_000 })) === normalize(text);
     let matched = await this.inputStep('붙여넣기 검증', matches, false);
     if (!matched && (await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
       await this.inputStep('짧은 입력 폴백', () => page.keyboard.insertText(text));
@@ -1426,7 +1441,7 @@ export class ChatGPTDriver {
       return;
     }
     // 비우기 전에 무엇이 들어갔는지부터 읽는다 — 이게 원인을 가르는 증거다.
-    const actual = normalize(await input.innerText({ timeout: 3_000 }));
+    const actual = normalize(await input.evaluate(readComposerInPage, undefined, { timeout: 3_000 }));
     const want = normalize(text);
     let diffAt = 0;
     while (diffAt < actual.length && diffAt < want.length && actual[diffAt] === want[diffAt]) diffAt++;

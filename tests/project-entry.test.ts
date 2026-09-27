@@ -133,7 +133,15 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
       unit.setAttribute('data-chatgpt-search-message-ids', '');
       unit.closest('[data-turn-key]')!.removeAttribute('data-turn-key');
     });
-    const { readMessagesInPage, messageByIdSelector } = await import('../src/chatgpt.js');
+    const { readMessagesInPage, messageByIdSelector, readComposerInPage } = await import('../src/chatgpt.js');
+
+    // 줄 중간 URL 이 링크 위젯이 되면 innerText 는 아이콘 자리에 줄바꿈을 그린다(platelog#3 실측).
+    // 검증은 장식을 뺀 글자로 한다.
+    const editor = page.locator(cfg.selectors.textInput).first();
+    await editor.evaluate((el) => { el.innerHTML = '<p>로컬 (<span data-rich-text-generated-autolink=""><span aria-hidden="true" contenteditable="false" style="display:block">⊕</span>http://10.0.2.2:54321</span>, 디버그)<br>다음 줄<br class="ProseMirror-trailingBreak"></p>'; });
+    assert.notEqual((await editor.innerText()).split('\n')[0], '로컬 (http://10.0.2.2:54321, 디버그)', 'innerText 는 줄을 가른다');
+    assert.equal(await editor.evaluate(readComposerInPage), '로컬 (http://10.0.2.2:54321, 디버그)\n다음 줄\n');
+    await editor.evaluate((el) => { el.innerHTML = ''; });
     const first = (await page.evaluate(readMessagesInPage, null)).at(-1)!;
     assert.match(first.id!, /^anchor-/);
     assert.equal((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '같은 노드는 같은 표식');

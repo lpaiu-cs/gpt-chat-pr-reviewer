@@ -17,6 +17,7 @@ test('paste success is determined by complete content, with no large or partial-
     locator: () => ({ first: () => ({
       innerText: async () => content,
       evaluate: async (fn: (el: unknown, chunk: string) => void, chunk?: string) => {
+        if (fn.name === 'readComposerInPage') return content; // 검증용 본문 읽기
         if (chunk === undefined) return content.length; // 조각마다 재는 누적 길이
         chunks.push(chunk);
         assert.ok(chunk.length <= 8000); // below the 10k attachment threshold even for emoji
