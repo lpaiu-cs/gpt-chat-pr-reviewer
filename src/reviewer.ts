@@ -901,6 +901,7 @@ async function reclaimRound(
     headSha: ctx.pendingSend?.headSha ?? null,
     baseRef: ctx.pendingSend?.baseRef ?? null,
     mergeBaseSha: ctx.pendingSend?.mergeBaseSha ?? null,
+    ...(ctx.pendingSend?.reasoning ? { reasoning: ctx.pendingSend.reasoning } : {}),
   };
   if (!sent.mergeBaseSha) return null; // 구버전 전송은 고정 diff를 제공하지 않았다.
 
@@ -960,6 +961,8 @@ export interface ReviewTarget {
   headSha: string | null;
   baseRef: string | null;
   mergeBaseSha?: string | null;
+  /** 이 답을 만든 모델·추론 강도 (리뷰 본문 표기용 — 대상 판정에는 쓰지 않는다) */
+  reasoning?: string;
 }
 
 export function assertReviewedTarget(result: ReviewResult, target: ReviewTarget): void {
@@ -1062,7 +1065,7 @@ async function obtainRaw(
     return {
       raw: hit.raw,
       target: { headSha: hit.meta?.headSha ?? null, baseRef: hit.meta?.baseRef ?? null,
-        mergeBaseSha: hit.meta?.mergeBaseSha ?? null },
+        mergeBaseSha: hit.meta?.mergeBaseSha ?? null, ...(hit.meta?.reasoning ? { reasoning: hit.meta.reasoning } : {}) },
     };
   }
 
@@ -1114,8 +1117,11 @@ async function askChatGPT(
   const diff = await fetchDiffAt(ctx.owner, ctx.repo, target.mergeBaseSha, target.headSha);
   // ponytail: 100k자는 편집기 부하를 피하는 전환점이지 서비스 한도가 아니다.
   // 큰 diff도 생략 없이 전달한다. 첨부 한도에 걸리면 PR을 나누어야 한다.
+  // 이름은 전송마다 달라야 한다. 같은 이름이 이미 올라가 있으면 ChatGPT 가 "…(4).txt" 로
+  // 바꿔 붙여 카드를 못 찾는다 — 재시도가 전부 같은 이름이라 platelog#4 가 매번 멈췄다.
   const attachment = diff.length > 100_000 ? {
-    name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}.txt`, buffer: Buffer.from(diff, 'utf8'),
+    name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}-${randomUUID().slice(0, 8)}.txt`,
+    buffer: Buffer.from(diff, 'utf8'),
   } : undefined;
   const templateMarker = roundMarker(cfg, ctx, round);
   const marker = templateMarker ?? `Review request: ${ctx.owner}/${ctx.repo}#${ctx.prNumber} round ${round}`;
@@ -1133,11 +1139,12 @@ async function askChatGPT(
 
   progress.phase('prompt'); // collectResponse 가 곧 'waiting' 으로 넘긴다
   let conversationUrl: string | undefined;
-  const raw = await driver.sendAndCollect(prompt, (url) => {
+  const raw = await driver.sendAndCollect(prompt, (url, reasoning) => {
     // **응답을 기다리기 전에** 저장한다. 여기가 이 변경의 핵심이다 — 대기 중에
     // 죽어도 다음 라운드가 그 대화로 복귀해 위의 중복 판별을 탈 수 있다.
     // 리뷰 대상도 같이 남긴다. 회수 판정은 "그때 그 diff 인가" 까지 봐야 한다.
     conversationUrl = url ?? undefined;
+    if (reasoning) target.reasoning = reasoning;
     if (!opts.dryRun) {
       rememberConversation(ctx, conversationUrl, round);
       ctx.pendingSend = { round, ...target, at: new Date().toISOString(), marker };
@@ -1156,11 +1163,12 @@ async function askChatGPT(
 }
 
 /** 검토 대상을 캐시 사이드카에 남긴다 (--from-cache 가 다시 알아낼 방법이 없다). */
-function targetMeta(t: ReviewTarget): { headSha?: string; baseRef?: string; mergeBaseSha?: string } {
+function targetMeta(t: ReviewTarget): { headSha?: string; baseRef?: string; mergeBaseSha?: string; reasoning?: string } {
   return {
     ...(t.headSha ? { headSha: t.headSha } : {}),
     ...(t.baseRef ? { baseRef: t.baseRef } : {}),
     ...(t.mergeBaseSha ? { mergeBaseSha: t.mergeBaseSha } : {}),
+    ...(t.reasoning ? { reasoning: t.reasoning } : {}),
   };
 }
 
@@ -1206,6 +1214,7 @@ export async function runRound(
         round,
         commitId: target.headSha,
         baseRef: target.mergeBaseSha,
+        reasoning: target.reasoning,
         live: liveComments(ctx),
       });
       console.log(chalk.dim('  (dry-run — 상태 변화 없음)'));
@@ -1260,6 +1269,7 @@ export async function runRound(
       isSelfReview: (await resolveSelfReview(ctx)),
       commitId: reviewed.headSha,
       baseRef: reviewed.mergeBaseSha,
+      reasoning: reviewed.reasoning,
       round,
       live: liveComments(ctx),
       publicationKey: ctx.pendingReview.key,

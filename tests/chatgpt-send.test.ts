@@ -11,20 +11,37 @@ test('실제 Chrome: 전송 실패 초안 회수와 첨부 완료 경계', async
   const entry = { url: 'https://chatgpt.com/g/g-p-1234-reviews/project', name: 'Reviews' };
   await page.route('https://chatgpt.com/**', route => route.fulfill({ contentType: 'text/html', body: `
     <form><div id="prompt-textarea" contenteditable="true"></div><input id="upload-files" type="file">
-      <button type="button" id="composer-plus-btn">Add</button></form>
-    <span onclick="document.querySelector('input').click()">Add photos &amp; files</span>
+      <button type="button" id="composer-plus-btn">Add</button>
+      <button type="button" id="model" aria-label="Select ChatGPT model">Instant</button></form>
+    <div id="menu" role="menu" data-state="closed" hidden>
+      <div role="menuitem" aria-label="Power" data-reasoning-slider tabindex="-1" aria-describedby="power-label">
+        <span role="slider" aria-hidden="true" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0"></span></div>
+      <span id="power-label">Instant, 1 of 5.</span><div role="menuitemradio" aria-checked="true">Latest</div></div>
     <script>document.addEventListener('keydown', e => { if (e.key === 'Enter') window.unintendedSend = true; });
+    // 개편 화면(2026-09) 실측 마크업: 추론 슬라이더 메뉴, 업로드 중 진행 막대 → 파일명 버튼
+    const menu = document.getElementById('menu'), slider = menu.querySelector('[role="slider"]');
+    document.getElementById('model').onclick = () => { menu.hidden = false; menu.dataset.state = 'open'; };
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') { menu.hidden = true; menu.dataset.state = 'closed'; } });
+    menu.querySelector('[data-reasoning-slider]').onkeydown = e => {
+      if (e.key !== 'ArrowRight') return;
+      const v = Math.min(4, +slider.getAttribute('aria-valuenow') + 1);
+      slider.setAttribute('aria-valuenow', v);
+      document.getElementById('power-label').textContent = ['Instant', 'Medium', 'High', 'Extra High', 'Pro'][v] + ', ' + (v + 1) + ' of 5.';
+    };
     document.querySelector('input').onchange = e => {
       const name = e.target.files[0].name;
-      const card = document.createElement('div'); card.setAttribute('role', 'group'); card.setAttribute('aria-label', name);
-      card.innerHTML = '<span data-testid="library-file-icon" hidden>ready</span><button type="button">remove</button>';
-      const button = card.querySelector('button'); button.setAttribute('aria-label', 'Remove file 1: ' + name);
-      button.onclick = () => card.remove(); document.querySelector('form').append(card);
-      setTimeout(() => card.querySelector('span').hidden = false, 50);
+      const card = document.createElement('div');
+      card.innerHTML = '<span role="progressbar"></span><button type="button">x</button>';
+      const bar = card.firstChild, remove = card.lastChild;
+      bar.setAttribute('aria-label', 'Uploading ' + name); remove.setAttribute('aria-label', 'Remove ' + name);
+      remove.onclick = () => card.remove(); document.querySelector('form').append(card);
+      setTimeout(() => { const b = document.createElement('button'); b.type = 'button'; b.textContent = 'file';
+        b.setAttribute('aria-label', name); bar.replaceWith(b); }, 50);
     };</script>` }));
   const input = page.locator('#prompt-textarea');
   const file = { name: 'review-diff-test.txt', buffer: Buffer.from('한글 diff\n+all lines\n') };
   const prompt = 'review round 1\nfixed head and base';
+  const uploaded = () => page.getByRole('button', { name: file.name, exact: true });
   async function driver() {
     await page.goto(entry.url);
     const d = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), chatgptProjectUrl: entry.url }) as any;
@@ -51,21 +68,33 @@ test('실제 Chrome: 전송 실패 초안 회수와 첨부 완료 경계', async
     await t.test('첨부 완료를 기다리고 전체 원문을 전달한다', async () => {
       const d = await driver();
       d.fillPrompt = async (_p: unknown, text: string) => {
-        assert(await page.getByTestId('library-file-icon').isVisible(), '첨부 완료 후 프롬프트를 입력한다');
+        assert(await uploaded().isVisible(), '첨부 완료 후 프롬프트를 입력한다');
+        assert.equal(await page.getByRole('progressbar').count(), 0);
         await input.fill(text);
       };
       d.clickSend = async () => {
-        assert(await page.getByTestId('library-file-icon').isVisible());
-        const uploaded = await page.locator('#upload-files').evaluate(async (el: HTMLInputElement) => el.files![0].text());
-        assert.equal(uploaded, file.buffer.toString());
+        assert(await uploaded().isVisible());
+        assert.equal(await page.locator('[role="slider"]').getAttribute('aria-valuenow'), '4', '추론 강도를 최대로 두고 보낸다');
+        assert.equal(await page.getByRole('menu').count(), 0, '메뉴를 닫고 보낸다');
+        const sent = await page.locator('#upload-files').evaluate(async (el: HTMLInputElement) => el.files![0].text());
+        assert.equal(sent, file.buffer.toString());
       };
-      assert.equal(await d.sendAndCollect(prompt, undefined, file), 'answer');
+      let reasoning = '';
+      assert.equal(await d.sendAndCollect(prompt, (_url: string | null, r: string) => { reasoning = r; }, file), 'answer');
+      assert.equal(reasoning, 'Latest · Pro (5/5)');
+    });
+    await t.test('추론 강도를 못 맞추면 보내지 않는다', async () => {
+      const d = await driver();
+      await page.locator('[data-reasoning-slider]').evaluate((el) => el.removeAttribute('data-reasoning-slider'));
+      d.clickSend = async () => assert.fail('추론 강도 미확인 상태로 전송하면 안 된다');
+      await assert.rejects(d.sendAndCollect(prompt, undefined, file), /추론 강도를 최대로 맞추지 못했습니다/);
+      assert.equal(await uploaded().count(), 0, '첨부 전에 멈춘다');
     });
     await t.test('전송 확인 실패 시 자기 첨부도 제거한다', async () => {
       const d = await driver(); d.clickSend = async () => {}; d.verifyPromptSent = async () => false;
       await assert.rejects(d.sendAndCollect(prompt, undefined, file), /전송되지/);
       assert.equal((await input.innerText()).trim(), '');
-      assert.equal(await page.getByRole('group').count(), 0);
+      assert.equal(await page.getByRole('button', { name: /^Remove / }).count(), 0);
       assert.equal(await page.evaluate(() => (window as any).unintendedSend), undefined, '첨부 제거에 전송 단축키를 사용하지 않는다');
     });
     await t.test('업로드 실패 시 클릭하지 않고 자기 초안을 회수한다', async () => {
@@ -85,7 +114,7 @@ test('실제 Chrome: 전송 실패 초안 회수와 첨부 완료 경계', async
       await input.fill('');
       await page.locator('#upload-files').setInputFiles({ ...file, mimeType: 'text/plain' });
       await assert.rejects(d.sendAndCollect(prompt), /보존/);
-      assert.equal(await page.getByRole('group').count(), 1);
+      assert.equal(await page.getByRole('button', { name: `Remove ${file.name}` }).count(), 1);
     });
     await t.test('생성 중이거나 사용자 편집이 있으면 오류 후에도 보존한다', async () => {
       const d = await driver();

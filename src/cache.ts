@@ -44,6 +44,8 @@ export interface ResponseMeta {
   headSha?: string;
   baseRef?: string;
   mergeBaseSha?: string;
+  /** 답을 만든 모델·추론 강도 (리뷰 본문 표기용) */
+  reasoning?: string;
 }
 
 /** 원본 응답과 출처를 저장하고 .txt 경로를 반환한다. */

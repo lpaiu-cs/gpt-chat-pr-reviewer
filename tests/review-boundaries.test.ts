@@ -67,10 +67,10 @@ async function fixture(fn: (f: {
   syncBuiltinESMExports();
   const driver = {
     ensureAlive: async () => false, startNewChat: async () => {}, withTurn: (fn: () => Promise<unknown>) => fn(),
-    sendAndCollect: async (prompt: string, onSent: (url: string) => void, attachment?: PromptAttachment) => {
+    sendAndCollect: async (prompt: string, onSent: (url: string, reasoning: string) => void, attachment?: PromptAttachment) => {
       controls.prompts.push(prompt);
       controls.attachments.push(attachment);
-      onSent('https://chatgpt.com/c/fixture');
+      onSent('https://chatgpt.com/c/fixture', 'Latest · Pro (5/5)');
       return JSON.stringify({ summary: 'issue', approval: 'request_changes',
         reviewedHeadSha: controls.wrongTarget ? 'c'.repeat(40) : head, reviewedBaseSha: base,
         comments: [{ path: 'x.ts', line: 1, body: 'fix this' }] });
@@ -86,6 +86,7 @@ test('고정 diff를 실제 전송하고 같은 head에만 게시한다', async 
   assert(f.controls.prompts[0].includes(head));
   assert(f.controls.prompts[0].includes(base));
   assert.equal(f.posts[0].commit_id, head);
+  assert.match(f.posts[0].body, /추론 모델: Latest · Pro \(5\/5\)/);
   assert.equal(f.controls.attachments[0], undefined);
 }));
 
@@ -125,6 +126,7 @@ test('재시도 소진 후 25분 타임아웃도 재시작/완료 판정 가능�
   assert.equal(f.controls.prompts.length, 1);
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0].commit_id, head);
+  assert.match(f.posts[0].body, /추론 모델: Latest · Pro \(5\/5\)/, '회수한 답도 전송 때의 추론 설정을 표기한다');
   assert.equal(ctx.round, 1);
   assert.equal(ctx.pendingSend, undefined);
   assert.equal(ctx.lastError, undefined);
@@ -283,6 +285,49 @@ test('확정된 POST 검증 거부는 저장된 payload를 버리고 새 응답�
   assert.equal(f.controls.prompts.length, 2);
   assert.equal(f.posts.length, 1);
 }));
+
+test('같은 대상을 다시 보내도 첨부 이름은 매번 다르다 (ChatGPT 가 중복 이름을 "(n)" 으로 바꾼다)', async () => fixture(async f => {
+  f.controls.diff = diff + '+big\n'.repeat(30_000);
+  f.controls.rejectPost = true;
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  f.controls.rejectPost = false;
+  const restored = loadContext(f.cfg, 'o', 'r', 1)!;
+  applySyncEvents(f.cfg, restored, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  delete restored.conversationUrl;
+  assert.equal(await runRound(f.cfg, f.driver, restored), 'posted');
+  const [first, second] = f.controls.attachments;
+  assert(first && second);
+  assert.notEqual(first.name, second.name);
+  assert(f.controls.prompts[1].includes(second.name), '프롬프트는 실제 첨부 이름을 가리킨다');
+}));
+
+test('첨부 인용 표식이 JSON 문자열에 섞여도 파싱하고 본문에서 걷어낸다 (platelog#4)', () => {
+  const raw = 'JSON\n{\n  "summary": "요약",\n  "approval": "request_changes",\n  "comments": [{ "path": "a.kt", "line": 37, ' +
+    '"body": "수정해 주세요. :chatgpt-content-reference{index="0"} :chatgpt-content-reference{index="1"} " }],\n' +
+    '  "reviewedHeadSha": "h", "reviewedBaseSha": "b"\n}';
+  const r = parseGPTResponse(raw);
+  assert.equal(r.parsed, true);
+  assert.equal(r.comments[0].body.trim(), '수정해 주세요.');
+  assert.equal(r.raw, raw, '원본은 그대로 남긴다');
+});
+
+test('정상 JSON 이 인용 표식을 코드 예제로 언급하면 그대로 보존한다 (#47 리뷰)', () => {
+  for (const mention of ['`:chatgpt-content-reference{` 접두사를 보세요', '예: `:chatgpt-content-reference{index="0"}`']) {
+    const review = { summary: '요약', approval: 'comment', comments: [{ path: 'src/parser.ts', line: 14, body: mention }],
+      reviewedHeadSha: 'h', reviewedBaseSha: 'b' };
+    for (const raw of [JSON.stringify(review), '```json\n' + JSON.stringify(review, null, 2) + '\n```']) {
+      const r = parseGPTResponse(raw);
+      assert.equal(r.parsed, true, raw);
+      assert.equal(r.comments[0].body, mention);
+    }
+  }
+  // 깨진 JSON 에서도 불완전한 표식은 JSON 구조까지 먹지 않는다 — 걷어낼 것은 완전한 표식뿐이다.
+  const broken = '{"summary": "s", "approval": "comment", "comments": [{"path": "a", "line": 1, ' +
+    '"body": "`:chatgpt-content-reference{` 참고 :chatgpt-content-reference{index="3"}"}]}';
+  const r = parseGPTResponse(broken);
+  assert.equal(r.parsed, true);
+  assert.equal(r.comments[0].body, '`:chatgpt-content-reference{` 참고');
+});
 
 test('잘못된 판정/코멘트는 전체 리뷰를 거부한다', () => {
   for (const approval of ['disapprove', 'not approved', 'APPROVE', null, {}]) {

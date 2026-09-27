@@ -37,8 +37,17 @@ export class ResponseTimeoutError extends Error {
 
 export interface PromptAttachment { name: string; buffer: Buffer }
 
-/** 미전송 첨부만 찾는다. 대화에 이미 전송된 파일은 포함하지 않는다. */
-const REMOVE_FILE_BUTTON = /^(Remove file|파일 제거|파일 삭제)/;
+/** 미전송 첨부만 찾는다. 대화에 이미 전송된 파일은 포함하지 않는다. 개편 화면은 "Remove <파일명>" 이다. */
+const REMOVE_FILE_BUTTON = /^(Remove |파일 제거|파일 삭제)/;
+
+/**
+ * 업로드가 끝난 첨부 카드. 옛 화면은 처리 중 숨겨 둔 아이콘이 드러나고, 개편 화면은
+ * "Uploading <파일명>" 진행 막대가 파일명 버튼으로 바뀐다 (실측 530KB 약 8초).
+ */
+function uploadedCard(composer: Locator, name: string): Locator {
+  return composer.getByRole('group', { name, exact: true }).getByTestId('library-file-icon')
+    .or(composer.getByRole('button', { name, exact: true })).first();
+}
 
 /** 대화에서 읽어온 메시지 하나 (역할 + 본문). */
 export interface ConversationMessage {
@@ -1033,7 +1042,7 @@ export class ChatGPTDriver {
    */
   async sendAndCollect(
     prompt: string,
-    onSent?: (conversationUrl: string | null) => void,
+    onSent?: (conversationUrl: string | null, reasoning: string) => void,
     attachment?: PromptAttachment,
   ): Promise<string> {
     const p = this.requirePage();
@@ -1065,6 +1074,10 @@ export class ChatGPTDriver {
     if ((await input.innerText()).trim() || await composer.getByRole('button', { name: REMOVE_FILE_BUTTON }).count()) {
       throw new Error('입력창에 작성 중인 내용 또는 첨부가 있습니다 — 기존 초안을 보존합니다.');
     }
+    const reasoning = await this.inputStep('추론 강도 최대', () => this.maximizeReasoning(p, composer).catch((cause) => {
+      throw new Error(`추론 강도를 최대로 맞추지 못했습니다 — 전송하지 않습니다: ${String(cause?.message ?? cause).split('\n')[0]}`, { cause });
+    }), false);
+    console.log(chalk.dim(`  추론: ${reasoning}`));
     try {
       if (attachment) {
         await this.inputStep(`고정 diff 첨부 (${attachment.buffer.length}바이트)`, async () => {
@@ -1073,19 +1086,20 @@ export class ChatGPTDriver {
           // 옆에는 이미지 전용 입력도 있다.
           await composer.locator('input[type="file"]:not([accept])').first()
             .setInputFiles({ ...attachment, mimeType: 'text/plain' });
-          // 파일 이름이 나타나는 것만으로 업로드 성공은 아니다. 처리 중에는 이 아이콘이 숨겨져 있다.
+          // 파일 이름이 나타나는 것만으로 업로드 성공은 아니다 — 완료된 카드와 진행 막대가 사라진 것까지 본다.
           try {
-            await composer.getByRole('group', { name: attachment.name, exact: true })
-              .getByTestId('library-file-icon').waitFor({ state: 'visible', timeout: 120_000 });
+            await uploadedCard(composer, attachment.name).waitFor({ state: 'visible', timeout: 120_000 });
+            await composer.getByRole('progressbar', { name: `Uploading ${attachment.name}`, exact: true })
+              .waitFor({ state: 'detached', timeout: 30_000 });
           } catch (cause) {
-            const files = await composer.getByRole('group').allTextContents().catch(() => []);
+            const files = await composer.locator('[role="group"], [role="progressbar"], button[aria-label^="Remove "]')
+              .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') || e.textContent || '')).catch(() => []);
             throw new Error(`고정 diff 첨부 완료를 확인하지 못했습니다: ${files.join(' / ').slice(0, 160) || '첨부 카드 없음'}`, { cause });
           }
         });
       }
       await this.inputStep(`프롬프트 입력 (${prompt.length}자, ${prompt.split('\n').length}줄)`, () => this.fillPrompt(p, prompt), false);
-      if (attachment) await composer.getByRole('group', { name: attachment.name, exact: true })
-        .getByTestId('library-file-icon').waitFor({ state: 'visible', timeout: 3_000 });
+      if (attachment) await uploadedCard(composer, attachment.name).waitFor({ state: 'visible', timeout: 3_000 });
 
       // 이번 라운드의 생성만 근거로 쓴다.
       this.sawGeneration = false;
@@ -1104,10 +1118,13 @@ export class ChatGPTDriver {
           const text = normalize(await input.evaluate(readComposerInPage));
           if (!text || text === normalize(prompt)) {
             if (attachment) {
-              const remove = composer.getByRole('group', { name: attachment.name, exact: true })
-                .getByRole('button', { name: REMOVE_FILE_BUTTON });
+              const card = composer.getByRole('group', { name: attachment.name, exact: true })
+                .or(composer.getByRole('button', { name: attachment.name, exact: true })).first();
+              const remove = composer.getByRole('button', { name: `Remove ${attachment.name}`, exact: true })
+                .or(composer.getByRole('group', { name: attachment.name, exact: true })
+                  .getByRole('button', { name: REMOVE_FILE_BUTTON })).first();
               if (await remove.count()) {
-                await composer.getByRole('group', { name: attachment.name, exact: true }).hover();
+                if (await card.count()) await card.hover();
                 await remove.click();
               }
             }
@@ -1123,7 +1140,7 @@ export class ChatGPTDriver {
     // **응답을 기다리기 전에** 알린다. 대기 구간이 2~15분이라 그 사이에 프로세스가
     // 죽으면, 여기서 안 남겨둔 URL 은 영영 잃는다. 그러면 다음 라운드가 대화가 없는
     // 줄 알고 새 창을 열어 **같은 질문을 다시 보낸다** (대화 한도를 그냥 버린다).
-    if (onSent) onSent(await this.waitForConversationUrl(p));
+    if (onSent) onSent(await this.waitForConversationUrl(p), reasoning);
 
     // ── 응답 수집 ──
     return this.collectResponse(p, before, lastUserBefore);
@@ -1334,6 +1351,42 @@ export class ChatGPTDriver {
   }
 
   /** 타임아웃으로 입력을 겹쳐 실행하지 않는다. 느린 호출은 경고만 남긴다. */
+  /**
+   * 추론 강도를 최대로 올리고 표기용 이름을 돌려준다 (예: "Latest · Pro (5/5)").
+   *
+   * 개편 화면의 기본값은 추론 없는 Instant 였다 — 개편 뒤 51,012자 diff 가 20초 만에
+   * approve 로 게시됐다 (개편 전 150~1,084초). 모델은 대화마다 기억돼 이어 쓰는 대화는
+   * 만든 때의 설정으로 돌아가므로 **전송마다** 맞춘다. 못 맞추면 호출부가 보내지 않는다.
+   */
+  private async maximizeReasoning(p: Page, composer: Locator): Promise<string> {
+    await composer.getByRole('button', { name: 'Select ChatGPT model', exact: true }).click({ timeout: 10_000 });
+    const menu = p.locator('[role="menu"][data-state="open"]').filter({ has: p.locator('[data-reasoning-slider]') });
+    try {
+      const power = menu.locator('[data-reasoning-slider]');
+      const slider = menu.locator('[role="slider"]');
+      await power.focus({ timeout: 5_000 });
+      const value = async (attr: string) => Number(await slider.getAttribute(attr, { timeout: 5_000 }));
+      const max = await value('aria-valuemax');
+      for (let step = 0; step <= max; step++) {
+        const now = await value('aria-valuenow');
+        if (now >= max) break;
+        await p.keyboard.press('ArrowRight');
+        for (let t = 0; t < 20 && await value('aria-valuenow') === now; t++) await p.waitForTimeout(100);
+      }
+      const now = await value('aria-valuenow');
+      if (!(max > 0) || now !== max) throw new Error(`슬라이더 ${now}/${max}`);
+      const [desc] = await power.evaluate((el) => (el.getAttribute('aria-describedby') ?? '').split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent?.trim() ?? ''));
+      const level = /^(.+?), (\d+) of (\d+)/.exec(desc ?? '');
+      const checked = menu.locator('[role="menuitemradio"][aria-checked="true"]');
+      const model = (await checked.count()) ? (await checked.first().textContent())?.trim() : '';
+      const label = level ? `${level[1]} (${level[2]}/${level[3]})` : `${now + 1}/${max + 1}`;
+      return model ? `${model} · ${label}` : label;
+    } finally {
+      if (await menu.count()) await p.keyboard.press('Escape');
+    }
+  }
+
   private async inputStep<T>(label: string, action: () => Promise<T>, reportCompletion = true): Promise<T> {
     const since = Date.now();
     const timer = setTimeout(() => console.log(chalk.yellow(`  ⚠ ${label} 10초째 진행 중`)), 10_000);
