@@ -132,6 +132,8 @@ export interface PostOptions {
    * 같은 기준을 재현할 수 있다 (대기 중 base 가 바뀌었을 수 있다).
    */
   baseRef?: string | null;
+  /** 답을 만든 모델·추론 강도. 모르면(구버전 캐시·기록) 표기하지 않는다. */
+  reasoning?: string;
   /** 아직 열려 있는 우리 지적 — 같은 것을 다시 올리지 않기 위한 대조 대상. */
   live?: LiveComment[];
 }
@@ -163,7 +165,7 @@ const BOT_DISCLAIMER =
 
 export function buildReviewBody(
   review: ReviewResult,
-  opts: Pick<PostOptions, 'round'> = {},
+  opts: Pick<PostOptions, 'round' | 'reasoning'> = {},
 ): string {
   const { round } = opts;
 
@@ -172,6 +174,7 @@ export function buildReviewBody(
     body += ` ${round}차 리뷰`;
   }
   body += `\n\n${BOT_DISCLAIMER}`;
+  if (opts.reasoning) body += `\n\n추론 모델: ${opts.reasoning}`;
   body += `\n\n**판정: ${VERDICT_LABEL[review.approval] ?? review.approval}**`;
   body += `\n\n${review.summary}`;
   return body;
@@ -246,7 +249,7 @@ export async function postReviewToGitHub(
   const { event, downgraded } = resolveEvent(review.approval, isSelfReview);
 
   // ── 리뷰 본문 구성 ──
-  let body = buildReviewBody(review, { round });
+  let body = buildReviewBody(review, { round, reasoning: opts.reasoning });
   if (invalid.length > 0) {
     body += '\n\n---\n\n### Non-inline Review Comments\n';
     for (const c of invalid) {

@@ -159,7 +159,7 @@ export interface PRContext {
     key: string;
     round: number;
     result: ReviewResult;
-    target: { headSha: string | null; baseRef: string | null; mergeBaseSha?: string | null };
+    target: { headSha: string | null; baseRef: string | null; mergeBaseSha?: string | null; reasoning?: string };
     openThreadIds: string[];
   };
   /**
@@ -212,6 +212,8 @@ export interface PRContext {
     marker?: string;
     /** 타임아웃 후 다음 응답 회수 시각. 재전송 없이 일반 실패 재시도와 별도로 확인한다. */
     recoverAfter?: string;
+    /** 전송 때 맞춘 모델·추론 강도 — 회수한 답을 게시할 때 표기한다. */
+    reasoning?: string;
   };
   /**
    * 감시 필터에 걸려 큐에서 빠진 사유 (draft 로 되돌림·라벨 제거 등).

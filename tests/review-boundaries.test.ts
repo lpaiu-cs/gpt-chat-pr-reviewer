@@ -67,10 +67,10 @@ async function fixture(fn: (f: {
   syncBuiltinESMExports();
   const driver = {
     ensureAlive: async () => false, startNewChat: async () => {}, withTurn: (fn: () => Promise<unknown>) => fn(),
-    sendAndCollect: async (prompt: string, onSent: (url: string) => void, attachment?: PromptAttachment) => {
+    sendAndCollect: async (prompt: string, onSent: (url: string, reasoning: string) => void, attachment?: PromptAttachment) => {
       controls.prompts.push(prompt);
       controls.attachments.push(attachment);
-      onSent('https://chatgpt.com/c/fixture');
+      onSent('https://chatgpt.com/c/fixture', 'Latest · Pro (5/5)');
       return JSON.stringify({ summary: 'issue', approval: 'request_changes',
         reviewedHeadSha: controls.wrongTarget ? 'c'.repeat(40) : head, reviewedBaseSha: base,
         comments: [{ path: 'x.ts', line: 1, body: 'fix this' }] });
@@ -86,6 +86,7 @@ test('고정 diff를 실제 전송하고 같은 head에만 게시한다', async 
   assert(f.controls.prompts[0].includes(head));
   assert(f.controls.prompts[0].includes(base));
   assert.equal(f.posts[0].commit_id, head);
+  assert.match(f.posts[0].body, /추론 모델: Latest · Pro \(5\/5\)/);
   assert.equal(f.controls.attachments[0], undefined);
 }));
 
@@ -125,6 +126,7 @@ test('재시도 소진 후 25분 타임아웃도 재시작/완료 판정 가능�
   assert.equal(f.controls.prompts.length, 1);
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0].commit_id, head);
+  assert.match(f.posts[0].body, /추론 모델: Latest · Pro \(5\/5\)/, '회수한 답도 전송 때의 추론 설정을 표기한다');
   assert.equal(ctx.round, 1);
   assert.equal(ctx.pendingSend, undefined);
   assert.equal(ctx.lastError, undefined);

@@ -58,3 +58,8 @@ test('buildReviewBody: 전체 본문 모양', () => {
     ].join('\n'),
   );
 });
+
+test('buildReviewBody: 답을 만든 모델·추론 강도를 표기하고, 모르면 생략한다', () => {
+  assert.match(buildReviewBody(review, { round: 1, reasoning: 'Latest · Pro (5/5)' }), /추론 모델: Latest · Pro \(5\/5\)/);
+  assert.doesNotMatch(buildReviewBody(review, { round: 1 }), /추론 모델/);
+});
