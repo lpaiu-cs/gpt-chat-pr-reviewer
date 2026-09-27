@@ -1117,8 +1117,11 @@ async function askChatGPT(
   const diff = await fetchDiffAt(ctx.owner, ctx.repo, target.mergeBaseSha, target.headSha);
   // ponytail: 100k자는 편집기 부하를 피하는 전환점이지 서비스 한도가 아니다.
   // 큰 diff도 생략 없이 전달한다. 첨부 한도에 걸리면 PR을 나누어야 한다.
+  // 이름은 전송마다 달라야 한다. 같은 이름이 이미 올라가 있으면 ChatGPT 가 "…(4).txt" 로
+  // 바꿔 붙여 카드를 못 찾는다 — 재시도가 전부 같은 이름이라 platelog#4 가 매번 멈췄다.
   const attachment = diff.length > 100_000 ? {
-    name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}.txt`, buffer: Buffer.from(diff, 'utf8'),
+    name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}-${randomUUID().slice(0, 8)}.txt`,
+    buffer: Buffer.from(diff, 'utf8'),
   } : undefined;
   const templateMarker = roundMarker(cfg, ctx, round);
   const marker = templateMarker ?? `Review request: ${ctx.owner}/${ctx.repo}#${ctx.prNumber} round ${round}`;

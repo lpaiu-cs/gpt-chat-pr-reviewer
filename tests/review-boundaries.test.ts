@@ -286,6 +286,21 @@ test('확정된 POST 검증 거부는 저장된 payload를 버리고 새 응답�
   assert.equal(f.posts.length, 1);
 }));
 
+test('같은 대상을 다시 보내도 첨부 이름은 매번 다르다 (ChatGPT 가 중복 이름을 "(n)" 으로 바꾼다)', async () => fixture(async f => {
+  f.controls.diff = diff + '+big\n'.repeat(30_000);
+  f.controls.rejectPost = true;
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  f.controls.rejectPost = false;
+  const restored = loadContext(f.cfg, 'o', 'r', 1)!;
+  applySyncEvents(f.cfg, restored, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  delete restored.conversationUrl;
+  assert.equal(await runRound(f.cfg, f.driver, restored), 'posted');
+  const [first, second] = f.controls.attachments;
+  assert(first && second);
+  assert.notEqual(first.name, second.name);
+  assert(f.controls.prompts[1].includes(second.name), '프롬프트는 실제 첨부 이름을 가리킨다');
+}));
+
 test('잘못된 판정/코멘트는 전체 리뷰를 거부한다', () => {
   for (const approval of ['disapprove', 'not approved', 'APPROVE', null, {}]) {
     assert.equal(parseGPTResponse(JSON.stringify({ summary: 'x', approval, comments: [] })).parsed, false);

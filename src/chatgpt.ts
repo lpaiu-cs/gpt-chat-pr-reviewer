@@ -1092,7 +1092,7 @@ export class ChatGPTDriver {
             await composer.getByRole('progressbar', { name: `Uploading ${attachment.name}`, exact: true })
               .waitFor({ state: 'detached', timeout: 30_000 });
           } catch (cause) {
-            const files = await composer.locator('[role="group"], [role="progressbar"]')
+            const files = await composer.locator('[role="group"], [role="progressbar"], button[aria-label^="Remove "]')
               .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') || e.textContent || '')).catch(() => []);
             throw new Error(`고정 diff 첨부 완료를 확인하지 못했습니다: ${files.join(' / ').slice(0, 160) || '첨부 카드 없음'}`, { cause });
           }
