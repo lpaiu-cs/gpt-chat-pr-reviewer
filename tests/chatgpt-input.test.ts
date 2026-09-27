@@ -58,3 +58,14 @@ test('paste success is determined by complete content, with no large or partial-
   await driver.fillPrompt(page, 'small');
   assert.equal(inserts, 1);
 });
+
+test('입력 검증은 줄바꿈 개수만 무시하고 글자는 전부 대조한다', async () => {
+  const { composerText } = await import('../src/chatgpt.js');
+  // 실측(2026-09 개편 입력창): URL 이 링크 위젯이 되며 앞에 줄바꿈이 하나 더, 끝에 두 개가 붙었다.
+  const sent = '## 대상 PR\nhttps://github.com/o/r/pull/1\n리뷰 라운드: 1차\n\n\n끝';
+  const shown = '## 대상 PR\n\nhttps://github.com/o/r/pull/1\n리뷰 라운드: 1차\n\n\n끝\n\n';
+  assert.equal(composerText(shown), composerText(sent));
+  // 옛 칩 사고: URL 글자가 owner/repo#N 으로 바뀌면 여전히 불일치다.
+  assert.notEqual(composerText(shown.replace('https://github.com/o/r/pull/1', '\uFEFFo/r#1\uFEFF')), composerText(sent));
+  assert.notEqual(composerText(sent.slice(0, -1)), composerText(sent)); // 잘림
+});

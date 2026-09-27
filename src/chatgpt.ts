@@ -77,6 +77,18 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
 }
 
 /**
+ * 입력창의 글을 보낸 글과 비교할 형태로 편다.
+ *
+ * **줄바꿈 개수는 보지 않는다.** 개편 입력창은 GitHub URL 을 링크 위젯으로 바꾸고(글자는
+ * 남는다) 그 앞과 끝에 줄바꿈을 더 그린다 — 같은 글인데 innerText 가 달라 전송이 매번
+ * 막혔다. 글자는 전부 대조하므로 잘림과 칩 치환(URL 이 owner/repo#N 으로 바뀌던 사고)은
+ * 여전히 잡힌다.
+ */
+export function composerText(s: string): string {
+  return s.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
+}
+
+/**
  * 어시스턴트 메시지를 **안정적 식별자**로 고정하는 셀렉터 (옛 화면 · 개편 화면).
  *
  * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
@@ -1063,7 +1075,7 @@ export class ChatGPTDriver {
       try {
         if (!(await this.isStreaming(p)) && await this.lastUserMessageId(p) === lastUserBefore
           && await this.countUserMessages(p) === beforeUserCount) {
-          const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
+          const normalize = composerText;
           const text = normalize(await input.innerText());
           if (!text || text === normalize(prompt)) {
             if (attachment) {
@@ -1374,8 +1386,11 @@ export class ChatGPTDriver {
         // PM의 plain-text paste는 연속 개행을 문단 하나로 합친다. 자체 clipboard
         // 형식으로 공백 보존을 요청하고, 개행은 hard break로 전달한다.
         const escaped = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        // PM이 마지막 BR을 표시용으로 버리므로 실제 마지막 개행과 구분한다.
-        dt.setData('text/html', `<p data-pm-slice="1 1 []">${escaped.replace(/\r?\n/g, '<br>')}<br></p>`);
+        // 옛 입력창(PM)은 마지막 BR을 표시용으로 버리므로 실제 마지막 개행과 구분한다.
+        // 개편 입력창은 그 BR을 줄바꿈으로 남긴다 — 붙이면 4000자 조각 경계마다 줄
+        // 한가운데가 끊겨 diff 줄이 쪼개진다(실측). 그쪽에서는 붙이지 않는다.
+        const tail = (el as HTMLElement).closest?.('form[data-chatgpt-composer]') ? '' : '<br>';
+        dt.setData('text/html', `<p data-pm-slice="1 1 []">${escaped.replace(/\r?\n/g, '<br>')}${tail}</p>`);
         el.dispatchEvent(
           new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
         );
@@ -1389,7 +1404,7 @@ export class ChatGPTDriver {
     }
     // 처리된 paste는 preventDefault로 false를 반환할 수 있다. 이벤트 반환값이
     // 아니라 전체 본문을 비교한다. 부분 입력 위에 다른 입력 방법을 덧붙이지 않는다.
-    const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\n+$/, '');
+    const normalize = composerText;
     const matches = async () => normalize(await input.innerText({ timeout: 3_000 })) === normalize(text);
     let matched = await this.inputStep('붙여넣기 검증', matches, false);
     if (!matched && (await input.innerText({ timeout: 3_000 })).length === 0 && text.length <= 4000 && text.split('\n').length <= 80) {
