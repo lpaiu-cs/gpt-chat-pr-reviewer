@@ -457,6 +457,18 @@ export class ChatGPTDriver {
    */
   private owned = true;
 
+  /**
+   * 화면을 조작할 차례 — **같은 브라우저의 탭들이 한 줄로 선다** (fork 가 같은 줄을 물려받는다).
+   *
+   * 동시 리뷰에서 겹쳐도 되는 구간은 응답 대기뿐이다. 같은 프로필의 ChatGPT 탭은 서로
+   * 독립이 아니다 — 한 탭이 입력하는 동안 옆 탭이 전송하자 입력하던 탭의 전송 버튼과
+   * 입력창이 사라졌고(Artificial-Consciousness#40 두 번), 입력 구간이 겹친 배치에서는
+   * 전송 클릭이 평소 1초 미만에서 4초로 늘었다.
+   */
+  private turn: { tail: Promise<void> } = { tail: Promise.resolve() };
+  /** 쥐고 있는 차례를 놓는다 (안 쥐었으면 null). */
+  private leaveTurn: (() => void) | null = null;
+
   // ── 생성 네트워크 관측 (이슈 #1) ──
   /** 생성 요청을 한 번이라도 봤는가 = 추적이 동작하는가 */
   private sawGeneration = false;
@@ -625,10 +637,66 @@ export class ChatGPTDriver {
     const child = new ChatGPTDriver(this.cfg);
     child.ctx = ctx;
     child.owned = false;
+    child.turn = this.turn; // 차례는 탭이 아니라 브라우저 단위다
     child.page = await ctx.newPage();
-    try { await child.preparePage(child.page); }
-    catch (error) { await child.close(); throw error; }
+    try {
+      await child.preparePage(child.page);
+      // 첫 로딩은 **라운드를 시작하기 전에** 끝낸다 (지금은 옆 탭이 쉬고 있다).
+      // 실측: 디스크 부족으로 프로필의 쿠키 DB 가 비워진 뒤, 메모리 상태로 버티던 기존
+      // 탭은 멀쩡했고 새 탭은 전부 입력창을 못 띄웠다(osk-system#114·#115 · platelog#3 ·
+      // pelican-music#51). 라운드 안에서 실패하면 탭 사정인데도 PR 이 오류·재시도
+      // 횟수·5분 대기를 떠안는다. 여기서 실패하면 탭 임대만 실패하고 PR 은 다음 배치로 간다.
+      await child.navigateToChatGPT();
+      await child.page.locator(this.cfg.selectors.textInput).first().waitFor({ state: 'visible', timeout: 15_000 });
+    } catch (error) {
+      const seen = await child.describePage();
+      await child.close();
+      const reason = (error instanceof Error ? error.message : String(error)).split('\n')[0];
+      throw new Error(`새 탭이 ChatGPT 입력창까지 가지 못했습니다: ${reason} — 화면: ${seen}`, { cause: error });
+    }
     return child;
+  }
+
+  /** 지금 화면을 한 줄로 — 주소 · 제목 · 보이는 글자 앞부분 (진단용, 실패해도 원래 오류가 먼저다). */
+  private async describePage(): Promise<string> {
+    const p = this.page;
+    if (!p) return '(탭 없음)';
+    let title = '';
+    let text = '';
+    try {
+      title = await p.title();
+      text = await p.locator('body').innerText({ timeout: 3_000 });
+    } catch { /* 읽은 데까지만 */ }
+    return `${p.url()} · 제목 "${title}" · "${text.replace(/\s+/g, ' ').trim().slice(0, 120)}"`;
+  }
+
+  /**
+   * 진입부터 전송까지를 **차례를 쥔 채** 실행한다 (필드 `turn` 참고).
+   *
+   * 응답 대기에 들어서면 `collectResponse` 가 그 자리에서 차례를 넘긴다 — 그래서
+   * 2~15분짜리 대기는 그대로 겹치고 입력 구간만 한 줄로 선다. 실패해도 넘긴다.
+   * 안 넘기면 옆 탭이 영영 못 들어온다.
+   *
+   * ponytail: 전송 전 `waitUntilIdle` 은 차례를 쥔 채 기다린다 — 복귀한 대화가 아직
+   * 생성 중인 드문 경로라 옆 탭이 늦어질 뿐이다. 잦아지면 그 대기 동안 차례를 넘긴다.
+   */
+  async withTurn<T>(fn: () => Promise<T>): Promise<T> {
+    const before = this.turn.tail;
+    let leave!: () => void;
+    this.turn.tail = new Promise<void>((resolve) => { leave = resolve; });
+    await before;
+    this.leaveTurn = leave;
+    try {
+      return await fn();
+    } finally {
+      this.endTurn();
+    }
+  }
+
+  private endTurn(): void {
+    const leave = this.leaveTurn;
+    this.leaveTurn = null;
+    leave?.();
   }
 
   async close(): Promise<void> {
@@ -788,8 +856,10 @@ export class ChatGPTDriver {
     try {
       await enterProject(p, { url: project, name: this.cfg.chatgptProjectName ?? '' }, this.cfg.selectors.textInput);
     } catch (cause) {
-      // 원인을 첫 줄 앞머리에 둔다 — 로그는 첫 줄만, 그것도 앞에서 자른다.
-      throw new Error(`ChatGPT 프로젝트에 진입하지 못했습니다: ${cause instanceof Error ? cause.message : String(cause)}`
+      // 원인과 주소를 **첫 줄에** 둔다 — 로그·상태는 첫 줄만, 그것도 앞에서 자른다.
+      // Playwright 오류는 호출 기록이 여러 줄로 붙어, 뒤에 붙인 주소가 통째로 잘렸었다.
+      const reason = (cause instanceof Error ? cause.message : String(cause)).split('\n')[0];
+      throw new Error(`ChatGPT 프로젝트에 진입하지 못했습니다: ${reason}`
         + ` (현재 주소: ${p.url()}) 데몬 종료 후 npm run dev -- setup 으로 프로젝트를 열어 다시 등록하고,`
         + ' 사이드바에 프로젝트가 보이도록 고정해 주세요.', { cause });
     }
@@ -1355,6 +1425,9 @@ export class ChatGPTDriver {
     timeout = this.cfg.responseTimeoutMs,
   ): Promise<string> {
     const sel = this.cfg.selectors;
+
+    // 여기서부터는 기다리기만 한다 — 차례를 넘겨 옆 탭이 진입·입력을 시작하게 한다.
+    this.endTurn();
 
     // 응답 시작을 **따로 기다리지 않는다.** 예전에는 여기서 60초 안에 어시스턴트
     // 노드가 안 뜨면 실패로 던졌는데, 추론 모드는 첫 노드가 뜨기까지 몇 분이 걸린다
