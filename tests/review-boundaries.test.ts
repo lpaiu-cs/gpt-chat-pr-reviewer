@@ -311,6 +311,24 @@ test('첨부 인용 표식이 JSON 문자열에 섞여도 파싱하고 본문에
   assert.equal(r.raw, raw, '원본은 그대로 남긴다');
 });
 
+test('정상 JSON 이 인용 표식을 코드 예제로 언급하면 그대로 보존한다 (#47 리뷰)', () => {
+  for (const mention of ['`:chatgpt-content-reference{` 접두사를 보세요', '예: `:chatgpt-content-reference{index="0"}`']) {
+    const review = { summary: '요약', approval: 'comment', comments: [{ path: 'src/parser.ts', line: 14, body: mention }],
+      reviewedHeadSha: 'h', reviewedBaseSha: 'b' };
+    for (const raw of [JSON.stringify(review), '```json\n' + JSON.stringify(review, null, 2) + '\n```']) {
+      const r = parseGPTResponse(raw);
+      assert.equal(r.parsed, true, raw);
+      assert.equal(r.comments[0].body, mention);
+    }
+  }
+  // 깨진 JSON 에서도 불완전한 표식은 JSON 구조까지 먹지 않는다 — 걷어낼 것은 완전한 표식뿐이다.
+  const broken = '{"summary": "s", "approval": "comment", "comments": [{"path": "a", "line": 1, ' +
+    '"body": "`:chatgpt-content-reference{` 참고 :chatgpt-content-reference{index="3"}"}]}';
+  const r = parseGPTResponse(broken);
+  assert.equal(r.parsed, true);
+  assert.equal(r.comments[0].body, '`:chatgpt-content-reference{` 참고');
+});
+
 test('잘못된 판정/코멘트는 전체 리뷰를 거부한다', () => {
   for (const approval of ['disapprove', 'not approved', 'APPROVE', null, {}]) {
     assert.equal(parseGPTResponse(JSON.stringify({ summary: 'x', approval, comments: [] })).parsed, false);
