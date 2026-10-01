@@ -169,3 +169,20 @@ test('실제 Chrome: 위치로 읽는 답이 완료 때 같은 노드에서 줄�
     assert.equal(await driver.collectFrom(0, 60_000), '{"summary":"ok"}');
   } finally { await browser.close(); }
 });
+
+test('실제 Chrome: 입력창 셀렉터가 둘 걸려도 보이는 것으로 진입한다', async () => {
+  // 실측: 프로젝트 홈에서 textInput 이 두 요소에 걸려 strict mode 위반으로 데몬이 기동 직후 종료했다.
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const page = await browser.newPage();
+  const entry = { url: 'https://chatgpt.com/g/g-p-1234/project', name: 'Reviews' };
+  await page.route('https://chatgpt.com/**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+    <h1>Reviews</h1><textarea id="prompt-textarea" style="display:none"></textarea>
+    <form data-chatgpt-composer><div contenteditable="true" role="textbox"></div></form>` }));
+  try {
+    const input = loadConfig('tests/__missing__.json').selectors.textInput;
+    await page.goto(entry.url);
+    assert.equal(await page.locator(input).count(), 2);
+    await enterProject(page, entry, input);
+    assert.deepEqual(await readProjectEntry(page, input), entry);
+  } finally { await browser.close(); }
+});

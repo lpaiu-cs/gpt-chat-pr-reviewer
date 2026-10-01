@@ -5,7 +5,7 @@ export interface ProjectEntry { url: string; name: string }
 
 export async function readProjectEntry(page: Page, input: string): Promise<ProjectEntry> {
   const url = requireProjectUrl(page.url());
-  await page.locator(input).waitFor({ state: 'visible', timeout: 15_000 });
+  await page.locator(input).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: 15_000 });
   const name = (await page.getByRole('heading', { level: 1 }).innerText()).trim();
   if (!name) throw new Error('프로젝트 이름을 읽지 못했습니다. 프로젝트 홈을 열어 주세요.');
   return { url, name };
@@ -15,7 +15,8 @@ export async function readProjectEntry(page: Page, input: string): Promise<Proje
 export async function enterProject(page: Page, entry: ProjectEntry, input: string): Promise<void> {
   const expected = chatgptProjectId(requireProjectUrl(entry.url));
   if (!entry.name?.trim()) throw new Error('프로젝트 이름 등록이 필요합니다. npm run dev -- setup 으로 프로젝트를 열고 등록하세요.');
-  const editor = page.locator(input);
+  // 입력창 셀렉터가 둘 이상 걸리는 화면이 있다(실측) — 보이는 첫 것을 쓴다.
+  const editor = page.locator(input).filter({ visible: true }).first();
   const onHome = () => chatgptProjectId(page.url()) === expected && /\/project\/?$/.test(new URL(page.url()).pathname);
   if (!onHome() || !(await editor.isVisible())) {
     if (!page.url().startsWith('https://chatgpt.com/') || !(await editor.isVisible())) {
