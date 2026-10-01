@@ -108,7 +108,7 @@ test('이미 열린 빈 프로젝트 홈은 전체 로딩 없이 재사용한다
     goto: async (url: string) => { destination = url; },
     waitForSelector: async () => {}, keyboard: { press: async () => {} },
     waitForTimeout: async () => {}, url: () => actual,
-    locator: () => ({ isVisible: async () => true, innerText: async () => '' }),
+    locator: () => ({ isVisible: async () => true, innerText: async () => '', first() { return this; } }),
   };
   await driver.startNewChat();
   assert.equal(destination, '');
@@ -142,7 +142,7 @@ test('프로젝트 입력창 실패는 원인과 최신 URL 등록 방법을 함
   const driver = new ChatGPTDriver({ ...cfg(), chatgptProjectUrl: PROJECT, chatgptProjectName: 'Reviews' }) as any;
   driver.page = {
     goto: async () => {}, url: () => PROJECT,
-    locator: () => ({ isVisible: async () => { throw new Error('selector timeout'); } }),
+    locator: () => ({ isVisible: async () => { throw new Error('selector timeout'); }, first() { return this; } }),
   };
   await assert.rejects(driver.startNewChat(), (error: Error) => {
     assert.match(error.message, /setup/);
@@ -151,7 +151,7 @@ test('프로젝트 입력창 실패는 원인과 최신 URL 등록 방법을 함
     return true;
   });
   // Playwright 오류는 호출 기록이 여러 줄이다. 상태·로그는 첫 줄만 남기므로 주소도 첫 줄에 있어야 한다.
-  driver.page.locator = () => ({ isVisible: async () => { throw new Error('locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n  - waiting'); } });
+  driver.page.locator = () => ({ isVisible: async () => { throw new Error('locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n  - waiting'); }, first() { return this; } });
   await assert.rejects(driver.startNewChat(), (error: Error) => {
     const first = error.message.split('\n')[0];
     assert.match(first, /Timeout 15000ms/);
