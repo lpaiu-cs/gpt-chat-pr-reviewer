@@ -8,7 +8,8 @@ const CONFIG_FILE = 'pr-review.config.json';
 // 앞쪽은 옛 화면, 뒤쪽은 2026-09 개편 화면이다 (입력창 id 와 메시지 역할 속성이 없어졌다).
 // 개편은 계정마다 따로 오므로 둘 다 둔다.
 const DEFAULT_SELECTORS: ChatGPTSelectors = {
-  textInput: '#prompt-textarea, form[data-chatgpt-composer] [contenteditable="true"]',
+  // 화면 내부 이동 뒤에는 이전 화면의 입력창이 숨은 채 앞에 남는다(실측) — 보이는 것만 고른다.
+  textInput: '#prompt-textarea:visible, form[data-chatgpt-composer] [contenteditable="true"]:visible',
   sendButton: 'button[data-testid="send-button"]',
   stopButton: 'button[data-testid="stop-button"], button[aria-label*="Stop"]',
   assistantMessage: '[data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":assistant"]',

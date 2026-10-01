@@ -83,6 +83,17 @@ test('실제 Chrome: 전송 실패 초안 회수와 첨부 완료 경계', async
       assert.equal(await d.sendAndCollect(prompt, (_url: string | null, r: string) => { reasoning = r; }, file), 'answer');
       assert.equal(reasoning, 'Latest · Pro (5/5)');
     });
+    await t.test('숨은 이전 화면 입력창이 먼저 있어도 보이는 입력창의 모델 메뉴를 쓴다', async () => {
+      // 실측: 홈에서 화면 내부 이동으로 들어온 프로젝트 홈에 홈 입력창이 숨은 채(display:none 조상) 먼저 남았고,
+      // 그 폼의 모델 버튼을 기다리다 "추론 강도를 최대로 맞추지 못했습니다" 로 매 라운드가 실패했다.
+      const d = await driver();
+      await page.evaluate(() => document.body.insertAdjacentHTML('afterbegin', '<div hidden><form data-chatgpt-composer>'
+        + '<div contenteditable="true" role="textbox"></div><button type="button" aria-label="Select ChatGPT model">Pro</button></form></div>'));
+      d.clickSend = async () => {};
+      let reasoning = '';
+      assert.equal(await d.sendAndCollect(prompt, (_url: string | null, r: string) => { reasoning = r; }), 'answer');
+      assert.equal(reasoning, 'Latest · Pro (5/5)');
+    });
     await t.test('추론 강도를 못 맞추면 보내지 않는다', async () => {
       const d = await driver();
       await page.locator('[data-reasoning-slider]').evaluate((el) => el.removeAttribute('data-reasoning-slider'));
