@@ -35,6 +35,20 @@ export class ResponseTimeoutError extends Error {
   }
 }
 
+/**
+ * 생성이 답 없이 끝났다 — 새로고침해도 중지 버튼도 답도 없다 (ChatGPT 에서 중지·연결 끊김).
+ *
+ * 타임아웃과 따로 둔다. 타임아웃은 "아직 오는 중일 수 있다" 라 같은 대화를 1분마다
+ * 무기한 다시 확인하는데(재전송 없음), 끝난 생성에는 그 회수가 영원히 끝나지 않는다.
+ * 이 오류를 받으면 호출부는 전송 기록을 버리고 다시 묻는다.
+ */
+export class GenerationEndedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GenerationEndedError';
+  }
+}
+
 export interface PromptAttachment { name: string; buffer: Buffer }
 
 /** 미전송 첨부만 찾는다. 대화에 이미 전송된 파일은 포함하지 않는다. 개편 화면은 "Remove <파일명>" 이다. */
@@ -301,6 +315,15 @@ export function matchInterrupt(uiText: string): string | null {
 
 /** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
 const MAX_RELOAD_RECOVERIES = 3;
+
+/**
+ * 생성 표시(중지 버튼)가 사라진 뒤 답 본문 없이 이만큼 지나면 스트림이 끊긴 것으로 본다.
+ *
+ * 배너 문구(INTERRUPT_PATTERNS)로만 알아보면 모르는 문구에서 응답 예산을 통째로
+ * 기다린다 — sky-fishing#2 는 버튼이 사라지고 본문 0자인 채로 25분 예산 끝까지 기다렸다.
+ * 근거는 대기 판정과 같은 중지 버튼이고, 복구도 배너와 같은 새로고침이다.
+ */
+const EMPTY_END_MS = 30_000;
 
 /** 응답이 시작도 안 한 채 조용할 때 한도를 다시 확인하는 주기. */
 const QUOTA_RECHECK_MS = 30_000;
@@ -1686,6 +1709,11 @@ export class ChatGPTDriver {
     let lastQuotaCheckAt = Date.now();
     let lastChangeAt = Date.now();
     let stallNoted = false;
+    let emptySince: number | null = null;
+    // **이번** 빈 구간을 새로고침으로 재확인했는가. 배너 복구 횟수(recoveries)와 따로 둔다 —
+    // 앞서 다른 중단을 복구한 이력으로 이번 중단을 새로고침 없이 종료로 확정하면, 다시
+    // 읽으면 회수할 수 있던 답을 버리고 같은 질문을 재전송한다 (#51 리뷰).
+    let emptyReloaded = false;
     const t0 = Date.now();
 
     while (Date.now() - t0 < timeout) {
@@ -1769,6 +1797,11 @@ export class ChatGPTDriver {
       // 남기는 용도이고, 무트래픽 시간으로 대기를 끊으면 오래 걸리는 추론의
       // 부분 응답을 완성본으로 게시하게 된다 (이슈 #1 이 경계한 조기 절단).
       const streaming = await this.isStreaming(page);
+      // 생성 표시도, 생성 요청도, 답 본문도 없다 — 아무것도 오고 있지 않다.
+      const empty = !streaming && !lastText && this.netInFlight === 0;
+      emptySince = empty ? (emptySince ?? Date.now()) : null;
+      // 생성이 다시 움직였다 — 앞선 새로고침은 다음 빈 구간의 종료 근거가 아니다.
+      if (!empty) emptyReloaded = false;
       // 본문이 없다는 이유만으로 추론 중이라고 단정하지 않는다. 중지 버튼이
       // 보여 주는 생성 상태와 실제 답변 본문의 수신 여부를 따로 설명한다.
       const phase = streaming
@@ -1843,26 +1876,44 @@ export class ChatGPTDriver {
 
       // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
       // 대화를 새로고침하면 완성본을 가져올 수 있다.
-      const interrupt = streaming ? null : await this.interruptedBanner(page);
+      // 배너가 없어도 생성이 답 없이 끝났으면 같은 복구를 탄다. 화면 문구를 같이 남겨
+      // 무엇이 떠 있었는지(연결 해제·오류 안내 등) 로그만 보고 알 수 있게 한다.
+      const banner = streaming ? null : await this.interruptedBanner(page);
+      const interrupt = banner
+        ?? (emptySince !== null && Date.now() - emptySince >= EMPTY_END_MS
+          ? `답 없이 생성이 끝남 · 화면 "${await this.screenHint(page)}"` : null);
       if (interrupt) {
-        if (recoveries >= MAX_RELOAD_RECOVERIES) {
+        // 답 없는 종료는 한 번만 새로고침한다 — 다시 30초를 봐도 없으면 오는 게 없다.
+        // 배너처럼 세 번 하면 회수 예산(150초)을 다 써서 타임아웃으로 접히고, 그러면
+        // 회수 루프가 끝나지 않는다.
+        // 배너는 수집 전체에서 세 번까지, 답 없는 종료는 **그 빈 구간마다** 한 번이다.
+        const limit = banner ? MAX_RELOAD_RECOVERIES : 1;
+        const used = banner ? recoveries : Number(emptyReloaded);
+        if (used >= limit) {
           // **무엇이 걸렸는지 남긴다.** 이게 없으면 오탐일 때 원인을 짚을 수 없다.
-          throw new Error(
-            `연결 중단이 반복됩니다 (${recoveries}회 복구 시도 · 감지 문구 "${interrupt}"). ` +
-              '브라우저 창에서 상태를 확인하세요.',
+          if (banner) {
+            throw new Error(
+              `연결 중단이 반복됩니다 (${recoveries}회 복구 시도 · 감지 문구 "${interrupt}"). ` +
+                '브라우저 창에서 상태를 확인하세요.',
+            );
+          }
+          throw new GenerationEndedError(
+            `생성이 답 없이 끝났습니다 — 새로고침 후에도 중지 버튼도 답도 없습니다 (${interrupt}). 다시 묻습니다.`,
           );
         }
-        recoveries++;
+        if (banner) recoveries++;
+        else emptyReloaded = true;
         console.log(
           chalk.yellow(
             `  ⚠ 연결 중단 감지 ("${interrupt}") — 대화를 새로고침해 완성된 응답을 가져옵니다 ` +
-              `(${recoveries}/${MAX_RELOAD_RECOVERIES})`,
+              `(${used + 1}/${limit})`,
           ),
         );
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
         await page.waitForTimeout(6_000);
         stable = 0;
         lastText = '';
+        emptySince = null;
         // 화면을 통째로 다시 그렸다 — 고정을 풀고 새 DOM 에서 다시 앵커를 잡는다.
         // (그대로 두면 새 노드의 id 가 달라졌을 때 "사라졌다" 로 라운드를 버린다.)
         bound = null;
@@ -1901,7 +1952,7 @@ export class ChatGPTDriver {
 
     const quota = await this.detectQuotaLimit(page);
     if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
-    console.log(chalk.dim(`  응답 타임아웃 진단 · 근거=${this.stallEvidence(stillGenerating)} · 중지버튼 ${await this.dumpStopButtons(page)}`));
+    console.log(chalk.dim(`  응답 타임아웃 진단 · 근거=${this.stallEvidence(stillGenerating)} · 중지버튼 ${await this.dumpStopButtons(page)} · 화면 "${await this.screenHint(page)}"`));
     throw new ResponseTimeoutError(
       lastText.trim().length > 0
         ? `${duration} 안에 응답이 끝나지 않았습니다 (${lastText.length.toLocaleString()}자까지 생성). ` +
@@ -2008,5 +2059,17 @@ export class ChatGPTDriver {
    */
   private async interruptedBanner(page: Page): Promise<string | null> {
     return matchInterrupt(await this.uiTextTail(page));
+  }
+
+  /**
+   * 화면 크롬(메시지 제외)의 끝부분 — 실패할 때 무엇이 떠 있었는지 남긴다.
+   * 진단이 깨져도 오류 분류(타임아웃 등)가 바뀌면 안 되므로 던지지 않는다.
+   */
+  private async screenHint(page: Page): Promise<string> {
+    try {
+      return (await this.uiTextTail(page)).replace(/\s+/g, ' ').trim().slice(-200);
+    } catch {
+      return '(수집 실패)';
+    }
   }
 }

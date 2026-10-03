@@ -271,7 +271,7 @@
 
 <main>
   <div id="pauseBar">
-    <span>⏸ 일시정지 중 — 감시·동기화는 계속하고 리뷰 실행만 멈춰 있습니다. 대기열은 보존됩니다.</span>
+    <span id="pause-msg"></span>
   </div>
 
   <div id="onlyBar">
@@ -842,6 +842,12 @@ function renderControl() {
   $('lbl-conc').classList.toggle('on', conc !== 1);
   $('lbl-conc').classList.toggle('pending', pendingOn('conc'));
   $('pauseBar').classList.toggle('show', paused);
+  // 일시정지는 **새** 리뷰만 막는다 — 진행 중인 라운드를 끊으면 이미 쓴 한도로 만든 답을
+  // 버린다. 누른 직후 "멈춰 있습니다" 라고만 쓰면 도는 라운드가 취소된 것처럼 읽힌다.
+  const running = actives().length;
+  $('pause-msg').textContent = paused && running
+    ? '⏸ 일시정지 예약 — 진행 중인 리뷰 ' + running + '건은 취소하지 않고 끝까지 기다립니다. 그 뒤로 새 리뷰를 시작하지 않습니다.'
+    : '⏸ 일시정지 중 — 감시·동기화는 계속하고 리뷰 실행만 멈춰 있습니다. 대기열은 보존됩니다.';
 
   const only = pick('only', ctl.only || []);
   $('onlyBar').classList.toggle('show', only.length > 0);
