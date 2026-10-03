@@ -14,6 +14,11 @@ export interface RoundPoolOptions<T, Tab> {
   key: (item: T) => string;
   /** 지금 동시에 돌릴 수 있는 수 — 설정이 바뀌면 다음 fill 부터 따른다 */
   capacity: () => number;
+  /**
+   * 새 라운드를 시작해도 되는가 (중지·일시정지·쿼터·쌓인 제어 요청). **시작 직전마다** 본다 —
+   * 탭을 빌리는 동안 옆 라운드가 한도에 걸리거나 중지 요청이 들어올 수 있다 (#53 리뷰).
+   */
+  canStart: () => boolean;
   /** 슬롯이 쓸 탭. 던지면 그 항목은 시작하지 않고 이번 fill 을 멈춘다 */
   lease: (slot: number) => Promise<Tab>;
   /** 도는 라운드가 하나도 없을 때 빌린 탭을 돌려준다 */
@@ -58,7 +63,7 @@ export function createRoundPool<T, Tab>(o: RoundPoolOptions<T, Tab>) {
     async fill(queue: T[]): Promise<number> {
       const total = queue.length;
       let started = 0;
-      while (queue.length > 0 && live.size < o.capacity()) {
+      while (queue.length > 0 && live.size < o.capacity() && o.canStart()) {
         const item = queue[0];
         if (live.has(o.key(item))) { queue.shift(); continue; }
         let slot = 0;
@@ -68,6 +73,11 @@ export function createRoundPool<T, Tab>(o: RoundPoolOptions<T, Tab>) {
           tab = await o.lease(slot);
         } catch (e) {
           o.onLeaseError?.(e, queue.length);
+          break;
+        }
+        // 빌리는 사이에 게이트가 닫혔다 — 그 항목은 큐에 남기고, 도는 것만 끝까지 둔다.
+        if (!o.canStart()) {
+          if (live.size === 0) await o.release().catch(() => {}); // 방금 빌린 탭을 남기지 않는다
           break;
         }
         queue.shift();

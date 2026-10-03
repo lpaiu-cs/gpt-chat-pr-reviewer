@@ -15,6 +15,7 @@ test('슬롯이 비면 나머지 라운드를 기다리지 않고 바로 채운�
   const pool = createRoundPool<string, number>({
     key: (s) => s,
     capacity: () => capacity,
+    canStart: () => true,
     lease: async (slot) => {
       if (failLease) throw new Error('탭을 못 열었다');
       leased.push(slot);
@@ -53,4 +54,29 @@ test('슬롯이 비면 나머지 라운드를 기다리지 않고 바로 채운�
   assert.equal(pool.live.size, 0);
   assert.equal(pool.rounds.size, 0);
   assert.equal(released, 1, '마지막 라운드가 끝나면 한 번 반납한다');
+});
+
+test('탭을 빌리는 사이 게이트가 닫히면 시작하지 않고 큐에 남긴다 (#53 리뷰)', async () => {
+  // 옆 라운드가 쿼터로 끝나거나 중지·일시정지가 들어오는 것은 탭 임대(await) 도중일 수 있다.
+  let open = true;
+  let released = 0;
+  const started: string[] = [];
+  const pool = createRoundPool<string, number>({
+    key: (s) => s,
+    capacity: () => 2,
+    canStart: () => open,
+    lease: async (slot) => { open = false; return slot; }, // 빌리는 동안 게이트가 닫힌다
+    release: async () => { released++; },
+    run: async (item) => { started.push(item); return 'posted'; },
+    settled: () => {},
+  });
+  const queue = ['a', 'b'];
+  assert.equal(await pool.fill(queue), 0);
+  assert.deepEqual(started, []);
+  assert.deepEqual(queue, ['a', 'b'], '시작하지 않은 항목은 큐에 남는다');
+  assert.equal(released, 1, '도는 라운드가 없으면 방금 빌린 탭을 반납한다');
+
+  // 닫혀 있으면 탭도 빌리지 않는다.
+  assert.equal(await pool.fill(queue), 0);
+  assert.equal(released, 1);
 });
