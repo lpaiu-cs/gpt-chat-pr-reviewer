@@ -123,3 +123,16 @@ test('동시 실행 수 변경은 0 이상의 정수만 받는다', () => {
     assert.equal(typeof parseIntent({ kind: 'concurrency-set', value: bad }), 'string');
   }
 });
+
+test('미룬 의도는 맨 앞으로 돌아가고 루프를 깨우지 않는다', async () => {
+  const { intents } = await import('../src/intents.js');
+  intents.drain();
+  let woken = 0;
+  intents.onPending = () => { woken++; };
+  intents.push({ kind: 'pause' });
+  const [switchA, switchB] = [{ kind: 'account-switch', action: 'start' }, { kind: 'account-switch', action: 'complete' }] as const;
+  intents.defer([switchA, switchB]);
+  assert.equal(woken, 1, 'defer 는 onPending 을 부르지 않는다 — 부르면 같은 의도를 미루며 스캔만 반복한다');
+  assert.deepEqual(intents.drain(), [switchA, switchB, { kind: 'pause' }]);
+  intents.onPending = undefined;
+});

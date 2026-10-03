@@ -330,6 +330,17 @@ const MAX_RELOAD_RECOVERIES = 3;
  */
 const EMPTY_END_MS = 30_000;
 
+/**
+ * 응답 예산이 다 됐는데 생성이 **확실히** 진행 중이면 같은 예산을 이 횟수까지 더 준다.
+ *
+ * 큰 diff 는 추론이 예산을 넘긴다 (실측: 1.8MB diff 가 39분 — sky-fishing#2). 예전에는 그때
+ * 타임아웃으로 접고 1분마다 대화를 다시 열어 확인했다 — 그동안 라운드가 실패로 표시되고
+ * 슬롯을 놓았다 다시 잡았으며, 다시 연 탭은 수신이 끊긴 관전자가 됐다. "확실히" 는 중지
+ * 버튼에 더해 생성 요청이 살아 있다는 네트워크 근거다 — 버튼만 남은 고장(이슈 #1)은 연장하지 않는다.
+ * ponytail: 생성 요청이 끝없이 살아 있는 고장에 대비한 상한이다. 더 긴 추론이 흔해지면 올린다.
+ */
+const MAX_RESPONSE_EXTENSIONS = 2;
+
 /** 응답이 시작도 안 한 채 조용할 때 한도를 다시 확인하는 주기. */
 const QUOTA_RECHECK_MS = 30_000;
 
@@ -1720,8 +1731,23 @@ export class ChatGPTDriver {
     // 읽으면 회수할 수 있던 답을 버리고 같은 질문을 재전송한다 (#51 리뷰).
     let emptyReloaded = false;
     const t0 = Date.now();
+    let deadline = t0 + timeout;
+    let extensions = 0;
+    const span = (ms: number): string => ms < 60_000 ? `${Math.ceil(ms / 1000)}초` : `${Math.round(ms / 60_000)}분`;
+    /** 예산이 다 됐을 때 — 생성이 확실히 진행 중이면 같은 예산을 한 번 더 준다 (MAX_RESPONSE_EXTENSIONS). */
+    const extend = async (): Promise<boolean> => {
+      if (extensions >= MAX_RESPONSE_EXTENSIONS) return false;
+      if (!(await this.isStreaming(page)) || this.stallEvidence(true) !== 'generating') return false;
+      extensions++;
+      deadline += timeout;
+      console.log(chalk.yellow(
+        `  ⏳ ${span(Date.now() - t0)} 지났지만 생성이 아직 진행 중입니다 — ` +
+          `${span(timeout)} 더 기다립니다 (연장 ${extensions}/${MAX_RESPONSE_EXTENSIONS}).`,
+      ));
+      return true;
+    };
 
-    while (Date.now() - t0 < timeout) {
+    while (Date.now() < deadline || await extend()) {
       await page.waitForTimeout(3_000);
 
       const msgs = await readMessages();
@@ -1946,7 +1972,7 @@ export class ChatGPTDriver {
     // 로 둔갑한다. 원인은 타임아웃인데 표기는 붉은 "리뷰 실패" 가 되어, 이 구분이
     // 느린 생성에서 통째로 우회된다.
     const stillGenerating = await this.isStreaming(page);
-    const duration = timeout < 60_000 ? `${Math.ceil(timeout / 1000)}초` : `${Math.round(timeout / 60_000)}분`;
+    const duration = span(deadline - t0); // 연장까지 포함한 전체 예산
 
     if (!stillGenerating && lastText.trim().length > 0) {
       // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
