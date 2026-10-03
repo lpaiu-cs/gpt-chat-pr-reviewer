@@ -247,7 +247,18 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
       note: `자동 재시도 ${ctx.retryCount + 1}/${cfg.maxAutoRetries}`,
       patch: { retryCount: ctx.retryCount + 1 },
     });
+  } else if (ctx.state === 'ERROR') {
+    // 재시도를 다 썼다. 횟수는 **그 대상에 대한** 예산이다 — 대상이 바뀌면 새 리뷰라 다시 준다.
+    // 기준은 실패한 시도가 보낸 대상(pendingSend)이고, 없으면 처음 본 지금 값이다.
+    // 한 번도 리뷰되지 않은 PR 은 headShaAtLastReview 가 없어 lastReviewed 로는 못 잰다.
+    const sent = ctx.pendingSend;
+    ctx.exhaustedTarget ??= sent?.headSha
+      ? { headSha: sent.headSha, baseRef: sent.baseRef }
+      : { headSha: data.headSha, baseRef: data.baseRef };
+    const moved = targetChanged(ctx.exhaustedTarget, data);
+    if (moved) fire(ctx, 'RETRY', { note: `${moved} — 재시도 횟수 초기화`, patch: { retryCount: 0 } });
   }
+  if (ctx.state !== 'ERROR') delete ctx.exhaustedTarget;
 
   // 4. 쿼터 쿨다운 종료
   if (
@@ -260,7 +271,7 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
 
   // 5. 작성자 응답 감지 (리뷰 대상 변경 or 게시 시점에 열려 있던 스레드 전체 resolve)
   if (ctx.state === 'AWAITING_AUTHOR') {
-    const moved = targetChanged(ctx, data);
+    const moved = targetChanged(lastReviewed(ctx), data);
     if (moved || awaitedThreadsResolved(ctx)) {
       fire(ctx, 'AUTHOR_RESPONDED', { note: moved ?? '전체 스레드 resolve 확인' });
     }
@@ -268,7 +279,7 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
 
   // 6. 수렴 후 리뷰 대상 변경 → 리뷰 재개
   if (ctx.state === 'CONVERGED') {
-    const moved = targetChanged(ctx, data);
+    const moved = targetChanged(lastReviewed(ctx), data);
     if (moved) fire(ctx, 'NEW_COMMITS', { note: `수렴 후 ${moved} — 리뷰 재개` });
   }
 }
@@ -473,16 +484,21 @@ export async function absorbReviewedMerge(
  * base 브랜치가 앞으로 나가는 것(main 에 새 커밋)은 여기 안 들어온다: 3-dot 은
  * merge-base 기준이라 그때 리뷰 diff 가 바뀌지 않는다.
  */
-function targetChanged(ctx: PRContext, data: SyncSnapshot): string | null {
-  if (ctx.headShaAtLastReview && data.headSha !== ctx.headShaAtLastReview) {
+function targetChanged(
+  ref: { headSha?: string | null; baseRef?: string | null },
+  data: SyncSnapshot,
+): string | null {
+  if (ref.headSha && data.headSha !== ref.headSha) {
     return '새 커밋 감지';
   }
   // 구버전 컨텍스트·구버전 스냅샷에는 base 가 없다 — 없으면 판정하지 않는다.
-  if (ctx.baseRefAtLastReview && data.baseRef && data.baseRef !== ctx.baseRefAtLastReview) {
-    return `base 변경 감지 (${ctx.baseRefAtLastReview} → ${data.baseRef})`;
+  if (ref.baseRef && data.baseRef && data.baseRef !== ref.baseRef) {
+    return `base 변경 감지 (${ref.baseRef} → ${data.baseRef})`;
   }
   return null;
 }
+
+const lastReviewed = (ctx: PRContext) => ({ headSha: ctx.headShaAtLastReview, baseRef: ctx.baseRefAtLastReview });
 
 /**
  * 배치 probe 결과로 컨텍스트를 동기화한다 (GitHub 추가 호출 없음).

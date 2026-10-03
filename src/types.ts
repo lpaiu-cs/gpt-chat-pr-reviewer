@@ -222,6 +222,12 @@ export interface PRContext {
    */
   excludedReason?: string;
   retryCount: number;
+  /**
+   * 자동 재시도를 다 쓴 ERROR 가 **무엇을 대상으로** 실패했는지. 대상이 바뀌면(새 커밋·base
+   * 변경) 새 리뷰로 보고 재시도 횟수를 다시 준다 — 없으면 수정을 push 해도 사람이 "지금
+   * 리뷰" 를 누를 때까지 ERROR 에 머문다. ERROR 를 벗어나면 지운다.
+   */
+  exhaustedTarget?: { headSha: string; baseRef?: string | null };
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
   quotaRetryAt?: string;

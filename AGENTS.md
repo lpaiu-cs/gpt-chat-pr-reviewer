@@ -69,6 +69,12 @@ PR별 컨텍스트(`PRContext`)에 라운드 수·요청 코멘트 수·스레�
 
 **큐도 대화 URL 도 상태가 아니다.** 둘 다 실행기 사정이라 `TRANSITIONS` 에 넣지 않는다.
 
+**자동 재시도(`maxAutoRetries`)는 리뷰 대상별 예산이다** (`exhaustedTarget`). 다 쓴 ERROR 도
+대상(head·base)이 바뀌면 횟수를 다시 받는다. 없으면 수정을 push 하거나 스택 PR 의 베이스가
+머지돼도(sky-fishing#2 — base 가 main 으로 바뀌었다) 사람이 "지금 리뷰" 를 누를 때까지 멈춘다.
+기준은 실패한 전송의 대상(`pendingSend`)이고 없으면 처음 본 값이다 — 한 번도 리뷰되지 않은
+PR 은 `headShaAtLastReview` 가 없어 그걸로는 못 잰다.
+
 ## 대화 세션
 
 미수렴 PR 은 라운드 간 같은 ChatGPT 대화를 이어 쓴다. 대화 URL 은 **상태가 아니라
