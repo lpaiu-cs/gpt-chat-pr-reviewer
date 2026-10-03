@@ -28,7 +28,7 @@ import {
   fetchDiffAt,
   ReviewValidationError,
 } from './github.js';
-import { ChatGPTDriver, QuotaLimitError, ResponseTimeoutError, sameConversationUrl } from './chatgpt.js';
+import { ChatGPTDriver, GenerationEndedError, QuotaLimitError, ResponseTimeoutError, sameConversationUrl } from './chatgpt.js';
 import { parseGPTResponse, isAccessFailure, accessFailureReason } from './parser.js';
 import { postReviewToGitHub, commentDigest, type LiveComment } from './poster.js';
 import { loadInstructions } from './instructions.js';
@@ -1368,6 +1368,9 @@ export async function runRound(
     // (같은 답을 다시 써도 결과가 같다)와 같은 붉은 "리뷰 실패" 로 뭉치면, 로그만
     // 보고는 무엇이 잘못됐는지 구분할 수 없다. 상태 전이는 같지만 표기를 나눈다.
     const timedOut = e instanceof ResponseTimeoutError;
+    // 끝난 생성은 회수할 답이 없다 — 전송 기록을 버려야 회수 루프가 멈추고 다음 시도가 다시 묻는다.
+    // 남겨 두면 회수가 대화의 같은 질문을 찾아 답 없는 자리를 계속 기다린다.
+    if (e instanceof GenerationEndedError) delete ctx.pendingSend;
     const recovering = canRecoverResponse(cfg, ctx) && (timedOut || !!ctx.pendingSend?.recoverAfter);
     if (recovering) {
       ctx.pendingSend!.recoverAfter = new Date(Date.now() + RESPONSE_RECOVERY_INTERVAL_MS).toISOString();
