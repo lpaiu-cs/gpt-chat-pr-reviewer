@@ -199,7 +199,8 @@ function toCard(c: PRContext): ContextCard {
     threadsResolved: c.threads.filter((t) => t.isResolved).length,
     excludedReason: c.excludedReason,
     quotaRetryAt: c.quotaRetryAt,
-    lastError: c.lastError?.slice(0, 160),
+    // reviewer 가 이미 280자로 자른다 — 여기서 더 자르면 ACCESS_FAILED 이유가 잘린다.
+    lastError: c.lastError?.slice(0, 300),
     conversationUrl: c.conversationUrl,
     conversationTurns: c.conversationUrl ? c.conversationTurns : undefined,
     updatedAt: c.updatedAt,

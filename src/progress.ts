@@ -65,6 +65,8 @@ export interface ActiveReview {
   /** 현재 단계로 진입한 시각 — 경과 시간은 클라이언트가 여기서 계산한다 */
   phaseSince: number;
   stream?: StreamProbe;
+  /** 이 라운드의 ChatGPT 대화 주소 — 새 대화는 첫 전송 뒤에야 생긴다 */
+  conversationUrl?: string;
 }
 
 export interface QueueItem {
@@ -452,6 +454,11 @@ class ProgressBus {
   /** 응답 대기 중 스트리밍 관측값 갱신 (chatgpt.ts 의 폴링 주기마다). */
   stream(state: string, chars: number): void {
     this.update((a) => ({ ...a, stream: { state, chars, at: Date.now() } }));
+  }
+
+  /** 진행 중인 라운드의 대화 주소 — 2~15분 대기 중에도 대시보드에서 대화를 열 수 있게 한다. */
+  conversation(url: string): void {
+    this.update((a) => (a.conversationUrl === url ? null : { ...a, conversationUrl: url }));
   }
 }
 

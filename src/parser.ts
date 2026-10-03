@@ -56,6 +56,17 @@ export function isAccessFailure(r: ReviewResult): boolean {
   return r.parsed && r.summary.trim().toUpperCase().startsWith('ACCESS_FAILED');
 }
 
+/**
+ * `ACCESS_FAILED: <무엇을 열다가 어떤 오류를 봤는지>` 의 뒷부분 (없으면 '').
+ *
+ * 이유 없는 ACCESS_FAILED 는 원인을 가리지 못한다 — platelog#10 은 같은 210자 답을
+ * 네 번 받고도 PR URL·커밋 URL·첨부 중 무엇이 막혔는지 알 수 없었다.
+ */
+export function accessFailureReason(r: ReviewResult): string {
+  // 한 줄로 편다 — 실패 메시지는 첫 줄만 lastError 로 남는다.
+  return r.summary.trim().slice('ACCESS_FAILED'.length).replace(/^[\s:：\-—]+/, '').replace(/\s+/g, ' ').trim();
+}
+
 // ── JSON 추출 ───────────────────────────────────────────────
 
 function extractJSON(text: string): string | null {
