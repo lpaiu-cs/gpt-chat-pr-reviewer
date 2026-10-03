@@ -1715,6 +1715,10 @@ export class ChatGPTDriver {
     let lastChangeAt = Date.now();
     let stallNoted = false;
     let emptySince: number | null = null;
+    // **이번** 빈 구간을 새로고침으로 재확인했는가. 배너 복구 횟수(recoveries)와 따로 둔다 —
+    // 앞서 다른 중단을 복구한 이력으로 이번 중단을 새로고침 없이 종료로 확정하면, 다시
+    // 읽으면 회수할 수 있던 답을 버리고 같은 질문을 재전송한다 (#51 리뷰).
+    let emptyReloaded = false;
     const t0 = Date.now();
 
     while (Date.now() - t0 < timeout) {
@@ -1799,7 +1803,10 @@ export class ChatGPTDriver {
       // 부분 응답을 완성본으로 게시하게 된다 (이슈 #1 이 경계한 조기 절단).
       const streaming = await this.isStreaming(page);
       // 생성 표시도, 생성 요청도, 답 본문도 없다 — 아무것도 오고 있지 않다.
-      emptySince = !streaming && !lastText && this.netInFlight === 0 ? (emptySince ?? Date.now()) : null;
+      const empty = !streaming && !lastText && this.netInFlight === 0;
+      emptySince = empty ? (emptySince ?? Date.now()) : null;
+      // 생성이 다시 움직였다 — 앞선 새로고침은 다음 빈 구간의 종료 근거가 아니다.
+      if (!empty) emptyReloaded = false;
       // 본문이 없다는 이유만으로 추론 중이라고 단정하지 않는다. 중지 버튼이
       // 보여 주는 생성 상태와 실제 답변 본문의 수신 여부를 따로 설명한다.
       const phase = streaming
@@ -1884,8 +1891,10 @@ export class ChatGPTDriver {
         // 답 없는 종료는 한 번만 새로고침한다 — 다시 30초를 봐도 없으면 오는 게 없다.
         // 배너처럼 세 번 하면 회수 예산(150초)을 다 써서 타임아웃으로 접히고, 그러면
         // 회수 루프가 끝나지 않는다.
+        // 배너는 수집 전체에서 세 번까지, 답 없는 종료는 **그 빈 구간마다** 한 번이다.
         const limit = banner ? MAX_RELOAD_RECOVERIES : 1;
-        if (recoveries >= limit) {
+        const used = banner ? recoveries : Number(emptyReloaded);
+        if (used >= limit) {
           // **무엇이 걸렸는지 남긴다.** 이게 없으면 오탐일 때 원인을 짚을 수 없다.
           if (banner) {
             throw new Error(
@@ -1897,11 +1906,12 @@ export class ChatGPTDriver {
             `생성이 답 없이 끝났습니다 — 새로고침 후에도 중지 버튼도 답도 없습니다 (${interrupt}). 다시 묻습니다.`,
           );
         }
-        recoveries++;
+        if (banner) recoveries++;
+        else emptyReloaded = true;
         console.log(
           chalk.yellow(
             `  ⚠ 연결 중단 감지 ("${interrupt}") — 대화를 새로고침해 완성된 응답을 가져옵니다 ` +
-              `(${recoveries}/${limit})`,
+              `(${used + 1}/${limit})`,
           ),
         );
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
