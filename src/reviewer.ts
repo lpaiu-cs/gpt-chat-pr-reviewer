@@ -249,16 +249,23 @@ export function applySyncEvents(cfg: AppConfig, ctx: PRContext, data: SyncSnapsh
     });
   } else if (ctx.state === 'ERROR') {
     // 재시도를 다 썼다. 횟수는 **그 대상에 대한** 예산이다 — 대상이 바뀌면 새 리뷰라 다시 준다.
-    // 기준은 실패한 시도가 보낸 대상(pendingSend)이고, 없으면 처음 본 지금 값이다.
-    // 한 번도 리뷰되지 않은 PR 은 headShaAtLastReview 가 없어 lastReviewed 로는 못 잰다.
+    // 기준은 예산이 걸린 대상(retryTarget)이고, 처음이면 실패한 시도가 보낸 대상(pendingSend),
+    // 그것도 없으면 지금 값이다. 한 번도 리뷰되지 않은 PR 은 headShaAtLastReview 가 없어
+    // lastReviewed 로는 못 잰다.
     const sent = ctx.pendingSend;
-    ctx.exhaustedTarget ??= sent?.headSha
+    ctx.retryTarget ??= sent?.headSha
       ? { headSha: sent.headSha, baseRef: sent.baseRef }
       : { headSha: data.headSha, baseRef: data.baseRef };
-    const moved = targetChanged(ctx.exhaustedTarget, data);
-    if (moved) fire(ctx, 'RETRY', { note: `${moved} — 재시도 횟수 초기화`, patch: { retryCount: 0 } });
+    const moved = targetChanged(ctx.retryTarget, data);
+    // 새 예산을 준 대상을 **지금** 적는다 — 이후 전송이 실패해 pendingSend 가 옛 대상에 남아도
+    // 다음 소진은 이 대상과 비교한다. 아니면 같은 변경에 예산을 끝없이 다시 준다 (#52 리뷰).
+    if (moved) {
+      fire(ctx, 'RETRY', {
+        note: `${moved} — 재시도 횟수 초기화`,
+        patch: { retryCount: 0, retryTarget: { headSha: data.headSha, baseRef: data.baseRef } },
+      });
+    }
   }
-  if (ctx.state !== 'ERROR') delete ctx.exhaustedTarget;
 
   // 4. 쿼터 쿨다운 종료
   if (
@@ -1348,6 +1355,7 @@ export async function runRound(
         headShaAtLastReview: headSha,
         baseRefAtLastReview: baseRef,
         retryCount: 0,
+        retryTarget: undefined, // 게시했다 — 다음 실패는 그때의 대상으로 예산을 다시 잰다
         lastError: undefined,
         // 게시 전 열린 스레드와 이번 리뷰의 스레드만 기다린다.
         awaitedThreadIds: ctx.awaitedThreadIds,
