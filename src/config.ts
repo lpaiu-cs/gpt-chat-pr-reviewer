@@ -32,7 +32,7 @@ const DEFAULT_PROMPT = `당신은 코드 리뷰어입니다. 아래 GitHub Pull 
 4. 결과를 맨 아래 "출력 형식"의 JSON 하나로만 작성합니다.
 
 **PR에 접근할 수 없다면** (권한 없음·URL 접근 실패 등) 추측해서 리뷰하지 말고,
-summary를 정확히 \`ACCESS_FAILED\` 로, comments를 빈 배열로 출력하세요.
+summary를 \`ACCESS_FAILED: <열지 못한 대상과 실제로 받은 오류>\` 로, comments를 빈 배열로 출력하세요.
 {{previous}}
 {{instructions}}
 

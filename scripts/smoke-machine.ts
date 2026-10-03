@@ -7,7 +7,7 @@
 import chalk from 'chalk';
 import { fire, canFire, IllegalTransitionError, toMermaid } from '../src/state/machine.js';
 import { createContext } from '../src/state/store.js';
-import { parseGPTResponse, isAccessFailure } from '../src/parser.js';
+import { parseGPTResponse, isAccessFailure, accessFailureReason } from '../src/parser.js';
 import { resolveEvent } from '../src/poster.js';
 import {
   ghErrorMessage,
@@ -203,6 +203,10 @@ const fakePR: PRInfo = {
   const denied = parseGPTResponse('{"summary":"ACCESS_FAILED","approval":"comment","comments":[]}');
   assert(denied.parsed && isAccessFailure(denied), 'ACCESS_FAILED 감지');
   assert(!isAccessFailure(good), '정상 응답은 ACCESS_FAILED 아님');
+  assert(accessFailureReason(denied) === '', '이유 없는 옛 ACCESS_FAILED 는 이유가 빈 문자열');
+  const why = parseGPTResponse('{"summary":"ACCESS_FAILED: https://github.com/o/r/pull/1 — 404\\n첨부 — 읽기 성공","approval":"comment","comments":[]}');
+  assert(isAccessFailure(why) && accessFailureReason(why) === 'https://github.com/o/r/pull/1 — 404 첨부 — 읽기 성공',
+    'ACCESS_FAILED 이유를 접두사 없이 한 줄로 꺼낸다');
 }
 
 // ── 시나리오 7: 셀프 리뷰 이벤트 하향 ──────────────────────
