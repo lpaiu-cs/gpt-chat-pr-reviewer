@@ -380,3 +380,37 @@ test('교체 실패 시 기존 상태를 보존하고 손상된 상태를 신규
   assert.throws(() => loadContext(f.cfg, 'o', 'r', 1), /신규 PR로 덮어쓰지/);
   assert.throws(() => listContexts(f.cfg), /신규 PR로 덮어쓰지/);
 }));
+
+test('재시도를 다 쓴 ERROR 는 리뷰 대상이 바뀌면 재시도 횟수를 다시 받는다', async () => fixture(async f => {
+  f.ctx.state = 'ERROR';
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  // 실패한 시도가 보낸 대상 A — 스택 PR 의 옛 base. 베이스 PR 이 머지되며 base 가 main(B)으로 바뀌었다.
+  f.ctx.pendingSend = { round: 1, headSha: head, baseRef: 'stack-base', mergeBaseSha: base, at: new Date().toISOString() };
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  assert.equal(f.ctx.state, 'REVIEW_DUE');
+  assert.equal(f.ctx.retryCount, 0);
+  assert.deepEqual(f.ctx.retryTarget, { headSha: head, baseRef: 'main' }, '새 예산을 준 대상(B)을 적는다');
+
+  // B 로의 재시도가 전송 전에 실패만 거듭해 pendingSend 가 A 에 남은 채 다시 소진됐다 (#52 리뷰).
+  // A 를 기준으로 삼으면 같은 변경에 예산을 끝없이 다시 준다 — B 와 비교해 멈춰야 한다.
+  f.ctx.state = 'ERROR';
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  assert.equal(f.ctx.state, 'ERROR');
+  assert.equal(f.ctx.retryCount, f.cfg.maxAutoRetries);
+
+  // 실제로 대상이 또 바뀌면 그때 다시 받는다.
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: 'c'.repeat(40), baseRef: 'main' });
+  assert.equal(f.ctx.state, 'REVIEW_DUE');
+  assert.match(f.ctx.history.at(-1)!.note ?? '', /새 커밋 감지 — 재시도 횟수 초기화/);
+
+  // 기록이 하나도 없으면 처음 본 값이 기준이다 — 대상이 그대로면 사람이 부를 때까지 기다린다.
+  f.ctx.state = 'ERROR';
+  f.ctx.retryCount = f.cfg.maxAutoRetries;
+  delete f.ctx.pendingSend;
+  delete f.ctx.retryTarget;
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: 'c'.repeat(40), baseRef: 'main' });
+  applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: 'c'.repeat(40), baseRef: 'main' });
+  assert.equal(f.ctx.state, 'ERROR');
+}));

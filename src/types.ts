@@ -222,6 +222,16 @@ export interface PRContext {
    */
   excludedReason?: string;
   retryCount: number;
+  /**
+   * 자동 재시도 예산이 **어느 리뷰 대상에** 걸려 있는지. 재시도를 다 쓴 ERROR 는 대상이
+   * 바뀌면(새 커밋·base 변경) 새 리뷰로 보고 횟수를 다시 받는다 — 없으면 수정을 push 해도
+   * 사람이 "지금 리뷰" 를 누를 때까지 ERROR 에 머문다.
+   *
+   * 예산을 다시 줄 때 **그 대상을 여기 적는다** — 전송 성공과 무관하게. 전송 전에 실패하면
+   * pendingSend 는 옛 대상에 머물러, 그걸 기준으로 삼으면 같은 변경에 예산을 끝없이 다시
+   * 준다 (#52 리뷰). 라운드가 게시되면 지운다.
+   */
+  retryTarget?: { headSha: string; baseRef?: string | null };
   lastError?: string;
   /** QUOTA_BLOCKED 해제 예정 시각 (ISO) */
   quotaRetryAt?: string;
