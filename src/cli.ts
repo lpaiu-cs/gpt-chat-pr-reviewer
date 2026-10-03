@@ -710,7 +710,13 @@ program
      * HTTP 핸들러가 여기까지 들어오지 않는 이유가 이것이다 (intents.ts 참고).
      */
     const applyIntents = async (): Promise<void> => {
-      const queued = intents.drain();
+      // 계정 전환은 브라우저 자체를 바꾼다 — 도는 라운드가 있으면 그것들이 끝날 때까지 미룬다.
+      // 나머지는 진행 중인 라운드가 쥔 것(그 PR 의 ctx)을 건드리지 않으므로 바로 적용한다
+      // (review-now 는 리뷰 중인 PR 을 "이미 리뷰 중" 으로 넘긴다).
+      const drained = intents.drain();
+      const later: Intent[] = pool.live.size > 0 ? drained.filter((i) => i.kind === 'account-switch') : [];
+      if (later.length > 0) intents.defer(later);
+      const queued = drained.filter((i) => !later.includes(i));
       if (queued.length === 0) return;
 
       // **필터 변경을 먼저 전부 적용한 뒤** review-now 를 판정한다.
@@ -808,7 +814,7 @@ program
             if (cfg.maxConcurrentReviews === it.value) break;
             cfg.maxConcurrentReviews = it.value;
             const how = it.value === 0 ? '제한 없음 (대기열 전체)' : `${it.value}건`;
-            console.log(chalk.cyan(`    동시 리뷰 수: ${how} — 다음 사이클부터 적용됩니다.`));
+            console.log(chalk.cyan(`    동시 리뷰 수: ${how} — 빈 슬롯을 채울 때부터 적용됩니다.`));
             try {
               patchConfigFile({ maxConcurrentReviews: it.value });
             } catch (e) {
@@ -821,7 +827,9 @@ program
           }
           case 'stop':
             if (!stopRequested) {
-              console.log(chalk.magenta('    ■ 종료 요청 — 정리하고 나갑니다.'));
+              console.log(chalk.magenta(pool.live.size > 0
+                ? `    ■ 종료 요청 — 진행 중인 리뷰 ${pool.live.size}건을 마친 뒤 나갑니다.`
+                : '    ■ 종료 요청 — 정리하고 나갑니다.'));
             }
             stopRequested = true;
             break;
@@ -1493,12 +1501,9 @@ program
       // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
       takeGraphQLUsage();
 
-      // 제어 의도는 **도는 라운드가 없을 때만** 적용한다 — 라운드가 ctx 를 붙잡고 있고,
-      // 계정 전환은 브라우저 자체를 바꾼다. 의도가 쌓이면 아래에서 새 라운드를 시작하지
-      // 않으므로 진행 중인 라운드가 빠지는 대로 이 자리가 온다 (예전 "다음 배치보다 먼저").
-      // ponytail: 의도 하나가 슬롯 채우기를 라운드 한 번만큼 멈춘다. 그 대기가 아프면
-      // 라운드와 무관한 의도(건너뛰기·일시정지·동시 리뷰 수)만 먼저 적용하도록 나눈다.
-      if (pool.live.size === 0) await applyIntents();
+      // 제어 의도는 진행 중인 라운드를 기다리지 않고 적용한다 — "지금 리뷰" 가 다음 빈 슬롯을
+      // 바로 잡는다. 계정 전환만 도는 라운드가 없을 때까지 미룬다 (applyIntents 참고).
+      await applyIntents();
 
       // 종료가 예약됐으면 **여기서 접는다.** 아래로 내려가면 이 사이클이 또
       // 라운드를 시작해 2~15분을 더 붙잡는다 — 사용자가 종료를 누른 뒤 그만큼
@@ -1557,7 +1562,7 @@ program
         return false;
       }
 
-      // 쌓인 제어 요청이 먼저다 — 새로 시작하지 않고 진행 중인 라운드가 빠지기를 기다린다.
+      // 남은 의도(미뤄 둔 계정 전환)가 먼저다 — 새로 시작하지 않고 진행 중인 라운드가 빠지기를 기다린다.
       if (intents.pending > 0) {
         tally();
         return false;
@@ -1660,6 +1665,8 @@ program
       // 종료 요청은 도는 라운드가 없을 때만 적용된다(applyIntents) — 라운드 중간에
       // 끊으면 이미 소비한 대화 한도로 만든 응답을 버린다.
       if (stopRequested) {
+        // 도는 라운드는 끊지 않는다 — 마지막 라운드의 완료(onRoundSettled)가 이 자리로 다시 온다.
+        if (pool.live.size > 0) return;
         console.log(chalk.magenta('\n  ■ 종료합니다 (요청됨).'));
         await cleanup();
         return;
@@ -1683,8 +1690,11 @@ program
       if (cycleRunning) rerun = true;
       else scheduleNext(0);
     };
-    // 의도는 도는 라운드가 없을 때만 적용된다 — 있으면 마지막 라운드의 완료가 사이클을 부른다.
-    intents.onPending = () => { if (!cycleRunning && pool.live.size === 0) scheduleNext(0); };
+    // 의도가 들어오면 바로 다음 사이클 — "지금 리뷰" 가 폴링 주기를 기다리지 않는다.
+    intents.onPending = () => {
+      if (cycleRunning) rerun = true;
+      else scheduleNext(0);
+    };
 
     await runCycle(); // 첫 사이클 — 다음 예약까지 스스로 한다
 

@@ -857,7 +857,7 @@ function renderControl() {
   // "아직 안 걸렸다" 를, 이 줄이 "언제 걸릴지" 를 맡는다.
   $('f-pending').textContent = ctl.pendingIntents
     ? '적용 대기 ' + ctl.pendingIntents + '건' +
-      (actives().length > 0 ? ' — 진행 중인 라운드가 끝나면 반영됩니다' : ' (다음 스캔에서 반영)')
+      (actives().length > 0 ? ' — 곧 반영됩니다 (계정 전환은 진행 중인 리뷰가 끝난 뒤)' : ' (다음 스캔에서 반영)')
     : '';
 }
 

@@ -42,6 +42,13 @@ import { progress } from './progress.js';
 import { chatgptProjectId } from './config.js';
 
 const RESPONSE_RECOVERY_INTERVAL_MS = 60_000;
+
+/**
+ * 이 크기 이상의 diff 는 응답이 예산을 넘길 수 있다고 미리 알린다 (실측 Pro 추론: 486KB 12분 ·
+ * 1.8MB 39분). 생성이 진행 중이면 예산을 연장하지만, 사람이 "멈췄나" 하고 대화 화면에서
+ * 중지를 누르기 전에 알아야 한다 — 실제로 그렇게 진행 중이던 생성이 끊겼다 (sky-fishing#2).
+ */
+const LARGE_DIFF_BYTES = 1_000_000;
 // 중지 버튼이 DOM에 남은 경우 완료 판정은 본문 정지 120초가 필요하다.
 const RESPONSE_RECOVERY_WAIT_MS = 150_000;
 
@@ -1150,6 +1157,13 @@ async function askChatGPT(
   }
   target.mergeBaseSha = await fetchMergeBase(ctx.owner, ctx.repo, target.baseRef, target.headSha);
   const diff = await fetchDiffAt(ctx.owner, ctx.repo, target.mergeBaseSha, target.headSha);
+  const diffBytes = Buffer.byteLength(diff, 'utf8');
+  if (diffBytes >= LARGE_DIFF_BYTES) {
+    console.log(chalk.yellow(
+      `  ⚠ diff 가 큽니다 (${(diffBytes / 1_000_000).toFixed(1)}MB) — 응답이 ${Math.round(cfg.responseTimeoutMs / 60_000)}분 예산을 ` +
+        '넘을 수 있습니다. 생성이 진행 중이면 예산을 연장해 기다리니 대화 화면에서 중지(■)를 누르지 마세요.',
+    ));
+  }
   // ponytail: 100k자는 편집기 부하를 피하는 전환점이지 서비스 한도가 아니다.
   // 큰 diff도 생략 없이 전달한다. 첨부 한도에 걸리면 PR을 나누어야 한다.
   // 이름은 전송마다 달라야 한다. 같은 이름이 이미 올라가 있으면 ChatGPT 가 "…(4).txt" 로
