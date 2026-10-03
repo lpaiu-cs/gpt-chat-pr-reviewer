@@ -579,6 +579,7 @@ lingering 에서 빠지므로 그 레포가 스캔 대상에서 통째로 사라
 ```sh
 npm install
 npm run smoke        # 상태 머신 테스트
+npm test             # 단위 테스트 (tsx --test 를 직접 부르면 tests/stdout-guard.ts 가 빠진다)
 npm run dev -- init  # 설정 + instructions.md 생성
 npm run dev -- review <pr-url> [--dry-run|--force]
 npm run dev -- serve [--once|--headless|--observe|--ui|--ui-port <port>]
