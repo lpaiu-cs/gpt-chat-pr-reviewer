@@ -938,6 +938,10 @@ program
       release: () => releaseTabs(),
       run: (e, tab, index, total) => runQueued(e, index, total, tab),
       settled: (e, outcome) => settleRound(e, outcome),
+      // 사이클 시작의 게이트와 같은 조건을 **라운드마다** 다시 본다 — 슬롯 채우기는 사이클 밖
+      // (라운드 완료·--once 의 drain)에서도, 탭을 빌리는 대기 뒤에도 일어난다 (#53 리뷰).
+      canStart: () => !stopRequested && !paused && !accountSwitch.blocked &&
+        intents.pending === 0 && Date.now() >= quotaUntil,
       onLeaseError: (e, remaining) => {
         const why = (e instanceof Error ? e.message : String(e)).split('\n')[0];
         console.log(chalk.yellow(`  ⚠ 추가 탭 준비 실패 — ${remaining}건은 다음 스캔에서 다시 채웁니다: ${why}`));
@@ -1562,7 +1566,8 @@ program
       let started = await pool.fill(queue);
       while (drain && pool.rounds.size > 0) {
         await Promise.race(pool.rounds);
-        if (Date.now() >= quotaUntil) started += await pool.fill(queue); // 한도에 걸렸으면 남은 것만 기다린다
+        // 한도·중지·일시정지가 걸렸으면 fill 이 시작하지 않는다 — 남은 라운드만 기다린다.
+        started += await pool.fill(queue);
       }
 
       // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.
