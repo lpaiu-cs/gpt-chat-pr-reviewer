@@ -62,6 +62,7 @@ import {
   QUEUE_REASON_LABELS,
   type QueueEntry,
 } from './queue.js';
+import { createRoundPool } from './pool.js';
 import { progress, type ContextCard, type QueueItem } from './progress.js';
 import { intents, type Intent } from './intents.js';
 import { startUIServer, type UIServerHandle } from './ui/server.js';
@@ -913,8 +914,42 @@ program
       publishControl();
     };
 
-    /** 지금 배치에서 동시에 도는 라운드 수 — 터미널 로그에 꼬리표를 달지 판단한다. */
-    let batchSize = 1;
+    /**
+     * 진행 중인 라운드 — 정규화 키 → 그 라운드가 붙잡은 컨텍스트 객체.
+     *
+     * **슬롯이 비면 바로 채운다** (`fill`). 예전에는 N건을 한꺼번에 시작하고 N건이 다
+     * 끝나야 다시 스캔했다 — 라운드 편차가 2~25분이라 가장 느린 1건이 나머지 슬롯을
+     * 통째로 묶었다. 그래서 이제 스캔이 라운드와 겹친다.
+     *
+     * 겹쳐도 되는 조건은 하나다: **진행 중인 PR 은 스캔이 손대지 않는다** (scan 이 이
+     * 맵으로 걸러 낸다). 같은 PR 의 파일을 두 경로가 read-modify-write 하면 서로의 결과를
+     * 덮어쓰고, 특히 syncPR 은 REVIEWING 을 "크래시 잔여" 로 보고 실패 처리한다 —
+     * 사이클이 겹쳐 같은 PR 을 두 번 리뷰했던 f34146b 의 사고가 정확히 이 축이다.
+     * 탭은 라운드마다 따로이고 진입·입력은 withTurn 이 한 줄로 세운다.
+     *
+     * **로그 꼬리표 판단보다 먼저 선언한다** — console 감싸기가 첫 줄부터 이걸 읽는다.
+     */
+    const liveKey = (c: Pick<PRContext, 'owner' | 'repo' | 'prNumber'>): string => ctxKey(c).toLowerCase();
+    const pool = createRoundPool<QueueEntry, ChatGPTDriver | null>({
+      key: (e) => liveKey(e.ctx),
+      // 제한 없음(0)은 사실상 무한이다 — reviewBatchSize 의 해석을 그대로 쓴다.
+      capacity: () => reviewBatchSize(cfg.maxConcurrentReviews, Number.MAX_SAFE_INTEGER),
+      lease: (slot) => leaseTab(slot),
+      release: () => releaseTabs(),
+      run: (e, tab, index, total) => runQueued(e, index, total, tab),
+      settled: (e, outcome) => settleRound(e, outcome),
+      // 사이클 시작의 게이트와 같은 조건을 **라운드마다** 다시 본다 — 슬롯 채우기는 사이클 밖
+      // (라운드 완료·--once 의 drain)에서도, 탭을 빌리는 대기 뒤에도 일어난다 (#53 리뷰).
+      canStart: () => !stopRequested && !paused && !accountSwitch.blocked &&
+        intents.pending === 0 && Date.now() >= quotaUntil,
+      onLeaseError: (e, remaining) => {
+        const why = (e instanceof Error ? e.message : String(e)).split('\n')[0];
+        console.log(chalk.yellow(`  ⚠ 추가 탭 준비 실패 — ${remaining}건은 다음 스캔에서 다시 채웁니다: ${why}`));
+      },
+    });
+    /** 진행 중인 PR 의 컨텍스트 — 그 라운드가 쥔 객체다. 스캔은 이걸 건드리지 않는다. */
+    const liveCtx = (c: Pick<PRContext, 'owner' | 'repo' | 'prNumber'>): PRContext | undefined =>
+      pool.live.get(liveKey(c))?.ctx;
 
     // ── 터미널 로그 꼬리표 ──
     // 동시에 둘 이상 돌면 여러 라운드의 출력이 한 줄씩 번갈아 섞여서, 어느 PR 의
@@ -927,7 +962,7 @@ program
     const rawLog = console.log;
     const rawErr = console.error;
     const withTag = (args: unknown[]): unknown[] => {
-      if (batchSize <= 1) return args;
+      if (pool.live.size <= 1) return args;
       const key = progress.currentReview();
       if (!key) return args;
       return [chalk.dim(`[${key.split('/').pop()}]`), ...args];
@@ -1130,7 +1165,9 @@ program
       // 반환 순서(번호 내림차순)에 끌려가지 않게 한다 (createContext 주석 참고).
       const scanAt = new Date(now).toISOString();
       const discovered = await repoSource.list();
-      const all = listContexts(cfg);
+      // 진행 중인 PR 은 디스크 사본 대신 라운드가 쥔 객체를 쓴다 — 아래에서 건드리지 않고
+      // 화면에만 그대로 싣는다 (pool 주석 참고).
+      const all = listContexts(cfg).map((c) => liveCtx(c) ?? c);
 
       // GitHub 슬러그는 대소문자를 구분하지 않는다. 컨텍스트에 낡은 케이싱이
       // 남아 있으면 정확한 문자열 비교로는 "발견 목록에 없다" 고 오판해 같은
@@ -1191,6 +1228,7 @@ program
           // 들쭉날쭉해진다. 새 정보가 없을 뿐 판정이 바뀐 게 아니다.
           openCount += lastOpenAt.get(repoSlug) ?? tracked.length;
           for (const c of tracked) {
+            if (liveCtx(c)) { seen.push(c); continue; }
             // excludedReason 은 probe 경로에서만 갱신된다. 건너뛰는 동안 사용자가
             // 건너뛰기/이것만을 눌렀다면 그 값은 낡았고, 그대로 믿으면 **방금 제외한
             // PR 을 리뷰해 버린다.** skip 은 "확실히 하지 말 것" 이라 즉시 들어야 한다.
@@ -1227,6 +1265,8 @@ program
         // 추적 중이지만 열린 목록에 없는 PR → 닫힘 확인 (여기서만 개별 조회)
         for (const c of tracked) {
           if (!probe.prs.some((p) => p.number === c.prNumber)) {
+            // 닫힘은 그 라운드가 끝난 뒤 다음 스캔이 잡는다.
+            if (liveCtx(c)) { seen.push(c); continue; }
             await syncPR(cfg, c);
             reportIfChanged(c);
             seen.push(c);
@@ -1234,6 +1274,8 @@ program
         }
 
         for (const pr of probe.prs) {
+          const live = liveCtx({ owner: pr.owner, repo: pr.repo, prNumber: pr.number });
+          if (live) { seen.push(live); continue; }
           const existing = loadContext(cfg, pr.owner, pr.repo, pr.number);
           const verdict = passesFilters(pr, scope.filters);
 
@@ -1353,8 +1395,8 @@ program
      * 넣은 프롬프트가 다른 쪽 입력창에 들어가고, 전송 버튼 자리의 중지 버튼을
      * 눌러 남의 생성을 끊는다.
      *
-     * 빌린 탭은 **배치가 끝나면 반납한다**(`releaseTabs`). 들고 있으면 제한 없음으로
-     * 한 번 크게 돌린 뒤 수십 개가 데몬이 죽을 때까지 살아남아 메모리를 붙잡는다.
+     * 빌린 탭은 **도는 라운드가 하나도 없을 때 반납한다**(`releaseTabs`). 들고 있으면 제한
+     * 없음으로 한 번 크게 돌린 뒤 수십 개가 데몬이 죽을 때까지 살아남아 메모리를 붙잡는다.
      * 다시 여는 값은 수백 ms 인데 라운드는 2~25분이라, 재사용해서 아낄 것이 없다.
      */
     const extraTabs: ChatGPTDriver[] = [];
@@ -1364,18 +1406,16 @@ program
       return extraTabs[slot - 1];
     };
     const releaseTabs = async (): Promise<void> => {
-      while (extraTabs.length > 0) await extraTabs.pop()?.close();
+      // 목록을 **먼저 비운다.** 하나씩 꺼내며 닫으면 닫는 동안 남은 탭을 fill 이 빌려 간다.
+      for (const tab of extraTabs.splice(0)) await tab.close();
     };
 
     /**
      * 큐 1건 실행 — 헤더 출력부터 라운드 종료까지.
      *
-     * @param onDone 이 라운드가 끝난 직후 (성공·실패 무관) 호출된다.
-     *
-     * **배치가 다 끝나기를 기다리지 않는다.** 동시 실행이면 `Promise.all` 이
-     * 배치 전체를 묶으므로, 뒤처리를 배치 끝에서만 하면 먼저 끝난 라운드의
-     * 결과(수렴·게시·큐에서 빠짐)가 가장 느린 라운드가 끝날 때까지 화면에
-     * 나오지 않는다. 라운드 편차가 2~15분이라 그 지연이 그대로 체감된다 —
+     * 뒤처리(settleRound)는 **그 라운드가 끝날 때** 한다. 동시 실행을 배치로 묶어
+     * 끝에서만 하면 먼저 끝난 라운드의 결과(수렴·게시·큐에서 빠짐)가 가장 느린
+     * 라운드가 끝날 때까지 화면에 나오지 않았다. 라운드 편차가 2~15분이라 그 지연이 그대로 체감된다 —
      * 로그에는 "응답 수신 완료"·"리뷰 게시 완료" 가 이미 흐르는데 대시보드만
      * 멎어 있어 사람이 "멈춘 건가" 로 읽는다.
      */
@@ -1384,7 +1424,6 @@ program
       index: number,
       total: number,
       tab: ChatGPTDriver | null,
-      onDone: () => void,
     ): Promise<RoundOutcome> => {
       const { ctx, reason } = entry;
       console.log(
@@ -1412,26 +1451,54 @@ program
           chalk.red(`  ✗ 라운드가 예외로 끝났습니다: ${e instanceof Error ? e.message : String(e)}`),
         );
         return 'failed';
-      } finally {
-        // 실패한 라운드도 알린다 — ERROR 배지와 재시도 대기가 화면에 나와야 한다.
-        // 알림 자체가 실패해도 라운드 결과를 삼키지 않는다.
-        try {
-          onDone();
-        } catch (e) {
-          console.error(
-            chalk.red(`  ✗ 화면 갱신 실패: ${e instanceof Error ? e.message : String(e)}`),
-          );
-        }
       }
     };
 
+    /** 라운드가 끝날 때마다 부른다 — watch 는 여기서 빈 슬롯을 바로 채우고 결과를 화면에 낸다. */
+    let onRoundSettled: () => void = () => {};
+
+    /** 한도는 계정 단위라 남은 큐도 지금은 못 돈다. 버리지 않고 미룬다. */
+    const noteQuota = (): void => {
+      if (Date.now() < quotaUntil) return; // 같이 돌던 라운드들이 한꺼번에 걸려도 한 번만 알린다
+      quotaUntil = Date.now() + cfg.quotaCooldownMs;
+      quotaNotified = Date.now();
+      progress.patch({ quotaUntil });
+      console.log(
+        chalk.yellow(
+          `\n  ⚠ 쿼터 한도 도달 — 큐를 보존하고 ${new Date(quotaUntil).toLocaleString('ko-KR')} 이후 재개합니다.`,
+        ),
+      );
+    };
+
+    /**
+     * 라운드 1건의 뒤처리 — 슬롯이 빈 직후, 성공·실패 무관. 다른 라운드를 기다리지 않는다.
+     * 실패한 라운드도 다음 사이클이 ERROR 배지와 재시도 대기를 화면에 낸다.
+     */
+    const settleRound = (entry: QueueEntry, outcome: string): void => {
+      reported.set(ctxKey(entry.ctx), ctxSignature(entry.ctx));
+      // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
+      prioritized.delete(parsePRRef(ctxKey(entry.ctx)) ?? '');
+      if (outcome === 'quota') noteQuota();
+      onRoundSettled();
+    };
+
+    /**
+     * 한 사이클 — 스캔하고 빈 슬롯을 채운다. 라운드를 1건이라도 시작했으면 true.
+     *
+     * 라운드를 기다리지 않는다 (pool 주석). drain=true(--once)만 이 스캔의 큐를 끝까지
+     * 비운다 — 슬롯이 비는 대로 같은 큐에서 채우고, 다시 스캔하지 않는다.
+     */
     const loop = async (drain: boolean): Promise<boolean> => {
       // 사이클 시작 시점에 카운터를 비운다. 레포 탐색·probe 뿐 아니라 폴백 전체
       // 동기화·닫힘 확인·게시 후 동기화까지 모든 GraphQL 경로가 여기에 집계된다.
       takeGraphQLUsage();
 
-      // 제어 의도는 스캔 직전에만 적용한다 — 라운드가 돌지 않는 유일한 지점이다.
-      await applyIntents();
+      // 제어 의도는 **도는 라운드가 없을 때만** 적용한다 — 라운드가 ctx 를 붙잡고 있고,
+      // 계정 전환은 브라우저 자체를 바꾼다. 의도가 쌓이면 아래에서 새 라운드를 시작하지
+      // 않으므로 진행 중인 라운드가 빠지는 대로 이 자리가 온다 (예전 "다음 배치보다 먼저").
+      // ponytail: 의도 하나가 슬롯 채우기를 라운드 한 번만큼 멈춘다. 그 대기가 아프면
+      // 라운드와 무관한 의도(건너뛰기·일시정지·동시 리뷰 수)만 먼저 적용하도록 나눈다.
+      if (pool.live.size === 0) await applyIntents();
 
       // 종료가 예약됐으면 **여기서 접는다.** 아래로 내려가면 이 사이클이 또
       // 라운드를 시작해 2~15분을 더 붙잡는다 — 사용자가 종료를 누른 뒤 그만큼
@@ -1490,78 +1557,25 @@ program
         return false;
       }
 
-      let reviewRan = false;
-      for (let i = 0; i < queue.length; ) {
-        // 이번에 한꺼번에 돌릴 만큼 끊는다. 기본 1 — 순차 처리다.
-        const batch = queue.slice(i, i + reviewBatchSize(cfg.maxConcurrentReviews, queue.length - i));
+      // 쌓인 제어 요청이 먼저다 — 새로 시작하지 않고 진행 중인 라운드가 빠지기를 기다린다.
+      if (intents.pending > 0) {
+        tally();
+        return false;
+      }
 
-        // 탭은 **시작 전에** 순서대로 빌린다. 실행 중에 빌리면 두 슬롯이 같은
-        // 순간에 같은 탭을 만들려 들어 어느 쪽이 어느 탭을 받았는지 흐려진다.
-        const tabs: (ChatGPTDriver | null)[] = [];
-        for (let slot = 0; slot < batch.length; slot++) {
-          try {
-            tabs.push(await leaseTab(slot));
-          } catch (e) {
-            // 추가 탭을 못 열면 남은 PR 은 **라운드를 시작하지 않고** 다음 배치로 미룬다
-            // (슬롯 0 은 처음 띄운 탭이라 여기서 실패하지 않는다). 라운드 안에서 실패하면
-            // 탭 사정인데도 PR 이 오류·재시도 횟수·5분 대기를 떠안는다.
-            const why = (e instanceof Error ? e.message : String(e)).split('\n')[0];
-            console.log(chalk.yellow(`  ⚠ 추가 탭 준비 실패 — ${batch.length - slot}건은 다음 배치로 미룹니다: ${why}`));
-            batch.splice(slot);
-            break;
-          }
-        }
-
-        batchSize = batch.length; // 1보다 크면 로그에 어느 PR 의 줄인지 꼬리표가 붙는다
-
-        /**
-         * 라운드 1건의 뒤처리. **배치 끝이 아니라 그 라운드가 끝날 때** 한다.
-         *
-         * 컨텍스트는 runRound 가 제자리에서 갱신하므로(`seen`·`eligible` 이 같은
-         * 객체를 들고 있다) 여기서 다시 만들 필요 없이 그대로 내보내면 된다.
-         */
-        const settle = (entry: QueueEntry): void => {
-          reported.set(ctxKey(entry.ctx), ctxSignature(entry.ctx));
-          // 앞당기기는 1회성이다 — 돌고 나면 평소 우선순위로 돌아간다.
-          prioritized.delete(parsePRRef(ctxKey(entry.ctx)) ?? '');
-          publish(seen, buildQueue(eligible), openCount, quotaUntil);
-        };
-
-        let outcomes: RoundOutcome[];
-        try {
-          outcomes = await Promise.all(
-            batch.map((entry, slot) =>
-              runQueued(entry, i + slot, queue.length, tabs[slot], () => settle(entry)),
-            ),
-          );
-        } finally {
-          batchSize = 1;
-          await releaseTabs(); // 유휴 탭을 남기지 않는다 (다음 배치가 다시 연다)
-        }
-        i += batch.length;
-        reviewRan = true;
-
-        if (outcomes.includes('quota')) {
-          // 한도는 계정 단위라 남은 큐도 지금은 못 돈다. 버리지 않고 미룬다.
-          quotaUntil = Date.now() + cfg.quotaCooldownMs;
-          quotaNotified = Date.now();
-          progress.patch({ quotaUntil });
-          console.log(
-            chalk.yellow(
-              `\n  ⚠ 쿼터 한도 도달 — 남은 큐 ${queue.length - i}건을 보존하고 ` +
-                `${new Date(quotaUntil).toLocaleString('ko-KR')} 이후 재개합니다.`,
-            ),
-          );
-          break;
-        }
-        if (!drain || intents.pending > 0) break; // 제어 요청은 다음 배치보다 먼저 적용
+      let started = await pool.fill(queue);
+      while (drain && pool.rounds.size > 0) {
+        await Promise.race(pool.rounds);
+        // 한도·중지·일시정지가 걸렸으면 fill 이 시작하지 않는다 — 남은 라운드만 기다린다.
+        started += await pool.fill(queue);
       }
 
       // 사이클이 끝난 뒤에 집계한다 — 폴백 동기화 비용까지 포함된다.
+      // (겹쳐 도는 라운드의 게시 후 동기화도 여기 섞인다 — 다음 주기가 조금 보수적이 될 뿐이다.)
       const cost = tally();
 
       // 아무 변화 없이 조용한 구간에서도 살아있음을 알린다
-      if (!reviewRan && Date.now() - lastHeartbeat > HEARTBEAT_MS) {
+      if (started === 0 && pool.live.size === 0 && Date.now() - lastHeartbeat > HEARTBEAT_MS) {
         lastHeartbeat = Date.now();
         const at = new Date().toLocaleTimeString('ko-KR');
         const budget = lastRemaining >= 0 ? ` · 시간당 한도 ${lastRemaining.toLocaleString()}` : '';
@@ -1572,7 +1586,7 @@ program
         );
       }
 
-      return reviewRan;
+      return started > 0;
     };
 
     /**
@@ -1610,56 +1624,18 @@ program
       releaseLock();
       return;
     }
-    try {
-      await loop(false);
-    } catch (e) {
-      console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
-    }
 
-    // 사이클이 끝난 뒤에 다음 스캔을 예약한다.
+    // 다음 스캔은 사이클이 끝난 뒤에만 예약한다 — **사이클끼리는** 겹치지 않는다.
     //
     // setInterval 은 리뷰 한 건이 폴링 간격보다 오래 걸릴 때 (실측 9~15분 vs 5분)
     // 사이클을 겹치게 만들었다. 겹친 사이클들은 같은 PR 을 동시에 리뷰해 중복
     // 리뷰를 게시하고, 브라우저 페이지 하나를 서로 다투다 전송·수신에도 실패했다.
+    // 라운드는 이제 사이클과 겹치지만, 같은 PR 은 pool 이 막고 탭은 라운드마다 따로다.
     let stopped = false;
     let timer: NodeJS.Timeout | null = null;
     let cycleRunning = false;
-
-    // 리뷰를 실행한 사이클 직후에는 대기 없이 재스캔한다.
-    // 라운드는 2~15분 걸리므로 그 사이에 쌓인 변화를 바로 확인해야 한다.
-    // (이걸 안 하면 15분 라운드 뒤 다시 폴링 주기를 기다려 꼬리 지연이 붙는다)
-    const scheduleNext = (delayMs: number): void => {
-      if (stopped) return;
-      if (timer) clearTimeout(timer);
-      progress.cycle({ nextScanAt: Date.now() + delayMs });
-      timer = setTimeout(async () => {
-        if (stopped) return;
-        cycleRunning = true;
-        let reviewRan = false;
-        try {
-          reviewRan = await loop(false);
-        } catch (e) {
-          console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
-        }
-        cycleRunning = false;
-        // 종료 요청은 사이클이 완전히 끝난 뒤에만 처리한다 — 라운드 중간에
-        // 끊으면 이미 소비한 대화 한도로 만든 응답을 버린다.
-        if (stopRequested) {
-          console.log(chalk.magenta('\n  ■ 종료합니다 (요청됨).'));
-          await cleanup();
-          return;
-        }
-        scheduleNext(reviewRan || intents.pending > 0 ? 0 : nextDelay());
-      }, delayMs);
-    };
-
-    console.log(
-      chalk.dim(
-        `\n  ${formatDuration(cfg.watchIntervalMs)}마다 스캔합니다 (리뷰 직후에는 즉시 재스캔). Ctrl+C 로 종료.\n`,
-      ),
-    );
-    intents.onPending = () => { if (!cycleRunning) scheduleNext(0); };
-    scheduleNext(intents.pending > 0 || stopRequested ? 0 : nextDelay());
+    /** 사이클 도중에 라운드가 끝났다 — 이 사이클이 끝나는 대로 한 번 더 돈다. */
+    let rerun = false;
 
     const cleanup = async () => {
       stopped = true;
@@ -1670,6 +1646,53 @@ program
       releaseLock();
       process.exit(0);
     };
+
+    const runCycle = async (): Promise<void> => {
+      if (stopped) return;
+      if (cycleRunning) { rerun = true; return; }
+      cycleRunning = true;
+      try {
+        await loop(false);
+      } catch (e) {
+        console.error(chalk.red('  ✗ 스캔 실패:'), e instanceof Error ? e.message : String(e));
+      }
+      cycleRunning = false;
+      // 종료 요청은 도는 라운드가 없을 때만 적용된다(applyIntents) — 라운드 중간에
+      // 끊으면 이미 소비한 대화 한도로 만든 응답을 버린다.
+      if (stopRequested) {
+        console.log(chalk.magenta('\n  ■ 종료합니다 (요청됨).'));
+        await cleanup();
+        return;
+      }
+      // 라운드가 끝났거나 적용할 의도가 있으면 대기 없이 — 빈 슬롯 채우기와 결과 반영이
+      // 폴링 주기만큼 늦지 않게 한다.
+      const now = rerun || (intents.pending > 0 && pool.live.size === 0);
+      rerun = false;
+      scheduleNext(now ? 0 : nextDelay());
+    };
+
+    const scheduleNext = (delayMs: number): void => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      progress.cycle({ nextScanAt: Date.now() + delayMs });
+      timer = setTimeout(() => void runCycle(), delayMs);
+    };
+
+    // 라운드가 끝나면 바로 다음 사이클 — 빈 슬롯을 채우고 결과를 화면에 낸다.
+    onRoundSettled = () => {
+      if (cycleRunning) rerun = true;
+      else scheduleNext(0);
+    };
+    // 의도는 도는 라운드가 없을 때만 적용된다 — 있으면 마지막 라운드의 완료가 사이클을 부른다.
+    intents.onPending = () => { if (!cycleRunning && pool.live.size === 0) scheduleNext(0); };
+
+    await runCycle(); // 첫 사이클 — 다음 예약까지 스스로 한다
+
+    console.log(
+      chalk.dim(
+        `\n  ${formatDuration(cfg.watchIntervalMs)}마다 스캔합니다 (리뷰 슬롯이 비면 즉시 채웁니다). Ctrl+C 로 종료.\n`,
+      ),
+    );
     process.on('SIGINT', cleanup);
     process.on('SIGTERM', cleanup);
   });
