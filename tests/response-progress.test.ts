@@ -105,3 +105,27 @@ test('생성 표시도 답도 없으면 한 번 새로고침한 뒤 GenerationEn
   await assert.rejects(make(1).collectResponse(page, 0, null, 60_000), ResponseTimeoutError);
   assert.equal(reloads, 0);
 });
+
+test('앞선 중단을 복구한 이력으로 이번 빈 구간을 새로고침 없이 종료로 확정하지 않는다 (#51 리뷰)', async (t) => {
+  let now = 1_000;
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(console, 'log', () => {});
+  let reloads = 0;
+  let resumeUntil = 0;
+  const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 }) as any;
+  // 30초 생성 → 배너로 끊김 → 새로고침 뒤 30초 더 생성 → 배너 없이 버튼·답이 사라진다.
+  driver.isStreaming = async () => now < 31_000 || (reloads === 1 && now < resumeUntil);
+  driver.interruptedBanner = async () => (reloads === 0 && now >= 31_000 ? 'Connection interrupted' : null);
+  driver.detectQuotaLimit = async () => null;
+  driver.dumpStopButtons = async () => 'fixture';
+  driver.uiTextTail = async () => '';
+  const page = {
+    waitForTimeout: async (ms: number) => { now += ms; },
+    reload: async () => { reloads++; if (reloads === 1) resumeUntil = now + 36_000; },
+    evaluate: async () => [{ role: 'user', id: 'question' }],
+    locator: () => ({ locator: () => ({ count: async () => 0, allInnerTexts: async () => [] }) }),
+  };
+  await assert.rejects(driver.collectResponse(page, 0, null), GenerationEndedError);
+  // 배너 복구 1회 + 이번 빈 구간의 재확인 1회. 이력만 보고 바로 던지면 1이다.
+  assert.equal(reloads, 2);
+});
