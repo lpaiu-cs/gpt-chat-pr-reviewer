@@ -211,6 +211,9 @@ test('matchInterrupt: 진짜 배너 문구는 잡는다', () => {
     'waiting for the complete answer',
   );
   assert.equal(matchInterrupt('연결이 중단되었습니다. 다시 시도하세요.'), '연결이 중단되었습니다');
+  // 2026-10 화면의 실측 문구 — 두 문장 중 어느 쪽만 보여도 잡는다.
+  assert.equal(matchInterrupt('연결이 해제되었습니다. 전체 답변을 기다리는 중입니다.'), '연결이 해제되었습니다');
+  assert.equal(matchInterrupt('… 전체 답변을 기다리는 중입니다.'), '전체 답변을 기다리는 중');
 });
 
 test('matchInterrupt: 리뷰 본문에 나올 법한 평범한 문장은 잡지 않는다', () => {
@@ -221,6 +224,8 @@ test('matchInterrupt: 리뷰 본문에 나올 법한 평범한 문장은 잡지 
     '소켓 연결이 끊기면 재연결을 시도하세요.',
     '연결이 중단될 때의 복구 경로가 없습니다.',
     '완전한 답변을 기다리는 대신 스트리밍으로 바꾸는 편이 낫습니다.',
+    '세션 연결이 해제되면 재시도하세요.',
+    '전체 답변을 기다리지 않고 부분 응답을 그대로 씁니다.',
     'The client keeps waiting for the complete response before rendering.',
   ]) {
     assert.equal(matchInterrupt(prose), null, prose);
