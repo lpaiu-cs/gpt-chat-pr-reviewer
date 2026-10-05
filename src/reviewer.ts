@@ -910,7 +910,7 @@ export interface RunRoundOptions {
  *    전송의 회수를 막으면 같은 질문이 또 나간다
  *  - **리뷰 대상이 달라짐**  새 커밋 또는 base 변경 — 낡은 diff 를 보고 만든 답이다
  *  - 복귀 실패          대화가 삭제·이동됐다
- *  - 그 라운드가 마지막 질문이 아님  어느 응답이 그 라운드 것인지 단정할 수 없다
+ *  - 후속 질문의 답이 리뷰 형식·고정 대상과 맞지 않음  다른 응답을 원래 리뷰로 쓰지 않는다
  */
 async function reclaimRound(
   cfg: AppConfig,
@@ -961,7 +961,12 @@ async function reclaimRound(
   // 정확히 그 모습이고, 여기서 실패로 보면 이 복구가 통째로 무의미해진다.
   if (!(await driver.resumeChat(url, { requireAssistant: false }))) return null;
 
-  const baseline = await driver.findRound(marker);
+  const baseline = await driver.findRound(marker, ctx.pendingSend?.ended === true, raw => {
+    const result = parseGPTResponse(raw);
+    if (!result.parsed || isAccessFailure(result)) return false;
+    try { assertReviewedTarget(result, sent); return true; }
+    catch { return false; }
+  });
   if (baseline === null) return null;
 
   console.log(chalk.dim('  이 라운드 질문이 대화에 이미 있습니다 — 재질문 없이 응답만 회수합니다.'));
@@ -1406,9 +1411,12 @@ export async function runRound(
     // (같은 답을 다시 써도 결과가 같다)와 같은 붉은 "리뷰 실패" 로 뭉치면, 로그만
     // 보고는 무엇이 잘못됐는지 구분할 수 없다. 상태 전이는 같지만 표기를 나눈다.
     const timedOut = e instanceof ResponseTimeoutError;
-    // 끝난 생성은 회수할 답이 없다 — 전송 기록을 버려야 회수 루프가 멈추고 다음 시도가 다시 묻는다.
-    // 남겨 두면 회수가 대화의 같은 질문을 찾아 답 없는 자리를 계속 기다린다.
-    if (e instanceof GenerationEndedError) delete ctx.pendingSend;
+    // 사용자가 이어받은 답도 리뷰 형식·원래 대상 검증을 거쳐 회수할 수 있게 기록은 남긴다.
+    // 빈 응답은 다시 묻되 무기한 회수는 중단하고, 일반 재시도 예산을 따른다.
+    if (e instanceof GenerationEndedError && ctx.pendingSend) {
+      ctx.pendingSend.ended = true;
+      delete ctx.pendingSend.recoverAfter;
+    }
     const recovering = canRecoverResponse(cfg, ctx) && (timedOut || !!ctx.pendingSend?.recoverAfter);
     if (recovering) {
       ctx.pendingSend!.recoverAfter = new Date(Date.now() + RESPONSE_RECOVERY_INTERVAL_MS).toISOString();

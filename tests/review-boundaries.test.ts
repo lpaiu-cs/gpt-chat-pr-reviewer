@@ -11,7 +11,7 @@ import { runRound, syncPR, applySyncEvents } from '../src/reviewer.js';
 import { parseGPTResponse } from '../src/parser.js';
 import type { AppConfig, PRContext } from '../src/types.js';
 import type { ChatGPTDriver, PromptAttachment } from '../src/chatgpt.js';
-import { ResponseTimeoutError } from '../src/chatgpt.js';
+import { findRoundBaseline, GenerationEndedError, ResponseTimeoutError } from '../src/chatgpt.js';
 
 const head = 'a'.repeat(40), base = 'b'.repeat(40);
 const diff = 'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-old\n+new\n';
@@ -153,6 +153,119 @@ test('사용자 템플릿에 라운드 마커가 없어도 실제 전송한 식�
   assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'posted');
   assert.equal(f.controls.prompts.length, 1);
   assert.equal(f.posts.length, 1);
+}));
+
+test('답 없는 종료 뒤 자연어로 이어받은 리뷰는 재시작 후에도 재전송 없이 원래 대상에 게시한다', async () => fixture(async f => {
+  const send = f.driver.sendAndCollect.bind(f.driver);
+  let answer = '';
+  f.driver.sendAndCollect = async (...args) => {
+    answer = await send(...args);
+    throw new GenerationEndedError('생성이 답 없이 끝났습니다');
+  };
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  const ctx = loadContext(f.cfg, 'o', 'r', 1)!;
+  assert.equal(ctx.pendingSend?.ended, true);
+  assert.equal(ctx.pendingSend?.recoverAfter, undefined, '무기한 회수로 승격하지 않는다');
+  applySyncEvents(f.cfg, ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+  assert.equal(ctx.retryCount, 1, '일반 재시도 예산을 소비한다');
+  f.driver.resumeChat = async () => true;
+  f.driver.findRound = async (marker, requireResponse, acceptFollowup) => {
+    assert.equal(requireResponse, true);
+    assert.equal(typeof acceptFollowup, 'function');
+    return findRoundBaseline([
+      { role: 'user', text: f.controls.prompts[0] },
+      { role: 'assistant', text: '' },
+      { role: 'user', text: '중단된 리뷰를 이어서 마무리해줘' },
+      { role: 'assistant', text: answer },
+    ], marker, requireResponse, acceptFollowup);
+  };
+  f.driver.collectFrom = async baseline => { assert.equal(baseline, 1); return answer; };
+  assert.equal(await runRound(f.cfg, f.driver, ctx), 'posted');
+  assert.equal(f.controls.prompts.length, 1);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].commit_id, head);
+  assert.equal(ctx.pendingSend, undefined);
+}));
+
+test('후속 답의 형식·대상이 틀리거나 ACCESS_FAILED이면 회수하지 않고 새로 묻는다', async () => {
+  const review = { summary: 'ok', approval: 'approve', comments: [], reviewedHeadSha: head, reviewedBaseSha: base };
+  for (const raw of [
+    '일반 대화 답변', '{"summary":',
+    JSON.stringify({ ...review, comments: [{ path: 'x.ts', line: 0, body: 'bad' }] }),
+    JSON.stringify({ ...review, reviewedHeadSha: 'c'.repeat(40) }),
+    JSON.stringify({ ...review, reviewedBaseSha: 'c'.repeat(40) }),
+    JSON.stringify({ summary: 'ok', approval: 'approve', comments: [] }),
+    JSON.stringify({ ...review, summary: 'ACCESS_FAILED: 첨부 — 읽기 실패' }),
+  ]) await fixture(async f => {
+    const send = f.driver.sendAndCollect.bind(f.driver);
+    f.driver.sendAndCollect = async (...args) => {
+      const answer = await send(...args);
+      if (f.controls.prompts.length === 1) throw new GenerationEndedError('생성이 답 없이 끝났습니다');
+      return answer;
+    };
+    assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+    applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: head, baseRef: 'main' });
+    f.driver.resumeChat = async () => true;
+    f.driver.findRound = async (marker, requireResponse, acceptFollowup) => findRoundBaseline([
+      { role: 'user', text: f.controls.prompts[0] },
+      { role: 'assistant', text: '' },
+      { role: 'user', text: '계속해줘' },
+      { role: 'assistant', text: raw },
+    ], marker, requireResponse, acceptFollowup);
+    f.driver.collectFrom = async () => { assert.fail('검증되지 않은 후속 답을 회수하면 안 된다'); };
+    assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'posted');
+    assert.equal(f.controls.prompts.length, 2);
+    assert.equal(f.posts.length, 1);
+    assert.equal(f.posts[0].commit_id, head);
+    assert.equal(f.posts[0].event, 'REQUEST_CHANGES', '후속 답의 approve가 게시되면 안 된다');
+  });
+});
+
+test('답 없는 종료 뒤에도 빈 자리만 남으면 새 질문을 보내고 재시도 상한에서 멈춘다', async () => fixture(async f => {
+  const send = f.driver.sendAndCollect.bind(f.driver);
+  f.driver.sendAndCollect = async (...args) => {
+    await send(...args);
+    throw new GenerationEndedError('생성이 답 없이 끝났습니다');
+  };
+  f.driver.resumeChat = async () => true;
+  f.driver.findRound = async (marker, requireResponse) => findRoundBaseline([
+    { role: 'user', text: f.controls.prompts.at(-1)! },
+  ], marker, requireResponse);
+  f.driver.collectFrom = async () => { assert.fail('끝난 빈 자리를 다시 기다리면 안 된다'); };
+  const snapshot = { status: 'OPEN' as const, headSha: head, baseRef: 'main' };
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  for (let i = 0; i < f.cfg.maxAutoRetries; i++) {
+    applySyncEvents(f.cfg, f.ctx, snapshot);
+    assert.equal(f.ctx.state, 'REVIEW_DUE');
+    assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  }
+  applySyncEvents(f.cfg, f.ctx, snapshot);
+  assert.equal(f.ctx.state, 'ERROR');
+  assert.equal(f.controls.prompts.length, f.cfg.maxAutoRetries + 1);
+  assert.equal(f.ctx.pendingSend?.recoverAfter, undefined);
+  assert.equal(f.posts.length, 0);
+}));
+
+test('타임아웃 회수 중 답 없는 종료가 확인되면 무기한 회수를 해제한다', async () => fixture(async f => {
+  const send = f.driver.sendAndCollect.bind(f.driver);
+  f.driver.sendAndCollect = async (...args) => {
+    await send(...args);
+    throw new ResponseTimeoutError('아직 응답 없음');
+  };
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  assert(f.ctx.pendingSend?.recoverAfter);
+  f.ctx.pendingSend.recoverAfter = new Date(Date.now() - 1).toISOString();
+  const snapshot = { status: 'OPEN' as const, headSha: head, baseRef: 'main' };
+  applySyncEvents(f.cfg, f.ctx, snapshot);
+  f.driver.resumeChat = async () => true;
+  f.driver.findRound = async () => 0;
+  f.driver.collectFrom = async () => { throw new GenerationEndedError('생성이 답 없이 끝났습니다'); };
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'failed');
+  assert.equal(f.ctx.pendingSend?.ended, true);
+  assert.equal(f.ctx.pendingSend?.recoverAfter, undefined);
+  applySyncEvents(f.cfg, f.ctx, snapshot);
+  assert.equal(f.ctx.retryCount, 1);
+  assert.equal(f.controls.prompts.length, 1);
 }));
 
 test('식별자 없는 구버전 사용자 템플릿 타임아웃은 무한 회수로 예약하지 않는다', async () => fixture(async f => {

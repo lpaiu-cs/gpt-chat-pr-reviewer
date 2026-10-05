@@ -40,7 +40,8 @@ export class ResponseTimeoutError extends Error {
  *
  * 타임아웃과 따로 둔다. 타임아웃은 "아직 오는 중일 수 있다" 라 같은 대화를 1분마다
  * 무기한 다시 확인하는데(재전송 없음), 끝난 생성에는 그 회수가 영원히 끝나지 않는다.
- * 이 오류를 받으면 호출부는 전송 기록을 버리고 다시 묻는다.
+ * 호출부는 전송 대상을 남겨 다음 재시도에서 늦은 답·사용자가 이어받은 답을 먼저 확인한다.
+ * 회수할 답이 없으면 다시 묻는다. 무기한 회수로 예약하지는 않는다.
  */
 export class GenerationEndedError extends Error {
   constructor(message: string) {
@@ -84,7 +85,9 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
     return legacy.map((el) => ({
       role: el.getAttribute('data-message-author-role') ?? '',
       id: el.getAttribute('data-message-id'),
-      text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
+      text: contentSel === null ? '' : (el.querySelector(contentSel)
+        ? [...el.querySelectorAll(contentSel)].map(block => block.textContent ?? '').join('\n')
+        : el.textContent ?? ''),
     }));
   }
   return [...document.querySelectorAll('[data-chatgpt-search-unit-key]')].flatMap((el) => {
@@ -103,7 +106,9 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
     return [{
       role,
       id,
-      text: contentSel === null ? '' : ((el.querySelector(contentSel) ?? el).textContent ?? ''),
+      text: contentSel === null ? '' : (el.querySelector(contentSel)
+        ? [...el.querySelectorAll(contentSel)].map(block => block.textContent ?? '').join('\n')
+        : el.textContent ?? ''),
     }];
   });
 }
@@ -148,23 +153,31 @@ export function messageByIdSelector(id: string): string {
 }
 
 /**
- * 이 대화에서 그 라운드 질문이 **마지막 질문**인지 보고, 맞으면 그 질문 직전까지의
- * 어시스턴트 메시지 수를 돌려준다 (없으면 null).
+ * 마지막 질문이 그 라운드이거나, 그 뒤의 답이 검증을 통과하는지 확인한다.
+ * 맞으면 마지막 질문 직전의 어시스턴트 메시지 수를 돌려준다 (없으면 null).
  *
  * 이 숫자가 응답 수집의 기준점이다. 다시 세면 안 된다 — 대상 응답의 노드가 이미
  * 만들어져 스트리밍 중이면 그것까지 기준에 포함돼, 오지 않을 **그 다음** 메시지를
  * 60초 기다리다 실패한다.
  *
- * **마지막 질문일 때만** 인정한다. 뒤에 다른 질문이 이어져 있으면 "우리가 묻고
- * 기다리는 중" 이 아니라 이미 진행된 대화이므로, 어느 응답이 그 라운드 것인지
- * 단정할 수 없다. 그때는 null 을 돌려 평소 경로(다시 묻기)로 보낸다.
+ * 후속 질문의 문구 대신 acceptFollowup으로 답의 리뷰 형식·대상을 검증한다.
+ * requireResponse는 답 없이 끝난 전송의 재확인에 쓴다 — 같은 빈 자리를 기다리지 않는다.
  */
-export function findRoundBaseline(msgs: ConversationMessage[], marker: string): number | null {
+export function findRoundBaseline(
+  msgs: ConversationMessage[], marker: string, requireResponse = false,
+  acceptFollowup?: (raw: string) => boolean,
+): number | null {
   let lastUser = -1;
+  let reviewUser = -1;
   for (let i = 0; i < msgs.length; i++) {
-    if (msgs[i].role === 'user') lastUser = i;
+    if (msgs[i].role !== 'user') continue;
+    lastUser = i;
+    if (msgs[i].text.includes(marker)) reviewUser = i;
   }
-  if (lastUser < 0 || !msgs[lastUser].text.includes(marker)) return null;
+  if (reviewUser < 0) return null;
+  const answer = msgs.slice(lastUser + 1).find(m => m.role === 'assistant');
+  if (lastUser !== reviewUser && !acceptFollowup?.(answer?.text ?? '')) return null;
+  if (requireResponse && !answer?.text.trim()) return null;
   return msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
 }
 
@@ -1246,7 +1259,9 @@ export class ChatGPTDriver {
    * 판별 실패는 전부 null 로 떨어뜨린다 — 잘못 "있다" 고 보면 엉뚱한 응답을
    * 게시하게 되고, 그건 다시 묻는 것보다 훨씬 나쁘다.
    */
-  async findRound(marker: string): Promise<number | null> {
+  async findRound(
+    marker: string, requireResponse = false, acceptFollowup?: (raw: string) => boolean,
+  ): Promise<number | null> {
     const p = this.requirePage();
     await this.countSettledMessages(p); // 렌더가 멎을 때까지 기다린다
 
@@ -1254,7 +1269,10 @@ export class ChatGPTDriver {
     // "그 질문이 마지막인가" 를 판정할 수 있다.
     try {
       const msgs = await p.evaluate(readMessagesInPage, this.cfg.selectors.messageContent);
-      return findRoundBaseline(msgs, marker);
+      // 생성 중이면 완성될 때까지 수집한다. 완성본의 형식·SHA 검증은 게시 경로에도 있다.
+      const generating = await this.isStreaming(p) && this.stallEvidence(true) === 'generating';
+      return findRoundBaseline(msgs, marker, requireResponse && !generating,
+        acceptFollowup ? raw => generating || acceptFollowup(raw) : undefined);
     } catch {
       return null;
     }
@@ -1929,7 +1947,7 @@ export class ChatGPTDriver {
             );
           }
           throw new GenerationEndedError(
-            `생성이 답 없이 끝났습니다 — 새로고침 후에도 중지 버튼도 답도 없습니다 (${interrupt}). 다시 묻습니다.`,
+            `생성이 답 없이 끝났습니다 — 새로고침 후에도 중지 버튼도 답도 없습니다 (${interrupt}). 다음 재시도에 응답을 다시 확인합니다.`,
           );
         }
         if (banner) recoveries++;

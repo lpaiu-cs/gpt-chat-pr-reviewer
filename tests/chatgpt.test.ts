@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { parseGPTResponse } from '../src/parser.js';
 import {
   anchorAnswer,
   findRoundBaseline,
@@ -121,6 +122,32 @@ test('anchorAnswer 의 nth 는 findRoundBaseline 과 같은 기준이다', () =>
   const anchor = anchorAnswer(msgs);
   assert.equal(anchor.status, 'ready');
   assert.equal(baseline, anchor.status === 'ready' ? anchor.nth : -1);
+});
+
+test('재개 문구 대신 최신 답의 리뷰 형식과 대상으로 회수 여부를 판단한다', () => {
+  const question = { role: 'user', text: '리뷰 라운드: 1차' };
+  const head = 'a'.repeat(40), base = 'b'.repeat(40);
+  const review = { summary: '완성된 리뷰', approval: 'approve', comments: [], reviewedHeadSha: head, reviewedBaseSha: base };
+  const answer = { role: 'assistant', text: JSON.stringify(review) };
+  const accept = (raw: string) => {
+    const result = parseGPTResponse(raw);
+    return result.parsed === true && result.reviewedHeadSha === head && result.reviewedBaseSha === base;
+  };
+  assert.equal(findRoundBaseline([question], question.text, true), null, '끝난 빈 생성은 다시 기다리지 않는다');
+  assert.equal(findRoundBaseline([question, answer], question.text, true), 0, '늦게 도착한 답은 회수한다');
+  for (const text of ['continue', '계속해줘', '이어서 진행해', '중단된 리뷰를 원래 형식으로 마무리해줘']) {
+    const continued = [question, { role: 'assistant', text: '' }, { role: 'user', text }];
+    assert.equal(findRoundBaseline([...continued, answer], question.text, true, accept), 1);
+    assert.equal(findRoundBaseline(continued, question.text, true, accept), null, '생성이 끝난 빈 답은 기다리지 않는다');
+    assert.equal(findRoundBaseline(continued, question.text, false, () => true), 1, '생성 중 판정은 완료까지 수집하게 한다');
+    assert.equal(findRoundBaseline([...continued, answer, { role: 'user', text: '다른 질문' }, { role: 'assistant', text: '다른 답' }], question.text, true, accept), null, '이전의 유효한 답으로 물러서지 않는다');
+  }
+  const followup = [question, answer, { role: 'user', text: '계속해줘' }];
+  for (const text of ['리뷰가 아닌 답', '{"summary":', JSON.stringify({ ...review, reviewedHeadSha: 'c'.repeat(40) }), JSON.stringify({ ...review, reviewedBaseSha: 'c'.repeat(40) })]) {
+    assert.equal(findRoundBaseline([...followup, { role: 'assistant', text }], question.text, true, accept), null);
+  }
+  assert.equal(findRoundBaseline([{ role: 'user', text: 'continue' }, answer], question.text, false, accept), null, '원래 질문이 없으면 추측하지 않는다');
+  assert.equal(findRoundBaseline([...followup, answer], question.text), null, '검증 없이 후속 답을 인정하지 않는다');
 });
 
 // 중지 버튼 고장 판정 (#109)

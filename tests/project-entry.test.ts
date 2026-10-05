@@ -151,6 +151,41 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
   } finally { await browser.close(); }
 });
 
+test('실제 Chrome: 재개 답의 모든 본문 블록을 검증하고 생성 중이면 완료까지 수집한다', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const page = await browser.newPage();
+  try {
+    const { parseGPTResponse } = await import('../src/parser.js');
+    const head = 'a'.repeat(40), base = 'b'.repeat(40), marker = '리뷰 라운드: 1차';
+    const raw = JSON.stringify({ summary: 'ok', approval: 'approve', comments: [], reviewedHeadSha: head, reviewedBaseSha: base });
+    const accept = (text: string) => {
+      const result = parseGPTResponse(text);
+      return result.parsed === true && result.reviewedHeadSha === head && result.reviewedBaseSha === base;
+    };
+    const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
+    driver.page = page;
+    page.waitForTimeout = async () => {};
+    for (const legacy of [true, false]) {
+      const attrs = (role: string, id: string) => legacy
+        ? `data-message-author-role="${role}" data-message-id="${id}"`
+        : `data-chatgpt-search-unit-key="t:${id}:${role}" data-chatgpt-search-message-ids="${id}"`;
+      await page.setContent(`<div ${attrs('user', 'u1')}>${marker}</div><div ${attrs('assistant', 'a1')}></div>
+        <div ${attrs('user', 'u2')}>이어서 진행해줘</div><div ${attrs('assistant', 'a2')}>
+        <div class="markdown">리뷰를 이어서 완료했습니다.</div><div class="markdown" id="answer">${raw}</div></div>`);
+      driver.isStreaming = async () => false;
+      assert.equal(await driver.findRound(marker, true, accept), 1);
+      assert.equal(await driver.collectFrom(1, 60_000), `리뷰를 이어서 완료했습니다.\n${raw}`);
+      await page.locator('.markdown').evaluateAll(els => els.forEach(el => { el.textContent = ''; }));
+      assert.equal(await driver.findRound(marker, true, accept), null, '끝난 빈 답은 기다리지 않는다');
+      driver.isStreaming = async () => true;
+      driver.stallEvidence = () => 'generating';
+      assert.equal(await driver.findRound(marker, true, accept), 1, 'JSON이 아직 없어도 생성 중이면 수집한다');
+      driver.stallEvidence = () => 'network-quiet';
+      assert.equal(await driver.findRound(marker, true, accept), null, '중지 버튼만 남은 고장으로 기다리지 않는다');
+    }
+  } finally { await browser.close(); }
+});
+
 test('실제 Chrome: 위치로 읽는 답이 완료 때 같은 노드에서 줄어도 받아들인다', async () => {
   // 실측(platelog#3): 새 대화의 생성 중 화면에서는 질문을 못 읽어 답 위치를 전송 시점 기준으로
   // 읽었고, 완료 때 코드블록을 다시 그리며 977→963자로 줄자 "다른 노드" 로 보고 라운드를 버렸다.
