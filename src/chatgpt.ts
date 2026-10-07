@@ -238,6 +238,26 @@ export function anchorAnswer(msgs: MessageRef[], afterUserId?: string | null): A
   return { status: 'pending', userId, nth };
 }
 
+/**
+ * 전송 직후 화면의 질문 목록으로 본 전송 여부 (`verifyPromptSent`).
+ *
+ *   sent     직전 질문 뒤에 새 질문이 있다 — 식별자가 없으면 질문 수가 늘었다
+ *   detached 직전 질문이 화면에서 떼어졌다. 새 질문을 띄우며 화면 밖 턴을 떼어낸 모습인데,
+ *            하나 늘고 하나 빠져 개수로는 안 갈린다 (osk-system#162·#165 — 대화에 질문이
+ *            하나뿐인 2차 라운드). 이것만으로는 전송 근거가 아니다 — 호출부가 입력창으로 확정한다
+ *   pending  아직 모른다
+ */
+export function judgePromptSent(
+  users: MessageRef[], lastUserIdBefore: string | null, beforeCount: number,
+): 'sent' | 'detached' | 'pending' {
+  if (lastUserIdBefore) {
+    const idx = users.findIndex((m) => m.id === lastUserIdBefore);
+    if (idx !== -1) return idx + 1 < users.length ? 'sent' : 'pending';
+  }
+  if (users.length > beforeCount) return 'sent';
+  return lastUserIdBefore && users.length > 0 ? 'detached' : 'pending';
+}
+
 /** 고정한 대상 — 답 노드의 식별자와, 그 답을 부른 질문. */
 export interface BoundTarget {
   id: string;
@@ -1157,7 +1177,7 @@ export class ChatGPTDriver {
       this.sawGeneration = false;
       this.assertProjectPage(p);
       await this.inputStep('전송 버튼', () => this.clickSend(p));
-      if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, lastUserBefore, beforeUserCount)))) {
+      if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, input, lastUserBefore, beforeUserCount)))) {
         throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
       }
     } catch (error) {
@@ -1229,24 +1249,26 @@ export class ChatGPTDriver {
    * 메시지 개수보다 늘어났는지로 판정한다. ID만 보고 "새 대화"로 오인하면
    * 기존 user 노드가 그대로 존재해도 전송 성공으로 착각해 직전 라운드 응답을
    * 현재 라운드 응답으로 고정할 수 있다.
+   *
+   * 질문 노드로 못 가르면 **입력창이 비었고** 직전 질문이 떼어졌거나 생성이 시작됐는지로
+   * 본다 (`judgePromptSent`). "안 보냈다" 로 틀리면 전송 기록(`onSent`)이 없어 재시도가
+   * 같은 질문을 또 보낸다 — osk-system#162 는 같은 2차 질문이 4번 들어갔다.
    */
   private async verifyPromptSent(
     page: Page,
+    input: Locator,
     lastUserIdBefore: string | null,
     beforeCount: number,
   ): Promise<boolean> {
+    const cleared = () => input.evaluate(readComposerInPage, undefined, { timeout: 3_000 })
+      .then((text) => !composerText(text).trim(), () => false);
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      const sent = await this.userMessages(page)
-        .then((users) => {
-          if (lastUserIdBefore) {
-            const idx = users.findIndex((m) => m.id === lastUserIdBefore);
-            if (idx !== -1) return idx + 1 < users.length;
-          }
-          return users.length > beforeCount;
-        })
-        .catch(() => false);
-      if (sent) return true;
+      const seen = await this.userMessages(page)
+        .then((users) => judgePromptSent(users, lastUserIdBefore, beforeCount))
+        .catch(() => 'pending' as const);
+      if (seen === 'sent') return true;
+      if ((seen === 'detached' || await this.isStreaming(page)) && await cleared()) return true;
       await page.waitForTimeout(500);
     }
     return false;

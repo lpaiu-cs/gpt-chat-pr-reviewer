@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseGPTResponse } from '../src/parser.js';
+import { loadConfig } from '../src/config.js';
 import {
   anchorAnswer,
+  ChatGPTDriver,
   findRoundBaseline,
+  judgePromptSent,
   judgeRebind,
   judgeRevival,
   judgeStuckButton,
@@ -52,6 +55,40 @@ test('anchorAnswer: 화면 밖 메시지가 떨어져 나가도 현재 화면 �
 test('anchorAnswer: id 가 없어도 위치는 준다', () => {
   const got = anchorAnswer([u('u1'), { role: 'assistant', id: null }]);
   assert.deepEqual(got, { status: 'ready', id: null, userId: 'u1', nth: 0 });
+});
+
+// ── 전송 확인 ──────────────────────────────────────────────
+
+test('judgePromptSent: 직전 질문 뒤의 새 질문 · 떼어진 직전 질문 · 아직 모름', () => {
+  assert.equal(judgePromptSent([u('u1'), u('u2')], 'u1', 1), 'sent');
+  assert.equal(judgePromptSent([u('u1')], 'u1', 1), 'pending');
+  // 실측(osk-system#162·#165): 새 질문을 띄우며 직전 질문을 떼어내 질문 수가 그대로다
+  assert.equal(judgePromptSent([u('u2')], 'u1', 1), 'detached');
+  assert.equal(judgePromptSent([], 'u1', 1), 'pending');
+  assert.equal(judgePromptSent([{ role: 'user', id: null }], null, 0), 'sent');
+});
+
+test('verifyPromptSent: 질문 노드로 못 가르면 입력창이 비었는지로 확정한다', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const page = { waitForTimeout: async (ms: number) => t.mock.timers.tick(ms) };
+  let users: MessageRef[] = [];
+  let composer = '';
+  let streaming = false;
+  const d = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
+  d.userMessages = async () => users;
+  d.isStreaming = async () => streaming;
+  const sent = () => d.verifyPromptSent(page, { evaluate: async () => composer }, 'u1', 1);
+
+  users = [u('u2')];
+  assert.equal(await sent(), true, '직전 질문이 떼어지고 입력창이 비었으면 보낸 것이다');
+  composer = 'review round 2';
+  assert.equal(await sent(), false, '입력창에 글이 남았으면 떼어진 화면만으로는 보낸 것이 아니다');
+  users = [u('u1')];
+  composer = '';
+  streaming = true;
+  assert.equal(await sent(), true, '질문이 아직 안 그려져도 생성이 시작되고 입력창이 비었으면 보낸 것이다');
+  streaming = false;
+  assert.equal(await sent(), false);
 });
 
 // ── 노드 교체 판정 ─────────────────────────────────────────
