@@ -994,6 +994,16 @@ export class ChatGPTDriver {
     await this.startNewChat();
   }
 
+  /** 지금 탭이 ChatGPT 프로젝트 홈이면 그 주소 (네트워크 없이 주소만 본다). */
+  projectHomeUrl(): string | null {
+    try {
+      const url = this.requirePage().url();
+      return chatgptProjectId(url) !== null && /\/project\/?$/.test(new URL(url).pathname) ? url : null;
+    } catch {
+      return null;
+    }
+  }
+
   async projectEntry() {
     this.assertProjectPage(this.requirePage());
     return readProjectEntry(this.requirePage(), this.cfg.selectors.textInput);

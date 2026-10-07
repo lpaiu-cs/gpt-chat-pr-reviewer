@@ -39,6 +39,28 @@ export class AccountSwitch {
     progress.control({ pendingIntents: intents.push({ kind: 'account-switch', action }) });
   }
 
+  /**
+   * 로그인 대기 중 새 계정이 프로젝트 홈에 들어와 있으면 확인 버튼을 기다리지 않고 완료한다.
+   * 같은 (계정, 주소)는 한 번만 시도한다 — 실패하면 오류가 화면에 남고, 재시도는 버튼이나 주소 변경으로.
+   */
+  async autoComplete(): Promise<boolean> {
+    const pending = this.cfg.accountSwitchPending;
+    if (this.state.phase !== 'login' || !pending) return false;
+    const driver = this.driver();
+    const url = driver.projectHomeUrl();
+    if (!url) return false;
+    const key = userKey(await driver.getSessionUser());
+    if (!key || key === pending.previousUser) return false;
+    const attempt = `${key} ${url}`;
+    if (attempt === this.lastAuto) return false;
+    this.lastAuto = attempt;
+    this.state = { phase: 'checking' };
+    this.publish();
+    return this.apply('complete');
+  }
+
+  private lastAuto = '';
+
   async apply(action: 'start' | 'complete'): Promise<boolean> {
     const oldProject = { chatgptProjectUrl: this.cfg.chatgptProjectUrl, chatgptProjectName: this.cfg.chatgptProjectName };
     try {

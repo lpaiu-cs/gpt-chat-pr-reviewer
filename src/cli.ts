@@ -1539,6 +1539,9 @@ program
         return false;
       }
 
+      // 계정 전환 로그인 대기 중이면 새 계정이 프로젝트 홈에 도착했는지 본다 (확인 버튼 대신).
+      if (await accountSwitch.autoComplete()) quotaUntil = 0;
+
       // ── 일시정지: 감시·동기화는 계속하고 실행만 멈춘다 ──
       if (paused || accountSwitch.blocked) {
         tally();
