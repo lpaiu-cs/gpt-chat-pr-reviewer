@@ -709,8 +709,9 @@ export async function removePullRequestReaction(
 
 // ── Diff 파싱 ───────────────────────────────────────────────
 
+// ANSI 색이 든 로그 파일이 diff 에 있으면 gh 가 출력을 거부한다 (터미널 주입 방어). 우리는 터미널이 아니라 문자열로 받는다.
 export async function fetchDiff(owner: string, repo: string, number: number): Promise<string> {
-  return await gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], {
+  return await gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`, '--allow-escape-sequences'], {
     maxBuffer: 10 * 1024 * 1024,
   });
 }
@@ -728,6 +729,7 @@ export async function fetchDiffAt(owner: string, repo: string, base: string, sha
       `repos/${owner}/${repo}/compare/${base}...${sha}`,
       '-H',
       'Accept: application/vnd.github.v3.diff',
+      '--allow-escape-sequences',
     ],
     { maxBuffer: 10 * 1024 * 1024 },
   );
