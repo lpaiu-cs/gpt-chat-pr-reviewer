@@ -78,8 +78,10 @@ export interface ThreadRecord {
   path: string;
   line: number | null;
   isResolved: boolean;
-  /** 우리(리뷰어) 외 다른 사용자의 답글 존재 여부 */
+  /** 답글 존재 여부 — 리뷰어와 같은 계정이 단 답글도 센다 (`adoptThreads`) */
   authorReplied: boolean;
+  /** 마지막 답글의 앞부분 — 반영·거절 이유를 다음 라운드 리뷰어가 읽는다 */
+  reply?: string;
   /** 게시된 리뷰 라운드 (best effort) */
   round: number;
   /** 첫 코멘트 앞부분 */

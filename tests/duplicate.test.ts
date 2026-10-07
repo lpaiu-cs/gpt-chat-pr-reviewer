@@ -106,6 +106,20 @@ test('숨긴 답글은 작성자 응답으로 세지 않는다', () => {
   assert.equal(ctx.threads[0].authorReplied, false);
 });
 
+test('리뷰어와 같은 계정의 답글도 답변으로 세고 마지막 답글을 남긴다 (osk-system#164)', () => {
+  const ctx = ctxWith([]);
+  adoptThreads(ctx, [thread({
+    id: 'T1',
+    comments: [
+      { author: VIEWER, body: '지적', isHidden: false },
+      { author: VIEWER, body: '반영했습니다', isHidden: false },
+      { author: VIEWER, body: '반영하지 않습니다(reject).\n호출부가 이미 막습니다.', isHidden: false },
+    ],
+  })], VIEWER, 2);
+  assert.equal(ctx.threads[0].authorReplied, true);
+  assert.equal(ctx.threads[0].reply, '반영하지 않습니다(reject). 호출부가 이미 막습니다.');
+});
+
 test('adoptThreads 는 첫 코멘트 본문의 지문을 남긴다', () => {
   const ctx = ctxWith([]);
   adoptThreads(ctx, [thread({ id: 'T1' })], VIEWER, 2);

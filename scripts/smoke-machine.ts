@@ -572,7 +572,8 @@ const fakePR: PRInfo = {
   ctx.threads = [
     { id: 'T0', path: 'old.ts', line: 5, isResolved: true, authorReplied: false, round: 1, snippet: '이미 반영됨' },
     { id: 'T1', path: 'a.ts', line: 10, isResolved: false, authorReplied: false, round: 1, snippet: '널 체크 누락' },
-    { id: 'T2', path: 'b.ts', line: 20, isResolved: false, authorReplied: true, round: 2, snippet: '경계값 처리' },
+    { id: 'T2', path: 'b.ts', line: 20, isResolved: false, authorReplied: true, round: 2, snippet: '경계값 처리',
+      reply: '반영하지 않습니다(reject). 호출부가 이미 막습니다.' },
   ];
 
   // 1차 라운드에는 이전 현황이 없다
@@ -591,6 +592,10 @@ const fakePR: PRInfo = {
   assert(
     cont.text.includes('[미해결]') && cont.text.includes('[답변만 있음]'),
     'resolve·답글 여부는 대화에 없는 정보이므로 반드시 싣는다',
+  );
+  assert(
+    cont.text.includes('작성자 답변: 반영하지 않습니다(reject)') && cont.text.includes('그 이유를 평가하세요'),
+    '답글 본문도 대화에 없다 — 이어가는 대화에서도 싣고 거절 여부를 평가하게 한다',
   );
 
   // 회전한 대화 — 그 대화에 없는 과거 라운드는 스니펫을 남긴다

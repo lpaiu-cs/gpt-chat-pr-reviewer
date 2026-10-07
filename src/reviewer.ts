@@ -89,6 +89,9 @@ async function removeReactionFromPullRequest(ctx: PRContext, content: PullReques
 
 // ── 스레드 동기화 ───────────────────────────────────────────
 
+/** 프롬프트에 싣는 답글 길이 상한 (스레드당). */
+const MAX_REPLY_CHARS = 800;
+
 /**
  * GraphQL 스레드 목록에서 우리(뷰어)가 시작한 스레드를 컨텍스트에 병합한다.
  * 새로 발견된 스레드는 roundForNew 라운드 소속으로 기록된다.
@@ -129,12 +132,18 @@ export function adoptThreads(
     const first = t.comments[0];
     if (!first || first.author !== viewer) continue; // 우리가 시작한 스레드만
 
+    // 답글은 작성자로 거르지 않는다. 데몬은 스레드 안에 답하지 않고, 작성자·에이전트는
+    // 리뷰어와 **같은 계정**으로 답한다(메인테이너 토큰). 작성자로 거르면 답글이 하나도 안
+    // 잡혀, 반영 거절 이유를 못 본 리뷰어가 같은 지적을 다시 올렸다 (osk-system#164).
     // 숨긴 답글은 응답으로 세지 않는다 — 스레드 본체와 같은 이유다.
-    const replied = t.comments.slice(1).some((c) => c.author !== viewer && !c.isHidden);
+    const last = t.comments.slice(1).filter((c) => !c.isHidden).at(-1);
+    const flat = last?.body.replace(/\s+/g, ' ').trim();
+    const reply = flat && flat.length > MAX_REPLY_CHARS ? `${flat.slice(0, MAX_REPLY_CHARS)}…` : flat || undefined;
     const existing = ctx.threads.find((r) => r.id === t.id);
     if (existing) {
       existing.isResolved = t.isResolved;
-      existing.authorReplied = replied;
+      existing.authorReplied = !!last;
+      existing.reply = reply;
       existing.digest ??= commentDigest(first.body); // 구버전 컨텍스트 보정
     } else {
       ctx.threads.push({
@@ -142,7 +151,8 @@ export function adoptThreads(
         path: t.path,
         line: t.line,
         isResolved: t.isResolved,
-        authorReplied: replied,
+        authorReplied: !!last,
+        ...(reply ? { reply } : {}),
         round: roundForNew,
         snippet: first.body.slice(0, 80).replace(/\s+/g, ' '),
         digest: commentDigest(first.body),
@@ -764,7 +774,9 @@ export function buildPreviousBlock(
   const lines = shown.map((t) => {
     const status = t.isResolved ? '해결됨' : t.authorReplied ? '답변만 있음' : '미해결';
     const head = `- [${status}] ${t.path}:${t.line ?? '?'}`;
-    return t.round >= inConversationFrom ? head : `${head} — ${t.snippet}`;
+    const line = t.round >= inConversationFrom ? head : `${head} — ${t.snippet}`;
+    // 답글도 GitHub 에서 벌어진 일이라 대화에 없다 — 이어가는 대화에서도 싣는다.
+    return t.reply ? `${line}\n  작성자 답변: ${t.reply}` : line;
   });
   const omitted = relevant.length - shown.length;
 
@@ -776,7 +788,11 @@ export function buildPreviousBlock(
     ...lines,
     ...(omitted > 0 ? [`- (그 외 ${omitted}건 생략)`] : []),
     '',
-    '위 코멘트가 실제로 반영되었는지 확인하고, 미반영 항목은 다시 지적해주세요.',
+    '위 코멘트가 실제로 반영되었는지 확인하세요. 작성자 답변이 있으면 반드시 읽으세요.',
+    '- 반영을 거절(reject)한 답변이면 그 이유를 평가하세요. 타당하면 같은 지적을 다시 올리지 말고,'
+      + ' 타당하지 않으면 그 근거가 왜 성립하지 않는지 들어 다시 지적하세요.',
+    '- 반영했다는 답변이어도 실제 코드에서 확인하세요.',
+    '- 답변 없이 미반영인 항목은 다시 지적해주세요.',
   ].join('\n');
 
   return { text, total: relevant.length, shown: shown.length };
@@ -1177,6 +1193,15 @@ async function askChatGPT(
     name: `review-diff-${target.mergeBaseSha.slice(0, 12)}-${target.headSha.slice(0, 12)}-${randomUUID().slice(0, 8)}.txt`,
     buffer: Buffer.from(diff, 'utf8'),
   } : undefined;
+  // 답글은 probe 로 안 보이고 전체 동기화(10분 주기)에서만 갱신된다. 대응 절차가 "답글 → push"
+  // 라 그 push 가 일으킨 라운드는 방금 단 답글을 모른다 — 보내기 직전에 스레드를 다시 읽는다.
+  if (round > 1) {
+    try {
+      adoptThreads(ctx, (await fetchPRSyncData(ctx.owner, ctx.repo, ctx.prNumber)).threads, await getViewerLogin(), ctx.round);
+    } catch {
+      console.log(chalk.yellow('  ⚠ 스레드 답글을 다시 읽지 못했습니다 — 마지막 동기화 기준으로 보냅니다.'));
+    }
+  }
   const templateMarker = roundMarker(cfg, ctx, round);
   const marker = templateMarker ?? `Review request: ${ctx.owner}/${ctx.repo}#${ctx.prNumber} round ${round}`;
   const prompt = bindPromptTarget(buildPrompt(cfg, ctx, round, instructions, continued), ctx, target,

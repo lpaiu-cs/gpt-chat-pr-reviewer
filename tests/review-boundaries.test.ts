@@ -19,13 +19,13 @@ const pr = { owner: 'o', repo: 'r', number: 1, url: 'https://github.com/o/r/pull
 
 async function fixture(fn: (f: {
   cfg: AppConfig; ctx: PRContext; driver: ChatGPTDriver; posts: any[];
-  controls: { failSync: boolean; losePostResponse: boolean; wrongTarget: boolean; rejectPost: boolean; diff: string; prompts: string[]; attachments: (PromptAttachment | undefined)[] };
+  controls: { failSync: boolean; losePostResponse: boolean; wrongTarget: boolean; rejectPost: boolean; diff: string; reply: string; prompts: string[]; attachments: (PromptAttachment | undefined)[] };
 }) => Promise<void>) {
   const dir = fs.mkdtempSync(path.join(tmpdir(), 'review-boundary-'));
   const cfg = { ...loadConfig(path.join(dir, 'absent.json')), dataDir: dir, customInstructionsFile: path.join(dir, 'instructions.md') };
   const ctx = createContext(pr);
   const posts: any[] = [];
-  const controls = { failSync: false, losePostResponse: false, wrongTarget: false, rejectPost: false, diff, prompts: [] as string[], attachments: [] as (PromptAttachment | undefined)[] };
+  const controls = { failSync: false, losePostResponse: false, wrongTarget: false, rejectPost: false, diff, reply: '', prompts: [] as string[], attachments: [] as (PromptAttachment | undefined)[] };
   const original = cp.execFile;
   const respond = (file: string, args: string[], opts: any) => {
     assert.equal(file, 'gh');
@@ -51,7 +51,8 @@ async function fixture(fn: (f: {
         state: 'OPEN', headRefOid: head, baseRefName: 'main', reviewThreads: {
           pageInfo: { hasNextPage: false, endCursor: null }, nodes: posts.flatMap(p => (p.comments ?? []).map((c: any, i: number) => ({
             id: `T${p.id}-${i}`, path: c.path, line: c.line, isResolved: true,
-            comments: { nodes: [{ author: { login: 'bot' }, body: c.body, pullRequestReview: { databaseId: p.id } }], pageInfo: { hasNextPage: false } },
+            comments: { nodes: [{ author: { login: 'bot' }, body: c.body, pullRequestReview: { databaseId: p.id } },
+              ...(controls.reply ? [{ author: { login: 'bot' }, body: controls.reply }] : [])], pageInfo: { hasNextPage: false } },
           }))),
         },
       } } } });
@@ -130,6 +131,17 @@ test('재시도 소진 후 25분 타임아웃도 재시작/완료 판정 가능�
   assert.equal(ctx.round, 1);
   assert.equal(ctx.pendingSend, undefined);
   assert.equal(ctx.lastError, undefined);
+}));
+
+test('답글을 단 뒤 push 한 라운드도 같은 계정의 그 답글을 프롬프트에 싣는다', async () => fixture(async f => {
+  assert.equal(await runRound(f.cfg, f.driver, f.ctx), 'posted');
+  // 리뷰어와 같은 계정(bot)의 반영 거절 답글 — 전체 동기화 전이라 컨텍스트는 아직 모른다
+  f.controls.reply = '반영하지 않습니다(reject). 호출부가 이미 막습니다.';
+  f.ctx.state = 'REVIEW_DUE';
+  f.driver.resumeChat = async () => true;
+  await runRound(f.cfg, f.driver, f.ctx);
+  assert.match(f.controls.prompts[1], /작성자 답변: 반영하지 않습니다\(reject\)\. 호출부가 이미 막습니다\./);
+  assert.match(f.controls.prompts[1], /반영을 거절\(reject\)한 답변이면 그 이유를 평가하세요/);
 }));
 
 test('사용자 템플릿에 라운드 마커가 없어도 실제 전송한 식별자로 회수한다', async () => fixture(async f => {
