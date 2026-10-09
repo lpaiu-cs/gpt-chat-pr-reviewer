@@ -495,6 +495,49 @@ export function judgeStuckButton(
   return s.idleMs >= settleMs;
 }
 
+/**
+ * 서버에 응답 상태(`stream_status`)를 묻기 시작하는 시점과 간격.
+ *
+ * 탭 화면은 완료의 권위가 아니다 (2026-10 실측). 서버가 375~555초에 끝낸 답을 데몬 탭은
+ * **전송 후 약 600초**에 웹앱이 스스로 다시 맞출 때까지 그리지 않았다 — 지연 47~228초,
+ * 300초 넘는 라운드의 약 40%. 같은 기간 대조군은 서버 완료 2~10초 뒤에 화면에 떴다.
+ * 서버 쪽 모양(소요·도구 호출·마지막 활동과의 간격)으로는 둘이 갈리지 않는다.
+ */
+const SERVER_STATUS_AFTER_MS = 60_000;
+const SERVER_STATUS_EVERY_MS = 30_000;
+/** 서버가 끝났다고 한 뒤 탭이 따라올 여유 — 정상 지연(2~10초)과 비교도 안 되게 잡는다. */
+const STALE_TAB_GRACE_MS = 15_000;
+/** 같은 수집에서 이 이유로 새로고침하는 상한. */
+const MAX_STALE_TAB_RELOADS = 2;
+
+/** 탭이 낡았는지 판정하는 신호들. */
+export interface StaleTabSignals {
+  /** 탭에 중지 버튼이 보이는가 */
+  streaming: boolean;
+  /** 이번 수집에서 서버가 IS_STREAMING 이라고 답한 적이 있는가 */
+  sawServerStreaming: boolean;
+  /** 그 뒤 서버가 COMPLETE 라고 답한 지 얼마나 됐나 (못 봤으면 null) */
+  completeForMs: number | null;
+  /** 이번 수집에서 이 이유로 새로고침한 횟수 */
+  reloads: number;
+}
+
+/**
+ * 서버는 끝났는데 탭이 아직 생성 중으로 보이는가 — 새로고침해 완성본을 가져올 때인가 (순수 함수).
+ *
+ * **이번 생성을 IS_STREAMING 으로 본 뒤의 COMPLETE 만** 믿는다. 이어 쓰는 대화는 전송
+ * 직후에 직전 턴의 COMPLETE 가 남아 있을 수 있고, 그걸 믿으면 생성 중인 탭을 새로고침한다.
+ * 엔드포인트가 바뀌어 IS_STREAMING 을 끝내 못 보면 아무 일도 하지 않는다 (종전 동작).
+ */
+export function judgeStaleTab(
+  s: StaleTabSignals,
+  graceMs: number = STALE_TAB_GRACE_MS,
+  maxReloads: number = MAX_STALE_TAB_RELOADS,
+): boolean {
+  if (!s.streaming || !s.sawServerStreaming || s.completeForMs === null) return false;
+  return s.completeForMs >= graceMs && s.reloads < maxReloads;
+}
+
 /** 복구 판정에 쓰는 신호들. */
 export interface BrowserLiveness {
   /** 컨텍스트(= 브라우저)가 살아 있는가 */
@@ -1788,6 +1831,11 @@ export class ChatGPTDriver {
     // 앞서 다른 중단을 복구한 이력으로 이번 중단을 새로고침 없이 종료로 확정하면, 다시
     // 읽으면 회수할 수 있던 답을 버리고 같은 질문을 재전송한다 (#51 리뷰).
     let emptyReloaded = false;
+    // 서버 응답 상태 (judgeStaleTab) — 탭 화면이 서버를 못 따라올 때 새로고침한다.
+    let lastStatusAt = 0;
+    let sawServerStreaming = false;
+    let completeSince: number | null = null;
+    let staleReloads = 0;
     const t0 = Date.now();
     let deadline = t0 + timeout;
     let extensions = 0;
@@ -1803,6 +1851,21 @@ export class ChatGPTDriver {
           `${span(timeout)} 더 기다립니다 (연장 ${extensions}/${MAX_RESPONSE_EXTENSIONS}).`,
       ));
       return true;
+    };
+    /** 대화를 새로고침하고 수집 상태를 처음부터 다시 잡는다 (연결 중단 · 낡은 탭 복구 공용). */
+    const reloadConversation = async (): Promise<void> => {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+      await page.waitForTimeout(6_000);
+      stable = 0;
+      lastText = '';
+      emptySince = null;
+      // 화면을 통째로 다시 그렸다 — 고정을 풀고 새 DOM 에서 다시 앵커를 잡는다.
+      // (그대로 두면 새 노드의 id 가 달라졌을 때 "사라졌다" 로 라운드를 버린다.)
+      bound = null;
+      readyNth = null;
+      fellBack = false;
+      unknowns = 0;
+      misses = 0;
     };
 
     while (Date.now() < deadline || await extend()) {
@@ -1963,6 +2026,35 @@ export class ChatGPTDriver {
         return lastText;
       }
 
+      // ── 서버는 끝났는데 탭만 생성 중 (judgeStaleTab) ──
+      // 중지 버튼이 보이는 동안만 서버에 묻는다. 조회 실패는 null — 종전 동작으로 남는다.
+      if (streaming && Date.now() - t0 >= SERVER_STATUS_AFTER_MS && Date.now() - lastStatusAt >= SERVER_STATUS_EVERY_MS) {
+        lastStatusAt = Date.now();
+        const status = await this.serverStreamStatus(page);
+        if (status === 'IS_STREAMING') {
+          if (!sawServerStreaming) console.log(chalk.dim('  서버 응답 상태: 생성 중 (stream_status) — 탭이 늦으면 새로고침합니다.'));
+          sawServerStreaming = true;
+          completeSince = null;
+        } else if (status === 'COMPLETE' && sawServerStreaming) {
+          completeSince ??= Date.now();
+        }
+      }
+      if (judgeStaleTab({
+        streaming,
+        sawServerStreaming,
+        completeForMs: completeSince === null ? null : Date.now() - completeSince,
+        reloads: staleReloads,
+      })) {
+        staleReloads++;
+        console.log(chalk.yellow(
+          `  ⚠ 서버는 응답을 마쳤는데(stream_status=COMPLETE) 탭은 아직 생성 중으로 보입니다 ` +
+            `(${span(Date.now() - t0)} 경과) — 대화를 새로고침해 완성본을 가져옵니다 (${staleReloads}/${MAX_STALE_TAB_RELOADS})`,
+        ));
+        await reloadConversation();
+        completeSince = Date.now(); // 새로 그린 화면에도 같은 여유를 준다
+        continue;
+      }
+
       // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
       // 대화를 새로고침하면 완성본을 가져올 수 있다.
       // 배너가 없어도 생성이 답 없이 끝났으면 같은 복구를 탄다. 화면 문구를 같이 남겨
@@ -1998,18 +2090,7 @@ export class ChatGPTDriver {
               `(${used + 1}/${limit})`,
           ),
         );
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
-        await page.waitForTimeout(6_000);
-        stable = 0;
-        lastText = '';
-        emptySince = null;
-        // 화면을 통째로 다시 그렸다 — 고정을 풀고 새 DOM 에서 다시 앵커를 잡는다.
-        // (그대로 두면 새 노드의 id 가 달라졌을 때 "사라졌다" 로 라운드를 버린다.)
-        bound = null;
-        readyNth = null;
-        fellBack = false;
-        unknowns = 0;
-        misses = 0;
+        await reloadConversation();
         continue;
       }
 
@@ -2137,6 +2218,33 @@ export class ChatGPTDriver {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * 서버가 아는 이 대화의 응답 상태 — `IS_STREAMING` · `COMPLETE` (모르면 null).
+   *
+   * 비공개 엔드포인트라 셀렉터처럼 깨질 수 있다. 실패는 전부 null 로 떨어뜨려 호출부가
+   * 종전 동작(탭 화면 기준)으로 남게 한다. 토큰은 이 페이지 안에서만 쓴다.
+   * 전송 직후의 임시 주소(/c/WEB:…)는 조회되지 않으므로 실제 id 일 때만 묻는다.
+   */
+  private async serverStreamStatus(page: Page): Promise<string | null> {
+    let id: string | undefined;
+    try { id = parseConversationUrl(page.url())?.split('/c/')[1]; } catch { return null; }
+    if (!id) return null;
+    return page.evaluate(async (conv) => {
+      try {
+        const session = await (await fetch('/api/auth/session', { credentials: 'include' })).json();
+        if (!session?.accessToken) return null;
+        const r = await fetch(`/backend-api/conversation/${conv}/stream_status`, {
+          headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include',
+        });
+        if (!r.ok) return null;
+        const status = (await r.json())?.status;
+        return typeof status === 'string' ? status : null;
+      } catch {
+        return null;
+      }
+    }, id).catch(() => null);
   }
 
   /**
