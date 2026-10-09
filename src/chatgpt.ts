@@ -505,6 +505,8 @@ export function judgeStuckButton(
  */
 const SERVER_STATUS_AFTER_MS = 60_000;
 const SERVER_STATUS_EVERY_MS = 30_000;
+/** 상태 조회 한 번의 상한 — 넘으면 null(종전 동작)로 돌아간다. */
+const SERVER_STATUS_TIMEOUT_MS = 10_000;
 /** 서버가 끝났다고 한 뒤 탭이 따라올 여유 — 정상 지연(2~10초)과 비교도 안 되게 잡는다. */
 const STALE_TAB_GRACE_MS = 15_000;
 /** 같은 수집에서 이 이유로 새로고침하는 상한. */
@@ -2231,12 +2233,15 @@ export class ChatGPTDriver {
     let id: string | undefined;
     try { id = parseConversationUrl(page.url())?.split('/c/')[1]; } catch { return null; }
     if (!id) return null;
-    return page.evaluate(async (conv) => {
+    // 두 요청과 본문 읽기를 한 시간 제한으로 묶는다. 응답이 끝나지 않는 연결은 예외도 없이
+    // 수집 루프를 붙잡아, 답이 화면에 떠도 못 받고 슬롯을 점유한다 (#60 리뷰).
+    return page.evaluate(async ({ conv, ms }) => {
       try {
-        const session = await (await fetch('/api/auth/session', { credentials: 'include' })).json();
+        const signal = AbortSignal.timeout(ms);
+        const session = await (await fetch('/api/auth/session', { credentials: 'include', signal })).json();
         if (!session?.accessToken) return null;
         const r = await fetch(`/backend-api/conversation/${conv}/stream_status`, {
-          headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include',
+          headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include', signal,
         });
         if (!r.ok) return null;
         const status = (await r.json())?.status;
@@ -2244,7 +2249,7 @@ export class ChatGPTDriver {
       } catch {
         return null;
       }
-    }, id).catch(() => null);
+    }, { conv: id, ms: SERVER_STATUS_TIMEOUT_MS }).catch(() => null);
   }
 
   /**

@@ -709,9 +709,30 @@ export async function removePullRequestReaction(
 
 // ── Diff 파싱 ───────────────────────────────────────────────
 
-// ANSI 색이 든 로그 파일이 diff 에 있으면 gh 가 출력을 거부한다 (터미널 주입 방어). 우리는 터미널이 아니라 문자열로 받는다.
+/** gh 가 `--allow-escape-sequences` 를 아는가 — 2.97.0 에서 생겼다 (`gh --version` 첫 줄로 판정). */
+export function supportsEscapeFlag(versionOutput: string): boolean {
+  const m = /gh version (\d+)\.(\d+)/.exec(versionOutput);
+  if (!m) return false;
+  const [major, minor] = [Number(m[1]), Number(m[2])];
+  return major > 2 || (major === 2 && minor >= 97);
+}
+
+let escapeArgs: Promise<string[]> | null = null;
+
+/**
+ * ANSI 색이 든 로그 파일이 diff 에 있으면 gh 가 출력을 거부한다 (터미널 주입 방어). 우리는 터미널이
+ * 아니라 문자열로 받으므로 허용한다. 단 2.96 이하 gh 는 이 옵션을 몰라 **모든** diff 조회를
+ * 거부하므로(#60 리뷰) 지원할 때만 붙인다 — 옛 gh 에서는 ANSI 가 든 PR 만 종전처럼 막힌다.
+ */
+function allowEscapeArgs(): Promise<string[]> {
+  return (escapeArgs ??= gh(['--version']).then(
+    (out) => (supportsEscapeFlag(out) ? ['--allow-escape-sequences'] : []),
+    () => { escapeArgs = null; return []; }, // 일시 실패는 굳히지 않고 다음 조회에서 다시 묻는다
+  ));
+}
+
 export async function fetchDiff(owner: string, repo: string, number: number): Promise<string> {
-  return await gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`, '--allow-escape-sequences'], {
+  return await gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`, ...await allowEscapeArgs()], {
     maxBuffer: 10 * 1024 * 1024,
   });
 }
@@ -729,7 +750,7 @@ export async function fetchDiffAt(owner: string, repo: string, base: string, sha
       `repos/${owner}/${repo}/compare/${base}...${sha}`,
       '-H',
       'Accept: application/vnd.github.v3.diff',
-      '--allow-escape-sequences',
+      ...await allowEscapeArgs(),
     ],
     { maxBuffer: 10 * 1024 * 1024 },
   );

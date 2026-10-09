@@ -38,7 +38,7 @@ PR URL을 ChatGPT 대화창에 전달하고, 리뷰 응답을 파싱해 GitHub �
 ## Requirements
 
 - Node.js 20+
-- [`gh` CLI](https://cli.github.com/) 로그인 완료 상태 (`gh auth login`)
+- [`gh` CLI](https://cli.github.com/) 로그인 완료 상태 (`gh auth login`) — 2.97.0 이상 권장 (그 아래에서는 ANSI 색이 든 로그가 diff 에 있는 PR 을 리뷰하지 못한다)
 - 데스크톱 Chrome
 - ChatGPT 계정
 
