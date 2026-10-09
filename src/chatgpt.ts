@@ -639,6 +639,11 @@ export class ChatGPTDriver {
       channel: this.cfg.browserChannel as any,
       headless,
       viewport: { width: 1280, height: 900 },
+      // 셀렉터는 영어 화면을 전제한다 ('Select ChatGPT model' · "N of M" · "New chat in …").
+      // 고정하지 않으면 화면 언어가 프로필 설정을 따르는데, 그 값은 Chrome 동기화가 바꾼다 —
+      // 2026-10-09 프로필을 일반 Chrome 으로 한 번 열자 계정의 ko-KR 이 account_values.intl 로
+      // 내려와 다음 기동부터 화면이 한국어가 됐고, 프로젝트 진입과 추론 강도 설정이 모두 막혔다.
+      locale: 'en-US',
       args: [
         '--disable-blink-features=AutomationControlled',
         '--no-first-run',
@@ -733,7 +738,10 @@ export class ChatGPTDriver {
       // ChatGPT 홈/로그인이 로드되지 않아 일반 모드와 같은 UA로 맞춘다.
       const session = await page.context().newCDPSession(page);
       const { userAgent } = await session.send('Browser.getVersion');
-      await session.send('Network.setUserAgentOverride', { userAgent: userAgent.replace('HeadlessChrome/', 'Chrome/') });
+      // acceptLanguage 를 빼면 이 호출이 위의 locale 고정을 프로필 언어로 되돌린다.
+      await session.send('Network.setUserAgentOverride', {
+        userAgent: userAgent.replace('HeadlessChrome/', 'Chrome/'), acceptLanguage: 'en-US,en',
+      });
     }
     this.trackGenerationTraffic(page);
   }
