@@ -1539,6 +1539,16 @@ program
         return false;
       }
 
+      // 계정 전환 로그인 대기 중이면 새 계정이 프로젝트 홈에 도착했는지 본다 (확인 버튼 대신).
+      // 완료됐으면 **이번 큐를 버린다.** 위의 scan 이 이전 계정의 ctx(대화 URL·pendingSend·재시도
+      // 횟수)로 만든 큐라, 그대로 채우면 첫 저장이 정리된 상태 파일을 덮어쓰고 새 계정으로는 못
+      // 여는 옛 대화를 회수하려 든다 (#60 리뷰). 다음 사이클이 정리된 파일로 다시 스캔한다.
+      if (await accountSwitch.autoComplete()) {
+        quotaUntil = 0;
+        tally();
+        return false;
+      }
+
       // ── 일시정지: 감시·동기화는 계속하고 실행만 멈춘다 ──
       if (paused || accountSwitch.blocked) {
         tally();

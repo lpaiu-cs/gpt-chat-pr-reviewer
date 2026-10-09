@@ -95,6 +95,20 @@ const NEW_UI = `
   }
 </script>`;
 
+test('실제 Chrome: 한국어 사이드바의 "<이름>에서 새 채팅" 으로 진입한다', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const page = await browser.newPage();
+  const entry = { url: 'https://chatgpt.com/g/g-p-1234/project', name: 'Reviews' };
+  const ko = NEW_UI.replace(/aria-label="New chat in Reviews"/g, 'aria-label="Reviews에서 새 채팅"')
+    .replace('Project actions for Reviews', 'Reviews 프로젝트 액션');
+  await page.route('https://chatgpt.com/**', (route) => route.fulfill({ contentType: 'text/html; charset=utf-8', body: ko }));
+  try {
+    await page.goto('https://chatgpt.com/');
+    await enterProject(page, entry, loadConfig('tests/__missing__.json').selectors.textInput);
+    assert.equal(new URL(page.url()).pathname, '/g/g-p-1234/project');
+  } finally { await browser.close(); }
+});
+
 test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기·응답 수집', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   const page = await browser.newPage();

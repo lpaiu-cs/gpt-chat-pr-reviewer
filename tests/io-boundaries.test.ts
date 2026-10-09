@@ -4,7 +4,7 @@ import cp, { spawn } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { fetchPRSyncData, fetchRepoProbe, gh, pollDelay } from '../src/github.js';
+import { fetchPRSyncData, fetchRepoProbe, gh, pollDelay, supportsEscapeFlag } from '../src/github.js';
 import { intents } from '../src/intents.js';
 
 test('스레드와 답글의 후속 페이지를 모두 읽고 불완전한 페이지는 거부한다', async () => {
@@ -102,4 +102,12 @@ test('실제 notify 프로세스가 동시 리뷰 배열에서 대상 시작/게
     assert.equal(out.split('\n').filter(s => s.startsWith('posting  ')).length, 1, out);
     assert(!out.includes('o/r#2'), out);
   } finally { child.kill(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('--allow-escape-sequences 는 그 옵션을 아는 gh(2.97.0+)에만 붙인다', () => {
+  assert.equal(supportsEscapeFlag('gh version 2.98.0 (2026-08-20)'), true);
+  assert.equal(supportsEscapeFlag('gh version 2.97.0 (2026-07-31)'), true);
+  assert.equal(supportsEscapeFlag('gh version 2.96.3 (2026-07-01)'), false); // 모르는 옵션이면 모든 diff 조회가 실패한다
+  assert.equal(supportsEscapeFlag('gh version 3.0.0'), true);
+  assert.equal(supportsEscapeFlag(''), false);
 });

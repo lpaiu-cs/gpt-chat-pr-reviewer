@@ -36,9 +36,10 @@ export async function enterProject(page: Page, entry: ProjectEntry, input: strin
     const row = (await byId.count()) > 0 ? byId : byName;
     // 숨겨진 버튼은 pointer-events:none일 수 있다. Enter는 호버나 OS 포커스를 요구하지 않는다.
     // 옛 사이드바는 행 옆의 "Open project home", 개편 사이드바는 행 안의 "New chat in <이름>" 이다
-    // (개편된 행 자체는 펼치기 버튼이라 눌러도 이동하지 않는다).
+    // (개편된 행 자체는 펼치기 버튼이라 눌러도 이동하지 않는다). 한국어 화면은 "<이름>에서 새 채팅" 이다 —
+    // 데몬은 locale 을 en-US 로 고정하지만(launch), setup 등 사람이 쓰는 창은 한국어일 수 있다.
     const openHome = row.locator('..').getByRole('button', { name: /^(Open project( home)?|프로젝트 홈 열기)$/i });
-    await openHome.or(row.getByRole('button', { name: /^New chat in /i })).first().press('Enter');
+    await openHome.or(row.getByRole('button', { name: /^New chat in |에서 새 채팅$/i })).first().press('Enter');
     await page.waitForURL(url => chatgptProjectId(url.href) !== null && /\/project\/?$/.test(url.pathname), { timeout: 15_000 });
     await editor.waitFor({ state: 'visible', timeout: 15_000 });
   }

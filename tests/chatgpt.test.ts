@@ -10,6 +10,7 @@ import {
   judgeRebind,
   judgeRevival,
   judgeStuckButton,
+  judgeStaleTab,
   matchInterrupt,
   type MessageRef,
 } from '../src/chatgpt.js';
@@ -227,6 +228,25 @@ test('judgeStuckButton: 토큰 간격 정도의 정지로는 끊지 않는다', 
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 30_000 }), false);
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 119_999 }), false);
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 120_000 }), true);
+});
+
+// 서버는 끝났는데 탭만 생성 중 — pelican-music#66: 서버 375초, 탭은 전송 후 약 600초에야 그렸다.
+const stale = { streaming: true, sawServerStreaming: true, completeForMs: 15_000, reloads: 0 };
+
+test('judgeStaleTab: 서버 COMPLETE 뒤에도 탭이 여유를 넘겨 생성 중이면 새로고침한다', () => {
+  assert.equal(judgeStaleTab(stale), true);
+  assert.equal(judgeStaleTab({ ...stale, completeForMs: 14_999 }), false); // 정상 지연(2~10초)은 기다린다
+});
+
+test('judgeStaleTab: 이번 생성을 IS_STREAMING 으로 본 적 없으면 COMPLETE 를 믿지 않는다', () => {
+  // 이어 쓰는 대화는 전송 직후 직전 턴의 COMPLETE 가 남아 있을 수 있다.
+  assert.equal(judgeStaleTab({ ...stale, sawServerStreaming: false }), false);
+});
+
+test('judgeStaleTab: 탭이 이미 따라왔거나 상한을 썼으면 새로고침하지 않는다', () => {
+  assert.equal(judgeStaleTab({ ...stale, streaming: false }), false);
+  assert.equal(judgeStaleTab({ ...stale, completeForMs: null }), false);
+  assert.equal(judgeStaleTab({ ...stale, reloads: 2 }), false);
 });
 
 // 죽은 브라우저 되살리기 (#109 의 별개 증상)
