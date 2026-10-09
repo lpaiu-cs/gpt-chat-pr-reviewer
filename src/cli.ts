@@ -944,7 +944,11 @@ program
       capacity: () => reviewBatchSize(cfg.maxConcurrentReviews, Number.MAX_SAFE_INTEGER),
       lease: (slot) => leaseTab(slot),
       release: () => releaseTabs(),
-      run: (e, tab, index, total) => runQueued(e, index, total, tab),
+      run: async (e, tab, index, total) => {
+        const outcome = await runQueued(e, index, total, tab);
+        if (outcome === 'failed') await dropTab(tab).catch(() => {});
+        return outcome;
+      },
       settled: (e, outcome) => settleRound(e, outcome),
       // 사이클 시작의 게이트와 같은 조건을 **라운드마다** 다시 본다 — 슬롯 채우기는 사이클 밖
       // (라운드 완료·--once 의 drain)에서도, 탭을 빌리는 대기 뒤에도 일어난다 (#53 리뷰).
@@ -1406,16 +1410,26 @@ program
      * 빌린 탭은 **도는 라운드가 하나도 없을 때 반납한다**(`releaseTabs`). 들고 있으면 제한
      * 없음으로 한 번 크게 돌린 뒤 수십 개가 데몬이 죽을 때까지 살아남아 메모리를 붙잡는다.
      * 다시 여는 값은 수백 ms 인데 라운드는 2~25분이라, 재사용해서 아낄 것이 없다.
+     *
+     * 같은 이유로 **라운드가 실패한 추가 탭은 바로 버린다**(`dropTab`). 탭에 남은 상태(공유
+     * 초안의 사본 등)가 실패 원인이면 재시도가 같은 탭에서 같은 이유로 계속 막힌다 —
+     * 2026-10-10 에 두 슬롯이 1분 반 동안 9번 막혔다. 슬롯 0 은 브라우저 자체라 두지 않는다.
      */
-    const extraTabs: ChatGPTDriver[] = [];
+    const extraTabs = new Map<number, ChatGPTDriver>();
     const leaseTab = async (slot: number): Promise<ChatGPTDriver | null> => {
       if (!driver || slot === 0) return driver;
-      while (extraTabs.length < slot) extraTabs.push(await driver.fork());
-      return extraTabs[slot - 1];
+      let tab = extraTabs.get(slot);
+      if (!tab) extraTabs.set(slot, tab = await driver.fork());
+      return tab;
+    };
+    const dropTab = async (tab: ChatGPTDriver | null): Promise<void> => {
+      for (const [slot, t] of extraTabs) if (t === tab) { extraTabs.delete(slot); await t.close(); }
     };
     const releaseTabs = async (): Promise<void> => {
       // 목록을 **먼저 비운다.** 하나씩 꺼내며 닫으면 닫는 동안 남은 탭을 fill 이 빌려 간다.
-      for (const tab of extraTabs.splice(0)) await tab.close();
+      const tabs = [...extraTabs.values()];
+      extraTabs.clear();
+      for (const tab of tabs) await tab.close();
     };
 
     /**
