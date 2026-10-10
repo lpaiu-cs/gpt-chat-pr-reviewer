@@ -140,6 +140,28 @@ export function composerText(s: string): string {
   return s.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
 }
 
+/** 고정 diff 첨부 이름 (reviewer.ts 가 만든다) — 이 모양이면 우리가 올린 파일이다. */
+const OWN_ATTACHMENT = /^review-diff-[0-9a-f]{12}-[0-9a-f]{12}-[0-9a-f]{8}\.txt$/;
+
+/**
+ * 입력창에 남은 것이 **우리가 넣다 만 리뷰 프롬프트**인지 (순수 함수).
+ *
+ * 진입 가드는 사람의 초안을 지키려고 입력창이 비어 있지 않으면 멈춘다. 그런데 실패한 입력이
+ * 남긴 잔해도 같은 모양이라, 한 번 남으면 프로필 저장소에 남아 탭을 새로 열어도 재시작해도
+ * 모든 리뷰가 막혔다 (2026-10-10 · 붙여넣기 검증이 3초 제한에 걸린 뒤 약 3시간 · PR 41개).
+ * 그래서 우리 것이 확실한 경우만 지운다: 첨부는 전부 `review-diff-…txt` 이고, 글은 비었거나
+ * 보내려던 프롬프트의 앞부분이거나 템플릿 머리말(첫 `{{` 앞, 20자 이상)로 시작한다.
+ * 그 밖에는 전부 사람의 것으로 보고 남긴다.
+ */
+export function isOwnDraft(text: string, files: string[], template: string, prompt?: string, ownFile?: string): boolean {
+  if (!files.every((f) => f === ownFile || OWN_ATTACHMENT.test(f))) return false;
+  const t = composerText(text).trim();
+  if (!t) return true;
+  if (prompt && composerText(prompt).startsWith(t)) return true;
+  const head = composerText(template.split('{{')[0]).trim();
+  return head.length >= 20 && t.startsWith(head);
+}
+
 /**
  * 어시스턴트 메시지를 **안정적 식별자**로 고정하는 셀렉터 (옛 화면 · 개편 화면).
  *
@@ -1074,7 +1096,8 @@ export class ChatGPTDriver {
     const p = this.requirePage();
     const project = requireProjectUrl(this.cfg.chatgptProjectUrl);
     try {
-      await enterProject(p, { url: project, name: this.cfg.chatgptProjectName ?? '' }, this.cfg.selectors.textInput);
+      await enterProject(p, { url: project, name: this.cfg.chatgptProjectName ?? '' }, this.cfg.selectors.textInput,
+        () => this.clearOwnDraft(p.locator(this.cfg.selectors.textInput).first()));
     } catch (cause) {
       // 원인과 주소를 **첫 줄에** 둔다 — 로그·상태는 첫 줄만, 그것도 앞에서 자른다.
       // Playwright 오류는 호출 기록이 여러 줄로 붙어, 뒤에 붙인 주소가 통째로 잘렸었다.
@@ -1213,7 +1236,8 @@ export class ChatGPTDriver {
     this.assertProjectPage(p);
     const input = p.locator(this.cfg.selectors.textInput).first();
     const composer = input.locator('xpath=ancestor::form[1]');
-    if ((await input.innerText()).trim() || await composer.getByRole('button', { name: REMOVE_FILE_BUTTON }).count()) {
+    if (((await input.innerText()).trim() || await composer.getByRole('button', { name: REMOVE_FILE_BUTTON }).count())
+      && !(await this.clearOwnDraft(input))) {
       throw new Error('입력창에 작성 중인 내용 또는 첨부가 있습니다 — 기존 초안을 보존합니다.');
     }
     const reasoning = await this.inputStep('추론 강도 최대', () => this.maximizeReasoning(p, composer).catch((cause) => {
@@ -1256,22 +1280,8 @@ export class ChatGPTDriver {
       try {
         if (!(await this.isStreaming(p)) && await this.lastUserMessageId(p) === lastUserBefore
           && await this.countUserMessages(p) === beforeUserCount) {
-          const normalize = composerText;
-          const text = normalize(await input.evaluate(readComposerInPage));
-          if (!text || text === normalize(prompt)) {
-            if (attachment) {
-              const card = composer.getByRole('group', { name: attachment.name, exact: true })
-                .or(composer.getByRole('button', { name: attachment.name, exact: true })).first();
-              const remove = composer.getByRole('button', { name: `Remove ${attachment.name}`, exact: true })
-                .or(composer.getByRole('group', { name: attachment.name, exact: true })
-                  .getByRole('button', { name: REMOVE_FILE_BUTTON })).first();
-              if (await remove.count()) {
-                if (await card.count()) await card.hover();
-                await remove.click();
-              }
-            }
-            await input.fill('');
-          }
+          // 붙이다 만 앞부분도 우리 것이다 — 예전엔 전체와 같을 때만 지워 잔해가 남았다.
+          await this.clearOwnDraft(input, prompt, attachment?.name);
         }
       } catch { console.log(chalk.yellow('  ⚠ 미전송 초안을 정리하지 못했습니다 — 프로젝트 입력창을 확인하세요.')); }
       throw error;
@@ -1534,6 +1544,32 @@ export class ChatGPTDriver {
     } finally {
       if (await menu.count()) await p.keyboard.press('Escape');
     }
+  }
+
+  /**
+   * 입력창의 잔해가 우리 것이면(`isOwnDraft`) 글과 첨부를 지우고 true. 아니면 건드리지 않고 false.
+   * 다 지웠는지 다시 읽어 확인한다 — 못 지웠으면 false 라 호출부의 가드가 그대로 멈춘다.
+   */
+  async clearOwnDraft(input: Locator, prompt?: string, ownFile?: string): Promise<boolean> {
+    const composer = input.locator('xpath=ancestor::form[1]');
+    const removes = composer.getByRole('button', { name: REMOVE_FILE_BUTTON });
+    const read = async () => ({
+      text: composerText(await input.evaluate(readComposerInPage, undefined, { timeout: 10_000 })).trim(),
+      files: await removes.evaluateAll((els) => els.map((b) =>
+        b.closest('[role="group"]')?.getAttribute('aria-label') || (b.getAttribute('aria-label') ?? '').replace(/^Remove /, ''))),
+    });
+    const before = await read();
+    if (!isOwnDraft(before.text, before.files, this.cfg.promptTemplate, prompt, ownFile)) return false;
+    if (!before.text && before.files.length === 0) return true;
+    console.log(chalk.yellow(`  ⚠ 실패한 입력이 남긴 리뷰 프롬프트를 지웁니다 (${before.text.length}자 · 첨부 ${before.files.length}개)`));
+    for (let i = 0; i < 10 && await removes.count(); i++) {
+      const remove = removes.first();
+      await remove.locator('xpath=ancestor::*[@role="group"][1]').hover({ timeout: 2_000 }).catch(() => {});
+      await remove.click({ timeout: 5_000 });
+    }
+    await input.fill('');
+    const after = await read();
+    return !after.text && after.files.length === 0;
   }
 
   private async inputStep<T>(label: string, action: () => Promise<T>, reportCompletion = true): Promise<T> {

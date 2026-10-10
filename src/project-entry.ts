@@ -11,8 +11,11 @@ export async function readProjectEntry(page: Page, input: string): Promise<Proje
   return { url, name };
 }
 
-/** 전체 문서 로딩 대신 ChatGPT의 화면 내부 이동을 사용한다. 이름은 탐색용, ID가 신원이다. */
-export async function enterProject(page: Page, entry: ProjectEntry, input: string): Promise<void> {
+/**
+ * 전체 문서 로딩 대신 ChatGPT의 화면 내부 이동을 사용한다. 이름은 탐색용, ID가 신원이다.
+ * `clearOwn` 은 입력창에 남은 것이 우리 잔해일 때만 지우고 true 를 돌려준다 (사람의 초안은 보존).
+ */
+export async function enterProject(page: Page, entry: ProjectEntry, input: string, clearOwn?: () => Promise<boolean>): Promise<void> {
   const expected = chatgptProjectId(requireProjectUrl(entry.url));
   if (!entry.name?.trim()) throw new Error('프로젝트 이름 등록이 필요합니다. npm run dev -- setup 으로 프로젝트를 열고 등록하세요.');
   const editor = page.locator(input).first();
@@ -44,5 +47,7 @@ export async function enterProject(page: Page, entry: ProjectEntry, input: strin
     await editor.waitFor({ state: 'visible', timeout: 15_000 });
   }
   if (!onHome()) throw new Error('선택한 프로젝트 ID가 등록된 프로젝트와 다릅니다. setup으로 다시 등록하세요.');
-  if ((await editor.innerText()).trim()) throw new Error('프로젝트 입력창에 작성 중인 내용이 있습니다. 내용을 비운 뒤 다시 시도하세요.');
+  if ((await editor.innerText()).trim() && !(await clearOwn?.())) {
+    throw new Error('프로젝트 입력창에 작성 중인 내용이 있습니다. 내용을 비운 뒤 다시 시도하세요.');
+  }
 }

@@ -11,6 +11,7 @@ import {
   judgeRevival,
   judgeStuckButton,
   judgeStaleTab,
+  isOwnDraft,
   matchInterrupt,
   type MessageRef,
 } from '../src/chatgpt.js';
@@ -319,4 +320,20 @@ test('matchInterrupt: 리뷰 본문에 나올 법한 평범한 문장은 잡지 
 test('matchInterrupt: 걸린 문구를 그대로 돌려준다 (오탐 진단의 유일한 근거)', () => {
   const hit = matchInterrupt('앞부분 blah Connection Interrupted 뒷부분');
   assert.equal(hit, 'Connection Interrupted'); // 원문 대소문자 그대로
+});
+
+test('isOwnDraft: 우리가 넣다 만 리뷰 프롬프트만 지울 대상으로 본다', () => {
+  const template = loadConfig('tests/__missing__.json').promptTemplate;
+  const head = template.split('{{')[0];
+  const file = 'review-diff-0123456789ab-ba9876543210-deadbeef.txt';
+  // 템플릿 머리말로 시작하는 잔해와 우리 첨부 — 지운다
+  assert.equal(isOwnDraft(`${head}https://github.com/o/r/pull/1`, [file], template), true);
+  // 보내려던 프롬프트의 앞부분 — 지운다
+  assert.equal(isOwnDraft('PR 리뷰 요청 앞', [], '{{instructions}}', 'PR 리뷰 요청 앞부분 그리고 뒤'), true);
+  // 글 없이 우리 첨부만 — 지운다
+  assert.equal(isOwnDraft('', [file], template), true);
+  // 사람의 글·남의 첨부·머리말이 짧은 템플릿 — 남긴다
+  assert.equal(isOwnDraft('keep my draft', [], template), false);
+  assert.equal(isOwnDraft(head, ['notes.txt'], template), false);
+  assert.equal(isOwnDraft('짧은 머리말 뒤 사람 글', [], '짧은 {{url}}'), false);
 });

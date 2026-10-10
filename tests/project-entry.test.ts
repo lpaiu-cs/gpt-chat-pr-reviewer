@@ -47,6 +47,10 @@ test('실제 Chrome: 직접 로딩 실패·호버 비활성 버튼에서도 Ente
     await page.locator('#prompt-textarea').fill('keep my draft');
     await assert.rejects(enterProject(page, entry, '#prompt-textarea'), /작성 중/);
     assert.equal(await page.locator('#prompt-textarea').innerText(), 'keep my draft');
+    // 실패한 입력이 남긴 우리 프롬프트는 지우고 들어간다 — 남기면 모든 리뷰가 막힌다.
+    await page.locator('#prompt-textarea').fill(`${loadConfig('tests/__missing__.json').promptTemplate.split('{{')[0]}https://github.com/o/r/pull/1`);
+    await driver.startNewChat();
+    assert.equal((await page.locator('#prompt-textarea').innerText()).trim(), '');
     destination = entry.url.replace('1234', '5678');
     await page.goto('https://chatgpt.com/');
     await assert.rejects(enterProject(page, entry, '#prompt-textarea'), /ID/);
