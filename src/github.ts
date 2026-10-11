@@ -731,9 +731,16 @@ function allowEscapeArgs(): Promise<string[]> {
   ));
 }
 
+/**
+ * diff 조회의 출력 상한. 10MB 였을 때 lolchess_base#115 가 "stdout maxBuffer length exceeded" 로
+ * 3번 실패했다 (2026-10-12). 큰 diff 는 첨부로 보내므로 리뷰 쪽 상한이 따로 없고, 7.9MB 첨부도
+ * 정상 리뷰됐다 — 여기서 막을 이유가 없다. 넘으면 지금처럼 오류로 실패한다.
+ */
+const DIFF_MAX_BUFFER = 256 * 1024 * 1024;
+
 export async function fetchDiff(owner: string, repo: string, number: number): Promise<string> {
   return await gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`, ...await allowEscapeArgs()], {
-    maxBuffer: 10 * 1024 * 1024,
+    maxBuffer: DIFF_MAX_BUFFER,
   });
 }
 
@@ -752,7 +759,7 @@ export async function fetchDiffAt(owner: string, repo: string, base: string, sha
       'Accept: application/vnd.github.v3.diff',
       ...await allowEscapeArgs(),
     ],
-    { maxBuffer: 10 * 1024 * 1024 },
+    { maxBuffer: DIFF_MAX_BUFFER },
   );
 }
 
