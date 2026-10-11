@@ -19,8 +19,19 @@ const CITATION_ATTR = String.raw`\w+=(?:"[^"{}\n]*"|[\w.-]+)`;
 const CITATION = new RegExp(String.raw`\s*:(?:chatgpt-content-reference|contentReference)(?:\[[\w:]*\])?` +
   String.raw`\{${CITATION_ATTR}(?:\s*,?\s*${CITATION_ATTR})*\}`, 'g');
 
+/**
+ * 답 전체를 감싼 `<CodeBlock language="json" editable={false}>…</CodeBlock>` 의 안쪽.
+ *
+ * 2026-10-12 실측: 같은 대화의 답이 매번 이 태그로 감싸여 왔다. 화면은 이걸 못 그려 답 자리에
+ * "This response couldn’t load" 를 띄웠고(서버 기록에서 읽어야 했다), 추출은 첫 `{` 를 태그의
+ * `editable={false}` 에서 잡아 실패했다 (osk-system#183 · lolchess_base#113·#116·#117 반복 실패).
+ * 바깥 한 겹만 벗긴다 — JSON 문자열 안에서 이 태그를 언급한 리뷰는 건드리지 않는다.
+ */
+const CODE_BLOCK_WRAPPER = /^\s*<CodeBlock\b[^>]*>([\s\S]*)<\/CodeBlock>\s*$/;
+
 export function parseGPTResponse(raw: string): ReviewResult {
-  return parseReview(raw, raw) ?? parseReview(raw.replace(CITATION, ''), raw)
+  const unwrapped = raw.match(CODE_BLOCK_WRAPPER)?.[1] ?? raw;
+  return parseReview(raw, raw) ?? parseReview(unwrapped.replace(CITATION, ''), raw)
     // 파싱 실패 — 호출부가 게시를 거부해야 한다.
     ?? { summary: raw.slice(0, 3000), approval: 'comment', comments: [], raw, parsed: false };
 }
