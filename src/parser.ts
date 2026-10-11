@@ -28,9 +28,11 @@ const CITATION = new RegExp(String.raw`\s*:(?:chatgpt-content-reference|contentR
  * 바깥 한 겹만 벗긴다 — JSON 문자열 안에서 이 태그를 언급한 리뷰는 건드리지 않는다.
  */
 const CODE_BLOCK_WRAPPER = /^\s*<CodeBlock\b[^>]*>([\s\S]*)<\/CodeBlock>\s*$/;
+/** 앞뒤에 설명이 붙은 경우 — 첫 블록의 안쪽. 원문 파싱이 실패했을 때만 쓰므로 언급과 섞이지 않는다. */
+const CODE_BLOCK_ANY = /<CodeBlock\b[^>]*>([\s\S]*?)<\/CodeBlock>/;
 
 export function parseGPTResponse(raw: string): ReviewResult {
-  const unwrapped = raw.match(CODE_BLOCK_WRAPPER)?.[1] ?? raw;
+  const unwrapped = raw.match(CODE_BLOCK_WRAPPER)?.[1] ?? raw.match(CODE_BLOCK_ANY)?.[1] ?? raw;
   return parseReview(raw, raw) ?? parseReview(unwrapped.replace(CITATION, ''), raw)
     // 파싱 실패 — 호출부가 게시를 거부해야 한다.
     ?? { summary: raw.slice(0, 3000), approval: 'comment', comments: [], raw, parsed: false };

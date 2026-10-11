@@ -919,14 +919,14 @@ export class ChatGPTDriver {
       // pelican-music#51). 라운드 안에서 실패하면 탭 사정인데도 PR 이 오류·재시도
       // 횟수·5분 대기를 떠안는다. 여기서 실패하면 탭 임대만 실패하고 PR 은 다음 배치로 간다.
       //
-      // 로딩도 **차례를 쥔 채** 한다. 프로젝트 입력창 초안은 탭 사이에 공유되는데, 옆 탭이
-      // 입력하는 도중에 뜬 탭은 그 초안을 복원해 갖고, 옆 탭이 보낸 뒤에도 사본이 남는다.
-      // 진입 가드가 그걸 사람의 초안으로 보고 그 탭의 라운드가 전부 막혔다 (2026-10-10:
-      // 84,920자 직접 입력 8초 사이에 뜬 탭 둘에서 9회 — platelog-site#1 과 동시).
-      await child.withTurn(async () => {
-        await child.navigateToChatGPT();
-        await child.requirePage().locator(this.cfg.selectors.textInput).first().waitFor({ state: 'visible', timeout: 15_000 });
-      });
+      //
+      // 로딩은 **차례를 기다리지 않는다.** 옆 탭이 입력하는 도중에 뜬 탭은 공유 초안의 사본을
+      // 갖게 되지만(2026-10-10 · platelog-site#1 과 동시에 뜬 탭 둘에서 9회), 그 사본은 우리
+      // 리뷰 프롬프트라 진입할 때 `clearOwnDraft` 가 지운다. 한때 여기서 차례를 기다렸더니,
+      // 임대가 앞선 라운드들의 진입·입력이 다 끝날 때까지 막히고 그동안 사이클 전체(스캔·나머지
+      // 슬롯)가 멈췄다 — 동시 리뷰 수를 5로 올려도 6분 넘게 2건만 돌았다 (2026-10-12).
+      await child.navigateToChatGPT();
+      await child.requirePage().locator(this.cfg.selectors.textInput).first().waitFor({ state: 'visible', timeout: 15_000 });
     } catch (error) {
       const seen = await child.describePage();
       await child.close();
