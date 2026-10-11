@@ -539,3 +539,15 @@ test('재시도를 다 쓴 ERROR 는 리뷰 대상이 바뀌면 재시도 횟수
   applySyncEvents(f.cfg, f.ctx, { status: 'OPEN', headSha: 'c'.repeat(40), baseRef: 'main' });
   assert.equal(f.ctx.state, 'ERROR');
 }));
+
+test('parseGPTResponse: 답 전체를 감싼 <CodeBlock> 태그를 벗겨 JSON 을 읽는다 (osk-system#183)', () => {
+  const json = '{\n  "summary": "확인했습니다.",\n  "approval": "approve",\n  "comments": [],\n'
+    + '  "reviewedHeadSha": "91f5f1e", "reviewedBaseSha": "5bf8120"\n}';
+  const r = parseGPTResponse(`<CodeBlock language="json" editable={false}>${json}</CodeBlock>`);
+  assert.equal(r.parsed, true);
+  assert.equal(r.approval, 'approve');
+  assert.equal(r.reviewedHeadSha, '91f5f1e');
+  // JSON 문자열 안에서 태그를 언급한 리뷰는 그대로 둔다
+  const mention = '{"summary":"<CodeBlock> 를 언급","approval":"comment","comments":[]}';
+  assert.equal(parseGPTResponse(mention).summary, '<CodeBlock> 를 언급');
+});

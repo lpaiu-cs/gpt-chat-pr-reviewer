@@ -212,6 +212,9 @@ IS_STREAMING 으로 본 뒤** COMPLETE 가 15초 넘게 화면에 안 나타나�
 문구면 `/backend-api/conversation/<id>` 의 현재 가지에서 마지막 질문 뒤의 최종 답(텍스트·받는
 쪽 all)을 읽는다. 읽은 답도 파서의 형식·대상 SHA 검증을 그대로 거친다. 서버에도 없으면 문구를
 밝힌 오류로 던진다 — 원인을 "JSON 없음" 으로 가리지 않는다.
+배포 뒤 서버 기록으로 원인이 확정됐다: 답이 `<CodeBlock language="json" editable={false}>…</CodeBlock>`
+로 감싸여 왔고 화면이 그 태그를 못 그렸다. 파서는 바깥 한 겹의 이 태그를 벗겨 읽는다
+(`CODE_BLOCK_WRAPPER` — 첫 `{` 를 태그의 `editable={false}` 에서 잡아 추출이 실패했었다).
 
 **생성 중에는 절대 전송하지 않는다** (`waitUntilIdle`). 전송 버튼 자리가 중지
 버튼이라 진행 중인 응답을 끊는다. 우리 라운드가 실패로 접혀도 브라우저의 생성은
