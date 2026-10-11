@@ -201,7 +201,9 @@ function toCard(c: PRContext): ContextCard {
     excludedReason: c.excludedReason,
     quotaRetryAt: c.quotaRetryAt,
     // reviewer 가 이미 280자로 자른다 — 여기서 더 자르면 ACCESS_FAILED 이유가 잘린다.
-    lastError: c.lastError?.slice(0, 300),
+    // 오류 상태일 때만 싣는다. lastError 는 게시해야 지워져서(복구 판정에도 쓴다) 재시도 대기·
+    // 리뷰 중인 카드에 고친 뒤의 옛 오류가 그대로 떠 "아직도 실패한다" 로 읽혔다 (2026-10-12).
+    lastError: c.state === 'ERROR' ? c.lastError?.slice(0, 300) : undefined,
     conversationUrl: c.conversationUrl,
     conversationTurns: c.conversationUrl ? c.conversationTurns : undefined,
     updatedAt: c.updatedAt,

@@ -550,4 +550,6 @@ test('parseGPTResponse: 답 전체를 감싼 <CodeBlock> 태그를 벗겨 JSON �
   // JSON 문자열 안에서 태그를 언급한 리뷰는 그대로 둔다
   const mention = '{"summary":"<CodeBlock> 를 언급","approval":"comment","comments":[]}';
   assert.equal(parseGPTResponse(mention).summary, '<CodeBlock> 를 언급');
+  // 앞뒤에 설명이 붙어도 블록 안을 읽는다
+  assert.equal(parseGPTResponse(`리뷰 결과입니다.\n<CodeBlock language="json" editable={false}>${json}</CodeBlock>\n끝.`).parsed, true);
 });
