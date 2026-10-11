@@ -562,6 +562,53 @@ export function judgeStaleTab(
   return s.completeForMs >= graceMs && s.reloads < maxReloads;
 }
 
+/**
+ * 답 자리에 답 대신 그려진 ChatGPT 화면 오류 문구인가.
+ *
+ * 2026-10-12 실측: 특정 PR 만 매번(3/3) 답이 27자 "This response couldn’t load" 로 끝났다
+ * (lolchess_base#113·#116·#117 — 크기와 무관, 같은 시각 더 큰 diff 는 정상). 직전에 답 글자가
+ * 잠깐 그려졌다가(41자) 노드가 교체되며 이 문구가 됐다 — 답은 왔는데 화면이 못 그린 모양이다.
+ * 이걸 답으로 받으면 "리뷰 JSON 없음" 으로 실패하고, 재시도가 같은 대화에 같은 질문을 또 보낸다.
+ */
+export function isUnloadedAnswer(text: string): boolean {
+  return /^This response couldn[’']t load\.?$/i.test(text.trim());
+}
+
+/** 서버 대화 기록(`/backend-api/conversation/<id>`)에서 쓰는 모양만. */
+export interface ServerConversation {
+  current_node?: string;
+  mapping?: Record<string, {
+    parent?: string | null;
+    message?: {
+      author?: { role?: string };
+      recipient?: string;
+      content?: { content_type?: string; parts?: unknown[] };
+    } | null;
+  }>;
+}
+
+/**
+ * 서버 기록에서 **마지막 질문 뒤의 최종 답** 본문 (없으면 null · 순수 함수).
+ *
+ * 현재 가지(`current_node` 에서 부모로)만 걷는다 — 다시 생성한 옛 가지의 답을 집으면 안 된다.
+ * 추론 요약·도구 호출(content_type 이 text 가 아니거나 받는 쪽이 all 이 아닌 것)은 답이 아니다.
+ * 마지막 질문을 만나면 멈춘다 — 그 앞의 답은 직전 라운드의 것이다.
+ */
+export function pickServerAnswer(conv: ServerConversation): string | null {
+  const nodes = conv.mapping ?? {};
+  const seen = new Set<string>();
+  for (let id = conv.current_node; id && nodes[id] && !seen.has(id); id = nodes[id].parent ?? undefined) {
+    seen.add(id);
+    const m = nodes[id].message;
+    const role = m?.author?.role;
+    if (role === 'user') return null;
+    if (role !== 'assistant' || (m?.recipient ?? 'all') !== 'all' || m?.content?.content_type !== 'text') continue;
+    const text = (m.content.parts ?? []).filter((p): p is string => typeof p === 'string').join('');
+    if (text.trim()) return text;
+  }
+  return null;
+}
+
 /** 복구 판정에 쓰는 신호들. */
 export interface BrowserLiveness {
   /** 컨텍스트(= 브라우저)가 살아 있는가 */
@@ -2042,7 +2089,7 @@ export class ChatGPTDriver {
       // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일
       if (!streaming && lastText.trim().length > 0 && stable >= SETTLE_STABLE_READS) {
         console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
-        return lastText;
+        return this.settleAnswer(page, lastText);
       }
 
       // 중지 버튼이 끝내 안 사라지는 경우의 완료 (#109).
@@ -2068,7 +2115,7 @@ export class ChatGPTDriver {
           ),
         );
         console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
-        return lastText;
+        return this.settleAnswer(page, lastText);
       }
 
       // ── 서버는 끝났는데 탭만 생성 중 (judgeStaleTab) ──
@@ -2162,7 +2209,7 @@ export class ChatGPTDriver {
       // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
       // 완성본일 가능성이 높으므로 복구용으로 쓴다 — 종전 동작.
       console.log(chalk.yellow('  ⚠ 예산 소진 — 생성은 끝나 있어 현재 텍스트를 사용합니다.'));
-      return lastText;
+      return this.settleAnswer(page, lastText);
     }
 
     const quota = await this.detectQuotaLimit(page);
@@ -2293,6 +2340,37 @@ export class ChatGPTDriver {
         return null;
       }
     }, { conv: id, ms: SERVER_STATUS_TIMEOUT_MS }).catch(() => null);
+  }
+
+  /**
+   * 화면이 답 대신 오류 문구를 그렸으면(`isUnloadedAnswer`) 서버 기록의 답으로 바꾼다.
+   * 서버에도 없으면 던진다 — 그 문구를 답으로 넘기면 "리뷰 JSON 없음" 으로 원인이 가려진다.
+   * 읽은 답도 파서의 형식·대상 SHA 검증을 그대로 거친다.
+   */
+  private async settleAnswer(page: Page, text: string): Promise<string> {
+    if (!isUnloadedAnswer(text)) return text;
+    let id: string | undefined;
+    try { id = parseConversationUrl(page.url())?.split('/c/')[1]; } catch { /* 아래에서 실패 */ }
+    const conv = id ? await page.evaluate(async ({ conv, ms }) => {
+      try {
+        const signal = AbortSignal.timeout(ms);
+        const session = await (await fetch('/api/auth/session', { credentials: 'include', signal })).json();
+        if (!session?.accessToken) return null;
+        const r = await fetch(`/backend-api/conversation/${conv}`, {
+          headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include', signal,
+        });
+        return r.ok ? await r.json() : null;
+      } catch {
+        return null;
+      }
+    }, { conv: id, ms: SERVER_STATUS_TIMEOUT_MS * 3 }).catch(() => null) : null;
+    const answer = conv ? pickServerAnswer(conv) : null;
+    if (!answer || isUnloadedAnswer(answer)) {
+      throw new Error(`ChatGPT 화면이 답 대신 "${text.trim()}" 를 띄웠고 서버 기록에서도 답을 찾지 못했습니다`
+        + ` (${conv ? '기록에 최종 답 없음' : '기록 조회 실패'}) — 대화에서 직접 확인하세요: ${page.url()}`);
+    }
+    console.log(chalk.yellow(`  ⚠ 화면이 답을 그리지 못했습니다 ("${text.trim()}") — 서버 기록에서 ${answer.length.toLocaleString()}자를 읽었습니다.`));
+    return answer;
   }
 
   /**

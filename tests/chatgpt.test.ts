@@ -12,6 +12,8 @@ import {
   judgeStuckButton,
   judgeStaleTab,
   isOwnDraft,
+  isUnloadedAnswer,
+  pickServerAnswer,
   matchInterrupt,
   type MessageRef,
 } from '../src/chatgpt.js';
@@ -336,4 +338,31 @@ test('isOwnDraft: 우리가 넣다 만 리뷰 프롬프트만 지울 대상으�
   assert.equal(isOwnDraft('keep my draft', [], template), false);
   assert.equal(isOwnDraft(head, ['notes.txt'], template), false);
   assert.equal(isOwnDraft('짧은 머리말 뒤 사람 글', [], '짧은 {{url}}'), false);
+});
+
+test('isUnloadedAnswer: 답 자리의 화면 오류 문구만 알아본다', () => {
+  assert.equal(isUnloadedAnswer('This response couldn’t load'), true);
+  assert.equal(isUnloadedAnswer(" This response couldn't load. \n"), true);
+  assert.equal(isUnloadedAnswer('{"summary":"This response couldn’t load"}'), false);
+});
+
+test('pickServerAnswer: 현재 가지에서 마지막 질문 뒤의 최종 답만 고른다', () => {
+  const msg = (role: string, text: string, extra: Record<string, unknown> = {}) =>
+    ({ author: { role }, recipient: 'all', content: { content_type: 'text', parts: [text] }, ...extra });
+  const conv = {
+    current_node: 'a2',
+    mapping: {
+      u1: { parent: null, message: msg('user', '1차 질문') },
+      a1: { parent: 'u1', message: msg('assistant', '1차 답') },
+      u2: { parent: 'a1', message: msg('user', '2차 질문') },
+      t2: { parent: 'u2', message: { author: { role: 'assistant' }, content: { content_type: 'thoughts', parts: [] } } },
+      c2: { parent: 't2', message: msg('assistant', 'python(...)', { recipient: 'python' }) },
+      a2: { parent: 'c2', message: msg('assistant', '{"summary":"ok"}') },
+      old: { parent: 'u2', message: msg('assistant', '다시 생성되기 전 옛 답') },
+    },
+  };
+  assert.equal(pickServerAnswer(conv), '{"summary":"ok"}');
+  // 마지막 질문 뒤에 답이 아직 없으면 직전 라운드의 답으로 물러서지 않는다
+  assert.equal(pickServerAnswer({ ...conv, current_node: 't2' }), null);
+  assert.equal(pickServerAnswer({}), null);
 });
