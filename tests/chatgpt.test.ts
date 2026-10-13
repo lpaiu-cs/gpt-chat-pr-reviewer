@@ -10,7 +10,6 @@ import {
   judgeRebind,
   judgeRevival,
   judgeStuckButton,
-  judgeStaleTab,
   isOwnDraft,
   isUnloadedAnswer,
   pickServerAnswer,
@@ -233,23 +232,46 @@ test('judgeStuckButton: 토큰 간격 정도의 정지로는 끊지 않는다', 
   assert.equal(judgeStuckButton({ ...stuck, idleMs: 120_000 }), true);
 });
 
-// 서버는 끝났는데 탭만 생성 중 — pelican-music#66: 서버 375초, 탭은 전송 후 약 600초에야 그렸다.
-const stale = { streaming: true, sawServerStreaming: true, completeForMs: 15_000, reloads: 0 };
-
-test('judgeStaleTab: 서버 COMPLETE 뒤에도 탭이 여유를 넘겨 생성 중이면 새로고침한다', () => {
-  assert.equal(judgeStaleTab(stale), true);
-  assert.equal(judgeStaleTab({ ...stale, completeForMs: 14_999 }), false); // 정상 지연(2~10초)은 기다린다
-});
-
-test('judgeStaleTab: 이번 생성을 IS_STREAMING 으로 본 적 없으면 COMPLETE 를 믿지 않는다', () => {
-  // 이어 쓰는 대화는 전송 직후 직전 턴의 COMPLETE 가 남아 있을 수 있다.
-  assert.equal(judgeStaleTab({ ...stale, sawServerStreaming: false }), false);
-});
-
-test('judgeStaleTab: 탭이 이미 따라왔거나 상한을 썼으면 새로고침하지 않는다', () => {
-  assert.equal(judgeStaleTab({ ...stale, streaming: false }), false);
-  assert.equal(judgeStaleTab({ ...stale, completeForMs: null }), false);
-  assert.equal(judgeStaleTab({ ...stale, reloads: 2 }), false);
+// 탭이 멎어도 서버가 마친 답은 받는다 — lolchess_base#137: 수집 루프가 51분 멎은 채 서버가 마친 답을 버렸다.
+test('collectResponse: 탭이 멎으면 서버 기록의 답을 받고, 그 탭은 다음 라운드 전에 갈아 끼운다', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  t.mock.method(console, 'log', () => {});
+  const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
+  driver.preparePage = async () => {};
+  // 이번 생성을 IS_STREAMING 으로 본 뒤의 COMPLETE 만 믿는다 — 첫 COMPLETE 를 직전 턴의 것으로 두지 않게.
+  const statuses = ['COMPLETE', 'IS_STREAMING', 'COMPLETE'];
+  const conv = { current_node: 'a', mapping: {
+    u: { message: { author: { role: 'user' } } },
+    a: { parent: 'u', message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['{"summary":"ok"}'] } } },
+  } };
+  const hung = new Promise<never>(() => {});
+  let probes = 0;
+  const page = {
+    url: () => 'https://chatgpt.com/g/g-p-6aa1d12d5db88191870747513394cb0e-jadong-pr-ribyu/c/6acd33bf-39f0-83e8-add2-09d48b0af407',
+    waitForTimeout: () => hung, // 탭에 대한 호출이 돌아오지 않는다
+    evaluate: () => hung,
+    context: () => ({
+      newPage: async () => {
+        probes++;
+        return {
+          goto: async () => {},
+          close: async () => {},
+          evaluate: async (_fn: unknown, { path }: { path: string }) =>
+            path.endsWith('/stream_status') ? { status: statuses.shift() ?? 'COMPLETE' } : conv,
+        };
+      },
+    }),
+  };
+  let answer: string | undefined;
+  const collecting = driver.collectResponse(page, 0, null).then((a: string) => { answer = a; });
+  for (let i = 0; i < 200 && answer === undefined; i++) {
+    await new Promise(setImmediate);
+    t.mock.timers.tick(5_000);
+  }
+  await collecting;
+  assert.equal(answer, '{"summary":"ok"}');
+  assert.ok(probes >= 3, `${probes}`);
+  assert.equal(driver.pageRetired, true);
 });
 
 // 죽은 브라우저 되살리기 (#109 의 별개 증상)

@@ -948,7 +948,11 @@ program
       release: () => releaseTabs(),
       run: async (e, tab, index, total) => {
         const outcome = await runQueued(e, index, total, tab);
-        if (outcome === 'failed') await dropTab(tab).catch(() => {});
+        // 슬롯 0 은 브라우저 자체라 닫지 않고, 다음 라운드 전에 탭만 갈아 끼운다.
+        if (outcome === 'failed') {
+          if (tab && tab === driver) tab.retirePage();
+          else await dropTab(tab).catch(() => {});
+        }
         return outcome;
       },
       settled: (e, outcome) => settleRound(e, outcome),
@@ -1415,7 +1419,8 @@ program
      *
      * 같은 이유로 **라운드가 실패한 추가 탭은 바로 버린다**(`dropTab`). 탭에 남은 상태(공유
      * 초안의 사본 등)가 실패 원인이면 재시도가 같은 탭에서 같은 이유로 계속 막힌다 —
-     * 2026-10-10 에 두 슬롯이 1분 반 동안 9번 막혔다. 슬롯 0 은 브라우저 자체라 두지 않는다.
+     * 2026-10-10 에 두 슬롯이 1분 반 동안 9번 막혔다. 슬롯 0 은 브라우저 자체라 닫지 않고
+     * 탭만 갈아 끼운다(`retirePage`) — 두었더니 망가진 탭에서 6번 연속 실패했다 (2026-10-13).
      */
     const extraTabs = new Map<number, ChatGPTDriver>();
     const leaseTab = async (slot: number): Promise<ChatGPTDriver | null> => {

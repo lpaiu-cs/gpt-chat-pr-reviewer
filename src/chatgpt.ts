@@ -531,35 +531,59 @@ const SERVER_STATUS_EVERY_MS = 30_000;
 const SERVER_STATUS_TIMEOUT_MS = 10_000;
 /** 서버가 끝났다고 한 뒤 탭이 따라올 여유 — 정상 지연(2~10초)과 비교도 안 되게 잡는다. */
 const STALE_TAB_GRACE_MS = 15_000;
-/** 같은 수집에서 이 이유로 새로고침하는 상한. */
-const MAX_STALE_TAB_RELOADS = 2;
+/**
+ * 탭 수집이 예산을 이만큼 넘기고도 이만큼 한 바퀴도 못 돌면 탭이 멎은 것으로 보고 서버 감시가 대신 접는다.
+ * 새로고침 한 번(최대 66초)보다 넉넉하게 잡는다 — 그건 멎은 게 아니다.
+ */
+const TAB_STALL_MS = 120_000;
 
-/** 탭이 낡았는지 판정하는 신호들. */
-export interface StaleTabSignals {
-  /** 탭에 중지 버튼이 보이는가 */
-  streaming: boolean;
+/** 탭 수집(`collectFromTab`)과 서버 감시(`watchServer`)가 나눠 쓰는 값. */
+interface CollectShared {
+  /** 한쪽이 끝났다 — 다른 쪽은 더 하지 않는다 */
+  stopped: boolean;
   /** 이번 수집에서 서버가 IS_STREAMING 이라고 답한 적이 있는가 */
   sawServerStreaming: boolean;
-  /** 그 뒤 서버가 COMPLETE 라고 답한 지 얼마나 됐나 (못 봤으면 null) */
-  completeForMs: number | null;
-  /** 이번 수집에서 이 이유로 새로고침한 횟수 */
-  reloads: number;
+  /** 그 뒤 서버가 COMPLETE 라고 답한 시각 (못 봤으면 null) */
+  completeSince: number | null;
+  /** 탭 수집의 예산 끝 (연장하면 늘어난다) */
+  deadline: number;
+  /** 탭 수집이 마지막으로 한 바퀴를 시작한 시각 */
+  lastPollAt: number;
 }
 
-/**
- * 서버는 끝났는데 탭이 아직 생성 중으로 보이는가 — 새로고침해 완성본을 가져올 때인가 (순수 함수).
- *
- * **이번 생성을 IS_STREAMING 으로 본 뒤의 COMPLETE 만** 믿는다. 이어 쓰는 대화는 전송
- * 직후에 직전 턴의 COMPLETE 가 남아 있을 수 있고, 그걸 믿으면 생성 중인 탭을 새로고침한다.
- * 엔드포인트가 바뀌어 IS_STREAMING 을 끝내 못 보면 아무 일도 하지 않는다 (종전 동작).
- */
-export function judgeStaleTab(
-  s: StaleTabSignals,
-  graceMs: number = STALE_TAB_GRACE_MS,
-  maxReloads: number = MAX_STALE_TAB_RELOADS,
-): boolean {
-  if (!s.streaming || !s.sawServerStreaming || s.completeForMs === null) return false;
-  return s.completeForMs >= graceMs && s.reloads < maxReloads;
+/** 시간 안에 안 끝나면 TIMED_OUT — Playwright 의 페이지 호출에는 제한이 없어 멎은 탭에서 영영 기다린다. */
+const TIMED_OUT = Symbol('timed-out');
+async function within<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), ms); });
+  try { return await Promise.race([work, late]); } finally { clearTimeout(timer); }
+}
+
+/** 탭과 무관하게 쉰다 — 수집이 끝나면(abort) 바로 깨어나 던져, 끝난 수집의 타이머를 남기지 않는다. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(new Error('수집이 끝났습니다'));
+    const stop = () => { clearTimeout(timer); reject(new Error('수집이 끝났습니다')); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, ms);
+    signal.addEventListener('abort', stop, { once: true });
+  });
+}
+
+/** 페이지 안에서 로그인 토큰으로 비공개 API 를 부른다 — 토큰은 페이지 밖으로 나오지 않는다. 실패는 null. */
+async function fetchServerInPage({ path, ms }: { path: string; ms: number }): Promise<unknown> {
+  try {
+    // 두 요청과 본문 읽기를 한 시간 제한으로 묶는다. 응답이 끝나지 않는 연결은 예외도 없이
+    // 수집을 붙잡아, 답이 화면에 떠도 못 받고 슬롯을 점유한다 (#60 리뷰).
+    const signal = AbortSignal.timeout(ms);
+    const session = await (await fetch('/api/auth/session', { credentials: 'include', signal })).json();
+    if (!session?.accessToken) return null;
+    const r = await fetch(path, {
+      headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include', signal,
+    });
+    return r.ok ? await r.json() : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -740,6 +764,8 @@ export class ChatGPTDriver {
   private netInFlight = 0;
   /** 마지막으로 생성 네트워크가 움직인 시각 */
   private lastNetAt = 0;
+  /** 이 탭을 더 쓰지 않는다 — 다음 라운드 전에 `ensureAlive` 가 새 탭으로 갈아 끼운다 (`retirePage`). */
+  private pageRetired = false;
 
   constructor(config: AppConfig) {
     validateProjectUrl(config.chatgptProjectUrl);
@@ -765,6 +791,7 @@ export class ChatGPTDriver {
       ],
     });
     this.page = this.ctx.pages()[0] ?? (await this.ctx.newPage());
+    this.pageRetired = false;
     await this.preparePage(this.page);
   }
 
@@ -787,11 +814,13 @@ export class ChatGPTDriver {
    *
    * 로그인은 persistent profile 에 남으므로 다시 띄워도 그대로 이어진다.
    *
+   * 버리기로 한 탭(`retirePage`)도 여기서 갈아 끼운다 — 라운드 시작 때만이다 (`replaceRetired`).
+   *
    * @returns 되살렸으면 true (살아 있었으면 false)
    */
-  async ensureAlive(): Promise<boolean> {
+  async ensureAlive(replaceRetired = true): Promise<boolean> {
     const ctxAlive = this.ctx !== null && (this.ctx.browser()?.isConnected() ?? true);
-    const pageAlive = this.page !== null && !this.page.isClosed();
+    const pageAlive = this.page !== null && !this.page.isClosed() && !(replaceRetired && this.pageRetired);
     const plan = judgeRevival({ ctxAlive, pageAlive, owned: this.owned });
     if (plan === 'ok') return false;
 
@@ -804,8 +833,14 @@ export class ChatGPTDriver {
     };
 
     if (plan === 'reopen-tab' && this.ctx) {
-      console.log(chalk.yellow('  ⚠ 탭이 닫혔 있습니다 — 같은 브라우저에 탭만 다시 엽니다.'));
+      const old = this.page;
+      console.log(chalk.yellow(this.pageRetired
+        ? '  ⚠ 직전 라운드의 탭을 버리고 새 탭을 엽니다.'
+        : '  ⚠ 탭이 닫혔 있습니다 — 같은 브라우저에 탭만 다시 엽니다.'));
+      // 새 탭을 먼저 연다 — 탭이 하나도 없는 순간을 만들지 않는다.
       this.page = await this.ctx.newPage();
+      this.pageRetired = false;
+      await old?.close().catch(() => {});
       await this.preparePage(this.page);
       resetTraffic();
       await this.navigateToChatGPT();
@@ -903,7 +938,8 @@ export class ChatGPTDriver {
     // 얻기 전에 배치 전체가 시작도 못 하고, 다음 사이클도 같은 ctx 에서 다시
     // fork 하여 데몬 재시작 전까지 반복 실패한다 — 이 PR 이 없애려는 바로 그
     // 영속 고착이다. 여기서 먼저 되살리면 탭을 빌리는 모든 경로가 보호된다.
-    await this.ensureAlive();
+    // 부모 탭은 라운드 중일 수 있다 — 버릴 탭이어도 여기서 갈아 끼우면 그 라운드의 화면이 닫힌다.
+    await this.ensureAlive(false);
     const ctx = this.ctx;
     if (!ctx) throw new Error('Browser not launched — call launch() first');
     const child = new ChatGPTDriver(this.cfg);
@@ -976,6 +1012,18 @@ export class ChatGPTDriver {
     const leave = this.leaveTurn;
     this.leaveTurn = null;
     leave?.();
+  }
+
+  /**
+   * 이 탭을 더 쓰지 않는다 — 다음 라운드 전에 `ensureAlive` 가 새 탭으로 갈아 끼운다.
+   *
+   * 슬롯 0 은 브라우저 자체라 실패해도 버리지 않았는데(추가 탭은 `dropTab`), 그 탭이 망가지면
+   * 다음 라운드들이 전부 같은 탭에서 실패했다: 2026-10-13 lolchess_base#137 의 응답 대기에서
+   * 수십 분씩 멎은 탭으로 #137·#139 가 6번 연속 "사이드바에서 프로젝트를 찾지 못했습니다"
+   * 로 재시도 예산을 다 썼다 (같은 시각 다른 탭의 #138 은 진입·게시까지 정상).
+   */
+  retirePage(): void {
+    this.pageRetired = true;
   }
 
   async close(): Promise<void> {
@@ -1766,14 +1814,99 @@ export class ChatGPTDriver {
   }
 
   /**
-   * 어시스턴트 응답이 완전히 스트리밍 될 때까지 폴링한다.
-   * 3회 연속 동일 텍스트이면 완료로 간주.
+   * 응답을 받는다 — 탭 화면 수집(`collectFromTab`)과 서버 감시(`watchServer`) 중 먼저 끝나는 쪽.
+   *
+   * 둘을 따로 돌리는 이유: 탭에 대한 Playwright 호출은 제한 시간이 없어, 탭이 멎으면 수집 루프가
+   * 통째로 멎는다. 2026-10-13 lolchess_base#137 은 루프 한 바퀴가 51분, 다음이 18분 걸렸다 — 같은
+   * 시각 옆 탭의 라운드 둘은 정상이었고 브라우저의 CPU·메모리도 멀쩡했다. 서버 확인이 그 루프
+   * 안에 있어 같이 멎었고, 서버가 마친 답(화면 "Response complete")을 72분 만에 타임아웃으로 버렸다.
    */
   private async collectResponse(
     page: Page,
     messageCountBefore: number,
     afterUserId: string | null = null,
     timeout = this.cfg.responseTimeoutMs,
+  ): Promise<string> {
+    const shared: CollectShared = {
+      stopped: false, sawServerStreaming: false, completeSince: null,
+      deadline: Date.now() + timeout, lastPollAt: Date.now(),
+    };
+    const stop = new AbortController();
+    const fromTab = this.collectFromTab(page, messageCountBefore, afterUserId, timeout, shared);
+    let serverWon = false;
+    const fromServer = this.watchServer(page, shared, stop.signal).then((answer) => { serverWon = true; return answer; });
+    // 진 쪽의 늦은 결과·오류는 버린다.
+    fromTab.catch(() => {});
+    fromServer.catch(() => {});
+    try {
+      return await Promise.race([fromTab, fromServer]);
+    } finally {
+      shared.stopped = true;
+      stop.abort();
+      // 서버가 먼저 답했으면 탭 수집이 멈출 때까지 잠깐 본다. 안 멈추면 멎은 탭이다 — 다음 라운드가
+      // 그 탭을 쓰지 않게 하고, 늦게 깨어난 루프가 새 라운드의 화면을 건드리지 못하게 한다.
+      if (serverWon && (await within(fromTab.catch(() => ''), 15_000)) === TIMED_OUT) this.retirePage();
+    }
+  }
+
+  /**
+   * 탭과 **따로** 서버에 응답 상태를 묻고, 서버가 마친 답을 탭이 받아 오지 못하면 서버 기록에서 읽는다.
+   *
+   * 탭 화면은 완료의 권위가 아니다 (2026-10 실측). 서버가 375~555초에 끝낸 답을 데몬 탭은
+   * 전송 후 약 600초에 웹앱이 스스로 다시 맞출 때까지 그리지 않았다. 예전에는 그때 탭을
+   * 새로고침했는데, 무거운 대화는 다시 여는 데만 2분이 넘게 걸렸다. 답은 이미 서버 기록에 있다 —
+   * 화면이 답 대신 "This response couldn’t load" 를 그릴 때 읽는 바로 그 기록이다 (`settleAnswer`).
+   *
+   * **이번 생성을 IS_STREAMING 으로 본 뒤의 COMPLETE 만** 믿는다. 이어 쓰는 대화는 전송 직후에
+   * 직전 턴의 COMPLETE 가 남아 있을 수 있다. 조회 실패(null)는 아무 일도 하지 않는다 — 탭 수집만 남는다.
+   *
+   * 탭 수집이 멎어 자기 예산을 지키지 못하면 여기서 대신 타임아웃으로 접는다 (회수는 호출부가 맡는다).
+   */
+  private async watchServer(page: Page, s: CollectShared, signal: AbortSignal): Promise<string> {
+    await pause(SERVER_STATUS_AFTER_MS, signal);
+    for (;;) {
+      const status = await this.serverStreamStatus(page);
+      if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
+      if (status === 'IS_STREAMING') {
+        if (!s.sawServerStreaming) console.log(chalk.dim('  서버 응답 상태: 생성 중 (stream_status) — 탭이 늦으면 서버 기록에서 읽습니다.'));
+        s.sawServerStreaming = true;
+        s.completeSince = null;
+      } else if (status === 'COMPLETE' && s.sawServerStreaming) {
+        s.completeSince ??= Date.now();
+        if (Date.now() - s.completeSince >= STALE_TAB_GRACE_MS) {
+          const conv = await this.serverConversation(page);
+          const answer = conv ? pickServerAnswer(conv) : null;
+          if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
+          if (answer && !isUnloadedAnswer(answer)) {
+            console.log(chalk.yellow(
+              `  ⚠ 서버는 응답을 마쳤는데(stream_status=COMPLETE) 탭이 ${Math.round((Date.now() - s.completeSince) / 1000)}초째 ` +
+                `받아 오지 못했습니다 — 서버 기록에서 ${answer.length.toLocaleString()}자를 읽었습니다.`,
+            ));
+            return answer;
+          }
+        }
+      }
+      if (Date.now() > s.deadline + TAB_STALL_MS && Date.now() - s.lastPollAt > TAB_STALL_MS) {
+        this.retirePage();
+        throw new ResponseTimeoutError(
+          `탭이 ${Math.round((Date.now() - s.lastPollAt) / 60_000)}분째 응답하지 않아 예산 안에 응답을 받지 못했습니다 — ` +
+            '탭을 새로 열고 같은 대화를 다시 확인합니다.',
+        );
+      }
+      await pause(SERVER_STATUS_EVERY_MS, signal);
+    }
+  }
+
+  /**
+   * 어시스턴트 응답이 완전히 스트리밍 될 때까지 탭 화면을 폴링한다.
+   * 3회 연속 동일 텍스트이면 완료로 간주.
+   */
+  private async collectFromTab(
+    page: Page,
+    messageCountBefore: number,
+    afterUserId: string | null,
+    timeout: number,
+    shared: CollectShared,
   ): Promise<string> {
     const sel = this.cfg.selectors;
 
@@ -1923,13 +2056,7 @@ export class ChatGPTDriver {
     // 앞서 다른 중단을 복구한 이력으로 이번 중단을 새로고침 없이 종료로 확정하면, 다시
     // 읽으면 회수할 수 있던 답을 버리고 같은 질문을 재전송한다 (#51 리뷰).
     let emptyReloaded = false;
-    // 서버 응답 상태 (judgeStaleTab) — 탭 화면이 서버를 못 따라올 때 새로고침한다.
-    let lastStatusAt = 0;
-    let sawServerStreaming = false;
-    let completeSince: number | null = null;
-    let staleReloads = 0;
     const t0 = Date.now();
-    let deadline = t0 + timeout;
     let extensions = 0;
     const span = (ms: number): string => ms < 60_000 ? `${Math.ceil(ms / 1000)}초` : `${Math.round(ms / 60_000)}분`;
     /** 예산이 다 됐을 때 — 생성이 확실히 진행 중이면 같은 예산을 한 번 더 준다 (MAX_RESPONSE_EXTENSIONS). */
@@ -1937,7 +2064,7 @@ export class ChatGPTDriver {
       if (extensions >= MAX_RESPONSE_EXTENSIONS) return false;
       if (!(await this.isStreaming(page)) || this.stallEvidence(true) !== 'generating') return false;
       extensions++;
-      deadline += timeout;
+      shared.deadline += timeout;
       console.log(chalk.yellow(
         `  ⏳ ${span(Date.now() - t0)} 지났지만 생성이 아직 진행 중입니다 — ` +
           `${span(timeout)} 더 기다립니다 (연장 ${extensions}/${MAX_RESPONSE_EXTENSIONS}).`,
@@ -1960,8 +2087,10 @@ export class ChatGPTDriver {
       misses = 0;
     };
 
-    while (Date.now() < deadline || await extend()) {
+    while (!shared.stopped && (Date.now() < shared.deadline || await extend())) {
       await page.waitForTimeout(3_000);
+      if (shared.stopped) break;
+      shared.lastPollAt = Date.now();
 
       const msgs = await readMessages();
 
@@ -2118,34 +2247,7 @@ export class ChatGPTDriver {
         return this.settleAnswer(page, lastText);
       }
 
-      // ── 서버는 끝났는데 탭만 생성 중 (judgeStaleTab) ──
-      // 중지 버튼이 보이는 동안만 서버에 묻는다. 조회 실패는 null — 종전 동작으로 남는다.
-      if (streaming && Date.now() - t0 >= SERVER_STATUS_AFTER_MS && Date.now() - lastStatusAt >= SERVER_STATUS_EVERY_MS) {
-        lastStatusAt = Date.now();
-        const status = await this.serverStreamStatus(page);
-        if (status === 'IS_STREAMING') {
-          if (!sawServerStreaming) console.log(chalk.dim('  서버 응답 상태: 생성 중 (stream_status) — 탭이 늦으면 새로고침합니다.'));
-          sawServerStreaming = true;
-          completeSince = null;
-        } else if (status === 'COMPLETE' && sawServerStreaming) {
-          completeSince ??= Date.now();
-        }
-      }
-      if (judgeStaleTab({
-        streaming,
-        sawServerStreaming,
-        completeForMs: completeSince === null ? null : Date.now() - completeSince,
-        reloads: staleReloads,
-      })) {
-        staleReloads++;
-        console.log(chalk.yellow(
-          `  ⚠ 서버는 응답을 마쳤는데(stream_status=COMPLETE) 탭은 아직 생성 중으로 보입니다 ` +
-            `(${span(Date.now() - t0)} 경과) — 대화를 새로고침해 완성본을 가져옵니다 (${staleReloads}/${MAX_STALE_TAB_RELOADS})`,
-        ));
-        await reloadConversation();
-        completeSince = Date.now(); // 새로 그린 화면에도 같은 여유를 준다
-        continue;
-      }
+      // 서버는 끝났는데 탭만 생성 중인 경우는 서버 감시(watchServer)가 서버 기록에서 읽는다.
 
       // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
       // 대화를 새로고침하면 완성본을 가져올 수 있다.
@@ -2197,13 +2299,17 @@ export class ChatGPTDriver {
       }
     }
 
+    if (shared.stopped) return ''; // 서버 감시가 먼저 답했다 — 이 값은 쓰이지 않는다
+    // 아래 마무리(한도·진단·서버 기록 확인)도 움직이는 중이다 — 서버 감시의 백스톱이 앞질러 접지 않게.
+    shared.lastPollAt = Date.now();
+
     // ── 예산 소진 ──
     // **아직 생성 중인지**로 가른다. 글자가 좀 쌓였다는 것만으로 "받았다" 고 보면,
     // 15분 직전에 JSON 을 쓰기 시작한 응답이 잘린 채 파서로 넘어가 ReviewRejected
     // 로 둔갑한다. 원인은 타임아웃인데 표기는 붉은 "리뷰 실패" 가 되어, 이 구분이
     // 느린 생성에서 통째로 우회된다.
     const stillGenerating = await this.isStreaming(page);
-    const duration = span(deadline - t0); // 연장까지 포함한 전체 예산
+    const duration = span(shared.deadline - t0); // 연장까지 포함한 전체 예산
 
     if (!stillGenerating && lastText.trim().length > 0) {
       // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
@@ -2320,26 +2426,52 @@ export class ChatGPTDriver {
    * 전송 직후의 임시 주소(/c/WEB:…)는 조회되지 않으므로 실제 id 일 때만 묻는다.
    */
   private async serverStreamStatus(page: Page): Promise<string | null> {
+    const status = (await this.serverJson(page, '/stream_status', SERVER_STATUS_TIMEOUT_MS) as { status?: unknown } | null)?.status;
+    return typeof status === 'string' ? status : null;
+  }
+
+  /** 서버가 아는 이 대화의 기록 (모르면 null). */
+  private async serverConversation(page: Page): Promise<ServerConversation | null> {
+    return await this.serverJson(page, '', SERVER_STATUS_TIMEOUT_MS * 3) as ServerConversation | null;
+  }
+
+  /**
+   * 이 탭의 대화에 대한 비공개 API 응답 (`/backend-api/conversation/<id><suffix>` · 실패는 null).
+   *
+   * 탭이 시간 안에 답하지 않으면 **같은 로그인으로 가벼운 탭을 잠깐 열어** 묻는다 — 멎은 탭에서는
+   * 페이지 안의 fetch 도 돌지 않는다. 그 탭은 더 쓰지 않는다 (`retirePage`).
+   */
+  private async serverJson(page: Page, suffix: string, ms: number): Promise<unknown> {
     let id: string | undefined;
     try { id = parseConversationUrl(page.url())?.split('/c/')[1]; } catch { return null; }
     if (!id) return null;
-    // 두 요청과 본문 읽기를 한 시간 제한으로 묶는다. 응답이 끝나지 않는 연결은 예외도 없이
-    // 수집 루프를 붙잡아, 답이 화면에 떠도 못 받고 슬롯을 점유한다 (#60 리뷰).
-    return page.evaluate(async ({ conv, ms }) => {
-      try {
-        const signal = AbortSignal.timeout(ms);
-        const session = await (await fetch('/api/auth/session', { credentials: 'include', signal })).json();
-        if (!session?.accessToken) return null;
-        const r = await fetch(`/backend-api/conversation/${conv}/stream_status`, {
-          headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include', signal,
-        });
-        if (!r.ok) return null;
-        const status = (await r.json())?.status;
-        return typeof status === 'string' ? status : null;
-      } catch {
-        return null;
-      }
-    }, { conv: id, ms: SERVER_STATUS_TIMEOUT_MS }).catch(() => null);
+    const ask = (p: Page) => p.evaluate(fetchServerInPage, { path: `/backend-api/conversation/${id}${suffix}`, ms }).catch(() => null);
+    // 늦게 깨어난 지난 라운드의 호출이 새 탭을 버리지 않게 — 판정은 이 드라이버의 **지금** 탭에만 한다.
+    const current = page === this.page;
+    if (!(current && this.pageRetired)) {
+      const quick = await within(ask(page), ms + 5_000);
+      if (quick !== TIMED_OUT) return quick;
+      if (current) this.retirePage();
+      console.log(chalk.yellow('  ⚠ 리뷰 탭이 응답하지 않습니다 — 서버 확인은 잠깐 연 다른 탭으로 하고, 이 탭은 라운드가 끝나면 버립니다.'));
+    }
+    // 임시 탭의 모든 단계도 시간 안에 끝낸다 — 브라우저 쪽 호출이 멎으면 서버 감시(와 그 안의 예산
+    // 백스톱)가 같이 멎어 원래 장애로 돌아간다. 닫기는 기다리지 않는다 (그것도 멎을 수 있다).
+    const probe: { page?: Page; done?: boolean } = {};
+    const viaProbe = async (): Promise<unknown> => {
+      const p = await page.context().newPage();
+      if (probe.done) { void p.close().catch(() => {}); return null; }
+      probe.page = p;
+      await this.preparePage(p); // 헤드리스 UA 맞추기 — 안 하면 같은 프로필도 막힌다
+      await p.goto(`${new URL(page.url()).origin}/api/auth/session`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      return ask(p);
+    };
+    try {
+      const slow = await within(viaProbe().catch(() => null), ms + 45_000);
+      return slow === TIMED_OUT ? null : slow;
+    } finally {
+      probe.done = true;
+      void probe.page?.close().catch(() => {});
+    }
   }
 
   /**
@@ -2349,21 +2481,7 @@ export class ChatGPTDriver {
    */
   private async settleAnswer(page: Page, text: string): Promise<string> {
     if (!isUnloadedAnswer(text)) return text;
-    let id: string | undefined;
-    try { id = parseConversationUrl(page.url())?.split('/c/')[1]; } catch { /* 아래에서 실패 */ }
-    const conv = id ? await page.evaluate(async ({ conv, ms }) => {
-      try {
-        const signal = AbortSignal.timeout(ms);
-        const session = await (await fetch('/api/auth/session', { credentials: 'include', signal })).json();
-        if (!session?.accessToken) return null;
-        const r = await fetch(`/backend-api/conversation/${conv}`, {
-          headers: { Authorization: `Bearer ${session.accessToken}` }, credentials: 'include', signal,
-        });
-        return r.ok ? await r.json() : null;
-      } catch {
-        return null;
-      }
-    }, { conv: id, ms: SERVER_STATUS_TIMEOUT_MS * 3 }).catch(() => null) : null;
+    const conv = await this.serverConversation(page);
     const answer = conv ? pickServerAnswer(conv) : null;
     if (!answer || isUnloadedAnswer(answer)) {
       throw new Error(`ChatGPT 화면이 답 대신 "${text.trim()}" 를 띄웠고 서버 기록에서도 답을 찾지 못했습니다`
