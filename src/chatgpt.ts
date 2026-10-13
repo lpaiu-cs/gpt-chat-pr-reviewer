@@ -791,6 +791,7 @@ export class ChatGPTDriver {
       ],
     });
     this.page = this.ctx.pages()[0] ?? (await this.ctx.newPage());
+    this.pageRetired = false;
     await this.preparePage(this.page);
   }
 
@@ -863,7 +864,6 @@ export class ChatGPTDriver {
     }
     this.ctx = null;
     this.page = null;
-    this.pageRetired = false;
     resetTraffic();
 
     await this.launch();
@@ -2300,6 +2300,8 @@ export class ChatGPTDriver {
     }
 
     if (shared.stopped) return ''; // 서버 감시가 먼저 답했다 — 이 값은 쓰이지 않는다
+    // 아래 마무리(한도·진단·서버 기록 확인)도 움직이는 중이다 — 서버 감시의 백스톱이 앞질러 접지 않게.
+    shared.lastPollAt = Date.now();
 
     // ── 예산 소진 ──
     // **아직 생성 중인지**로 가른다. 글자가 좀 쌓였다는 것만으로 "받았다" 고 보면,
@@ -2444,23 +2446,31 @@ export class ChatGPTDriver {
     try { id = parseConversationUrl(page.url())?.split('/c/')[1]; } catch { return null; }
     if (!id) return null;
     const ask = (p: Page) => p.evaluate(fetchServerInPage, { path: `/backend-api/conversation/${id}${suffix}`, ms }).catch(() => null);
-    if (!this.pageRetired) {
+    // 늦게 깨어난 지난 라운드의 호출이 새 탭을 버리지 않게 — 판정은 이 드라이버의 **지금** 탭에만 한다.
+    const current = page === this.page;
+    if (!(current && this.pageRetired)) {
       const quick = await within(ask(page), ms + 5_000);
       if (quick !== TIMED_OUT) return quick;
-      this.retirePage();
+      if (current) this.retirePage();
       console.log(chalk.yellow('  ⚠ 리뷰 탭이 응답하지 않습니다 — 서버 확인은 잠깐 연 다른 탭으로 하고, 이 탭은 라운드가 끝나면 버립니다.'));
     }
-    let probe: Page | null = null;
+    // 임시 탭의 모든 단계도 시간 안에 끝낸다 — 브라우저 쪽 호출이 멎으면 서버 감시(와 그 안의 예산
+    // 백스톱)가 같이 멎어 원래 장애로 돌아간다. 닫기는 기다리지 않는다 (그것도 멎을 수 있다).
+    const probe: { page?: Page; done?: boolean } = {};
+    const viaProbe = async (): Promise<unknown> => {
+      const p = await page.context().newPage();
+      if (probe.done) { void p.close().catch(() => {}); return null; }
+      probe.page = p;
+      await this.preparePage(p); // 헤드리스 UA 맞추기 — 안 하면 같은 프로필도 막힌다
+      await p.goto(`${new URL(page.url()).origin}/api/auth/session`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      return ask(p);
+    };
     try {
-      probe = await page.context().newPage();
-      await this.preparePage(probe); // 헤드리스 UA 맞추기 — 안 하면 같은 프로필도 막힌다
-      await probe.goto('https://chatgpt.com/api/auth/session', { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      const slow = await within(ask(probe), ms + 5_000);
+      const slow = await within(viaProbe().catch(() => null), ms + 45_000);
       return slow === TIMED_OUT ? null : slow;
-    } catch {
-      return null;
     } finally {
-      await probe?.close().catch(() => {});
+      probe.done = true;
+      void probe.page?.close().catch(() => {});
     }
   }
 
