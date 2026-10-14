@@ -68,10 +68,10 @@ async function fixture(fn: (f: {
   syncBuiltinESMExports();
   const driver = {
     ensureAlive: async () => false, startNewChat: async () => {}, withTurn: (fn: () => Promise<unknown>) => fn(),
-    sendAndCollect: async (prompt: string, onSent: (url: string, reasoning: string) => void, attachment?: PromptAttachment) => {
+    sendAndCollect: async (prompt: string, onSent: (url: string, reasoning: string, askedBefore: string | null) => void, attachment?: PromptAttachment) => {
       controls.prompts.push(prompt);
       controls.attachments.push(attachment);
-      onSent('https://chatgpt.com/c/fixture', 'Latest · Pro (5/5)');
+      onSent('https://chatgpt.com/c/fixture', 'Latest · Pro (5/5)', 'q-before');
       return JSON.stringify({ summary: 'issue', approval: 'request_changes',
         reviewedHeadSha: controls.wrongTarget ? 'c'.repeat(40) : head, reviewedBaseSha: base,
         comments: [{ path: 'x.ts', line: 1, body: 'fix this' }] });
@@ -110,9 +110,9 @@ test('재시도 소진 후 25분 타임아웃도 재시작/완료 판정 가능�
   f.driver.resumeChat = async () => true;
   f.driver.findRound = async () => 2;
   let checks = 0;
-  f.driver.collectFrom = async (baseline, timeoutMs) => {
-    assert.equal(baseline, 2);
-    assert.equal(timeoutMs, 150_000, '중지 버튼 고장 판정의 120초 관측 시간을 확보한다');
+  f.driver.collectFrom = async (timeoutMs, asked) => {
+    assert.equal(timeoutMs, 150_000, '회수는 짧은 예산으로 확인한다');
+    assert.equal(asked?.askedBefore, 'q-before', '보내기 전 마지막 질문 뒤의 답만 받는다');
     if (++checks === 1) throw new ResponseTimeoutError('아직 생성 중');
     return answer;
   };
@@ -191,7 +191,7 @@ test('답 없는 종료 뒤 자연어로 이어받은 리뷰는 재시작 후에
       { role: 'assistant', text: answer },
     ], marker, requireResponse, acceptFollowup);
   };
-  f.driver.collectFrom = async baseline => { assert.equal(baseline, 1); return answer; };
+  f.driver.collectFrom = async () => answer;
   assert.equal(await runRound(f.cfg, f.driver, ctx), 'posted');
   assert.equal(f.controls.prompts.length, 1);
   assert.equal(f.posts.length, 1);

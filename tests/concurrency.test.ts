@@ -48,15 +48,21 @@ test('동시 리뷰 탭은 진입~전송을 한 줄로 하고 응답 대기만 �
   const sibling = await owner.fork();
   const tab = freshTab();
 
+  let done = false;
   let answered!: () => void;
-  const answer = new Promise<void>((resolve) => { answered = resolve; });
-  owner.isStreaming = async () => false;
-  owner.interruptedBanner = async () => null;
+  const answer = new Promise<void>((resolve) => { answered = () => { done = true; resolve(); }; });
+  owner.nap = () => answer; // 응답이 올 때까지 대기 — 이 사이에 옆 탭이 들어와야 한다
+  owner.detectQuotaLimit = async () => null;
+  const record = { current_node: 'a', mapping: {
+    q: { message: { author: { role: 'user' } } },
+    a: { parent: 'q', message: { author: { role: 'assistant' }, status: 'finished_successfully', end_turn: true,
+      content: { content_type: 'text', parts: ['answer'] } } },
+  } };
   owner.page = {
     ...tab,
-    waitForTimeout: () => answer, // 응답이 올 때까지 대기 — 이 사이에 옆 탭이 들어와야 한다
-    evaluate: async () => [{ role: 'user', id: 'q' }, { role: 'assistant', id: 'a' }],
-    locator: () => ({ locator: () => ({ count: async () => 1, allInnerTexts: async () => ['answer'] }) }),
+    url: () => 'https://chatgpt.com/c/6acd33bf-39f0-83e8-add2-09d48b0af407',
+    evaluate: async (_fn: unknown, { path }: { path: string }) =>
+      path.endsWith('/stream_status') ? { status: done ? 'COMPLETE' : 'IS_STREAMING' } : record,
   };
 
   const log: string[] = [];
@@ -64,7 +70,7 @@ test('동시 리뷰 탭은 진입~전송을 한 줄로 하고 응답 대기만 �
     log.push('A 입력');
     await new Promise((resolve) => setTimeout(resolve, 20));
     log.push('A 전송');
-    return owner.collectFrom(0, 60_000); // 실제 응답 대기 경로에서 차례를 넘긴다
+    return owner.collectFrom(60_000, { askedBefore: null }); // 실제 응답 대기 경로에서 차례를 넘긴다
   });
   await sibling.withTurn(async () => { log.push('B 입력'); });
   answered();

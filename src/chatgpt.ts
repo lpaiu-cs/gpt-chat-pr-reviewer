@@ -94,18 +94,9 @@ export function readMessagesInPage(contentSel: string | null): { role: string; i
     const key = el.getAttribute('data-chatgpt-search-unit-key') ?? '';
     const role = key.slice(key.lastIndexOf(':') + 1);
     if (role !== 'user' && role !== 'assistant') return [];
-    // 생성 중인 답은 식별자 목록도 턴 키 조상도 없다(실측). 그동안 위치로 읽으면 완료 때
-    // 코드블록을 다시 그리며 글자가 줄어 "다른 노드" 로 오인하고 라운드를 버렸다. 그래서
-    // **우리가 노드에 표식을 찍어** 식별자로 쓴다. 노드가 새로 그려지면 표식이 사라지고
-    // 새 표식이 찍히므로, 재고정(judgeRebind)이 같은 질문의 새 노드로 옮겨 탄다.
-    let id = (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null;
-    if (!id && role === 'assistant') {
-      id = el.getAttribute('data-pr-review-anchor');
-      if (!id) { id = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; el.setAttribute('data-pr-review-anchor', id); }
-    }
     return [{
       role,
-      id,
+      id: (el.getAttribute('data-chatgpt-search-message-ids') ?? '').trim().split(/\s+/)[0] || null,
       text: contentSel === null ? '' : (el.querySelector(contentSel)
         ? [...el.querySelectorAll(contentSel)].map(block => block.textContent ?? '').join('\n')
         : el.textContent ?? ''),
@@ -163,24 +154,9 @@ export function isOwnDraft(text: string, files: string[], template: string, prom
 }
 
 /**
- * 어시스턴트 메시지를 **안정적 식별자**로 고정하는 셀렉터 (옛 화면 · 개편 화면).
- *
- * 위치(`nth`)로 붙잡으면 DOM 재렌더·가상화 때 다른 메시지를 가리킬 수 있다 —
- * 9차 라운드가 7차 응답을 게시한 경로가 그것이다. 노드가 뜨는 즉시 이 값으로
- * 고정해 이후 읽기가 항상 같은 메시지를 향하게 한다.
- */
-export function messageByIdSelector(id: string): string {
-  if (id.startsWith('anchor-')) return `[data-pr-review-anchor="${id}"]`;
-  return `[data-message-id="${id}"], [data-chatgpt-search-message-ids~="${id}"]`;
-}
-
-/**
  * 마지막 질문이 그 라운드이거나, 그 뒤의 답이 검증을 통과하는지 확인한다.
- * 맞으면 마지막 질문 직전의 어시스턴트 메시지 수를 돌려준다 (없으면 null).
- *
- * 이 숫자가 응답 수집의 기준점이다. 다시 세면 안 된다 — 대상 응답의 노드가 이미
- * 만들어져 스트리밍 중이면 그것까지 기준에 포함돼, 오지 않을 **그 다음** 메시지를
- * 60초 기다리다 실패한다.
+ * 맞으면 마지막 질문 직전의 어시스턴트 메시지 수를 돌려준다 (없으면 null) — 회수는 "있다" 는
+ * 판정으로만 쓴다. 답 자체는 서버 기록에서 받는다 (`collectResponse`).
  *
  * 후속 질문의 문구 대신 acceptFollowup으로 답의 리뷰 형식·대상을 검증한다.
  * requireResponse는 답 없이 끝난 전송의 재확인에 쓴다 — 같은 빈 자리를 기다리지 않는다.
@@ -203,61 +179,10 @@ export function findRoundBaseline(
   return msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
 }
 
-/**
- * **이번 질문의 답이 지금 화면 어디에 있는가** (순수 함수).
- *
- * 마지막 사용자 메시지 뒤에 오는 첫 어시스턴트 메시지가 그 질문의 답이다.
- * 전송 직전에 센 개수로 위치를 고정하면 안 된다 — 대화가 길어지면 ChatGPT 가
- * 화면 밖 메시지를 떼었다 붙였다 하므로, 전송 후 어시스턴트 노드 수가 줄면
- * 고정한 위치는 **아무 노드도 가리키지 않는다.** 실제로 그 상태로 15분을
- * "0자" 로 기다리다 타임아웃했고(#75 6차), 같은 대화를 다시 열어 위치를 다시
- * 계산한 복구 경로는 즉시 3,421자를 읽었다.
- *
- *   ready   답 노드가 있다 — id 로 고정하고, id 가 없으면 nth 로 읽는다
- *   pending 질문은 찾았고 답 노드가 아직 없다 — 기다린다 (여기서 위치로
- *           물러서면 직전 라운드의 답을 새 응답으로 오인한다)
- *   unknown 사용자 메시지를 못 찾았다 (셀렉터 커스터마이즈·조회 실패) —
- *           호출부가 종전의 전송 시점 기준으로 물러선다
- *
- * `nth` 는 **어시스턴트 메시지 중** 몇 번째인가다 (= 그 질문 직전까지의
- * 어시스턴트 수). 그래서 `findRoundBaseline` 과 같은 값이고, 그대로
- * `locator(assistantMessage).nth(...)` 에 넣을 수 있다.
- */
+/** 화면의 메시지 하나 — 역할과 식별자만 (전송 확인에 쓴다). */
 export interface MessageRef {
   role: string;
   id: string | null;
-}
-
-export type AnswerAnchor =
-  | { status: 'ready'; id: string | null; userId: string | null; nth: number }
-  | { status: 'pending'; userId: string | null; nth: number }
-  | { status: 'unknown' };
-
-/**
- * `afterUserId` 는 **전송 직전의 마지막 질문**이다. 앵커가 아직 그 질문을 가리키면
- * 우리 질문이 화면에 그려지기 전이라는 뜻이므로 `pending` 으로 돌린다.
- *
- * 이 가드가 없으면 전송 후 몇 초 동안 앵커가 **직전 라운드의 답**을 가리킨다.
- * 그 노드를 고정하면 (1) 그대로 남아 있을 때 낡은 응답을 새 응답으로 게시하고
- * (2) 화면이 갱신되며 떨어져 나갈 때 "노드가 사라졌다" 로 라운드를 버린다.
- * 실제 관측이 후자다 — 실패가 전부 전송 경로에서만 났고 회수 경로에서는 없었다.
- */
-export function anchorAnswer(msgs: MessageRef[], afterUserId?: string | null): AnswerAnchor {
-  let lastUser = -1;
-  for (let i = 0; i < msgs.length; i++) {
-    if (msgs[i].role === 'user') lastUser = i;
-  }
-  if (lastUser < 0) return { status: 'unknown' };
-
-  const userId = msgs[lastUser].id;
-  const nth = msgs.slice(0, lastUser).filter((m) => m.role === 'assistant').length;
-
-  if (afterUserId && userId === afterUserId) return { status: 'pending', userId, nth };
-
-  for (let i = lastUser + 1; i < msgs.length; i++) {
-    if (msgs[i].role === 'assistant') return { status: 'ready', id: msgs[i].id, userId, nth };
-  }
-  return { status: 'pending', userId, nth };
 }
 
 /**
@@ -280,136 +205,36 @@ export function judgePromptSent(
   return lastUserIdBefore && users.length > 0 ? 'detached' : 'pending';
 }
 
-/** 고정한 대상 — 답 노드의 식별자와, 그 답을 부른 질문. */
-export interface BoundTarget {
-  id: string;
-  /** 그 답을 부른 질문의 식별자 (없으면 위치로 대조한다). */
-  userId: string | null;
-  /** 고정 당시의 앵커 위치. */
-  nth: number;
-}
-
-export type RebindDecision =
-  | { action: 'keep' }
-  | { action: 'rebind'; id: string }
-  /** 같은 질문의 답이 아직 화면에 없다 — 기다린다 (실패가 아니다). */
-  | { action: 'wait' }
-  | { action: 'hold'; reason: 'anchor-unknown' | 'turn-moved' };
-
-/**
- * 고정한 노드가 안 보일 때 **같은 질문의 답으로 다시 고정할 수 있는지** 판정한다.
- *
- * ChatGPT 는 전송 직후 임시 식별자로 답 노드를 그린 뒤 서버 식별자가 오면 그
- * 노드를 갈아 끼운다. 고정을 소실로만 처리하면 정상 응답이 오는 중에 라운드를
- * 버린다 — 최근 여덟 라운드 중 넷이 그렇게 실패했다.
- *
- * 갈아타는 조건은 **질문이 같을 때뿐**이다. 답이 길어져 우리 질문이 화면 밖으로
- * 밀려나면 앵커가 직전 턴으로 물러설 수 있고, 그때 따라가면 낡은 응답을 새
- * 응답으로 게시한다 — 이 도구에서 가장 비싼 실패다. 판별이 안 서면 hold 로
- * 두고, 호출부가 유예 횟수만큼 기다렸다가 라운드를 접는다.
- */
-export function judgeRebind(msgs: MessageRef[], bound: BoundTarget): RebindDecision {
-  if (msgs.some((m) => m.id === bound.id)) return { action: 'keep' };
-
-  const anchor = anchorAnswer(msgs);
-  if (anchor.status === 'unknown') return { action: 'hold', reason: 'anchor-unknown' };
-
-  // 질문 식별자가 있으면 그것이 가장 확실하다. 없을 때만 위치로 대조한다 —
-  // 뒤로 물러선 앵커는 언제나 더 작은 nth 를 내므로 오탐 방향이 안전하다.
-  const sameTurn = bound.userId ? anchor.userId === bound.userId : anchor.nth === bound.nth;
-  if (!sameTurn) return { action: 'hold', reason: 'turn-moved' };
-
-  // **우리 질문이 여전히 마지막인데 답만 없다 — 기다리는 상태다.**
-  // 추론 중에는 답 노드가 그려졌다 지워졌다 한다. 고정 전에는 이것을 정상
-  // 대기로 보면서 고정 후에만 소실로 보면, 같은 화면을 두고 판정이 갈린다.
-  // 실제로 그래서 18차가 실패했다 — 재시도(회수 경로)는 같은 화면에서 그냥
-  // 기다려 성공했다. 답이 끝내 안 나오면 응답 예산이 정확한 실패를 낸다.
-  if (anchor.status === 'pending' || !anchor.id) return { action: 'wait' };
-
-  return { action: 'rebind', id: anchor.id };
-}
-
 /** 전송 후 대화 주소(/c/<uuid>)가 확정되기를 기다리는 최대 시간. */
 const CONVERSATION_URL_TIMEOUT_MS = 15_000;
 
 /**
- * 스트림이 끊겼을 때 ChatGPT 가 **화면 크롬에** 표시하는 안내 문구.
+ * 아무것도 오고 있지 않은 채 이만큼 지나면 생성이 답 없이 끝난 것으로 본다 (`GenerationEndedError`).
+ * "아무것도" = 서버가 생성 중이 아니고, 기록에 이번 질문의 끝난 답이 없고, 생성 요청도 없다.
  *
- * **배너 고유 문구만 넣는다.** 한때 `/연결이 (중단|끊)/`·`/완전한 (답변|응답)을
- * 기다/` 가 있었는데, 둘 다 배너가 아니라 평범한 한국어 기술 산문이다. 리뷰
- * 본문이 그런 표현을 쓰면(네트워크·스트리밍 코드를 리뷰하면 흔하다) 그 문장은
- * 대화에 영구히 남아 새로고침해도 사라지지 않는다 — 복구 3회가 전부 즉시 매치해
- * 라운드가 통째로 버려지고, 재시도도 같은 자리에서 같은 이유로 죽는다.
- * 실제로 그렇게 두 PR 이 24회 연속 실패했다 (`pelican-music#29`·`osk-system#14`).
- *
- * 그 사고의 1차 방어선은 검사 범위(`uiTextTail` — 메시지 영역 제외)이고,
- * 이 목록은 2차 방어선이다. 둘 다 필요하다: 범위만 좁히면 배너를 흉내 낸
- * 토스트에 여전히 걸리고, 패턴만 조이면 다음에 추가되는 문구가 또 본문을 짚는다.
+ * ChatGPT 에서 생성을 중지하거나 연결이 끊긴 경우가 이 모습이다. 모르면 응답 예산을 통째로
+ * 기다린다 — sky-fishing#2 는 본문 0자인 채로 25분 예산 끝까지 기다렸다. 회수 예산(150초) 안에
+ * 끝나야 회수가 타임아웃으로 접혀 다시 돌지 않는다. 서버가 상태를 바꾸고 기록을 남기기까지의
+ * 틈(몇 초)과 비교도 안 되게 잡는다.
  */
-const INTERRUPT_PATTERNS: RegExp[] = [
-  /connection interrupted/i,
-  /waiting for the complete answer/i,
-  /연결이 중단되었습니다/,
-  /완전한 답변을 기다리는 중/,
-  // 2026-10 화면의 한국어 문구 (실측: "연결이 해제되었습니다. 전체 답변을 기다리는 중입니다.").
-  // 이 탭의 수신이 끊겼다는 뜻이지 생성 실패가 아니다 — 같은 대화를 옆에서 연 탭에도 뜬다.
-  // 쓰임은 하나: 버튼이 사라졌는데 답이 덜 왔을 때 잘린 답을 완성본으로 받지 않고 새로고침한다.
-  /연결이 해제되었습니다/,
-  /전체 답변을 기다리는 중/,
-];
-
-/**
- * 화면 크롬 텍스트에서 중단 안내를 찾는다 (없으면 null).
- *
- * 매치한 문자열을 그대로 돌려준다 — 무엇이 걸렸는지 로그에 남지 않으면, 오탐이
- * 났을 때 그 사실조차 알 수 없다. 실제로 위 사고에서 원인을 짚는 데 걸린 시간의
- * 대부분이 "무엇이 매치됐는가" 를 되짚는 데 들었다.
- */
-export function matchInterrupt(uiText: string): string | null {
-  for (const re of INTERRUPT_PATTERNS) {
-    const m = uiText.match(re);
-    if (m) return m[0];
-  }
-  return null;
-}
-
-/** 연결 중단 시 새로고침으로 복구를 시도할 최대 횟수. */
-const MAX_RELOAD_RECOVERIES = 3;
-
-/**
- * 생성 표시(중지 버튼)가 사라진 뒤 답 본문 없이 이만큼 지나면 스트림이 끊긴 것으로 본다.
- *
- * 배너 문구(INTERRUPT_PATTERNS)로만 알아보면 모르는 문구에서 응답 예산을 통째로
- * 기다린다 — sky-fishing#2 는 버튼이 사라지고 본문 0자인 채로 25분 예산 끝까지 기다렸다.
- * 근거는 대기 판정과 같은 중지 버튼이고, 복구도 배너와 같은 새로고침이다.
- */
-const EMPTY_END_MS = 30_000;
+const ENDED_QUIET_MS = 60_000;
 
 /**
  * 응답 예산이 다 됐는데 생성이 **확실히** 진행 중이면 같은 예산을 이 횟수까지 더 준다.
  *
  * 큰 diff 는 추론이 예산을 넘긴다 (실측: 1.8MB diff 가 39분 — sky-fishing#2). 예전에는 그때
  * 타임아웃으로 접고 1분마다 대화를 다시 열어 확인했다 — 그동안 라운드가 실패로 표시되고
- * 슬롯을 놓았다 다시 잡았으며, 다시 연 탭은 수신이 끊긴 관전자가 됐다. "확실히" 는 중지
- * 버튼에 더해 생성 요청이 살아 있다는 네트워크 근거다 — 버튼만 남은 고장(이슈 #1)은 연장하지 않는다.
- * ponytail: 생성 요청이 끝없이 살아 있는 고장에 대비한 상한이다. 더 긴 추론이 흔해지면 올린다.
+ * 슬롯을 놓았다 다시 잡았으며, 다시 연 탭은 수신이 끊긴 관전자가 됐다. "확실히" 는 서버가
+ * 생성 중이라고 하거나(`stream_status`) 생성 요청이 살아 있다는 것이다.
+ * ponytail: 생성이 끝없이 살아 있는 고장에 대비한 상한이다. 더 긴 추론이 흔해지면 올린다.
  */
 const MAX_RESPONSE_EXTENSIONS = 2;
 
-/** 응답이 시작도 안 한 채 조용할 때 한도를 다시 확인하는 주기. */
+/** 서버가 생성 중이 아닐 때 한도 배너를 다시 확인하는 주기. */
 const QUOTA_RECHECK_MS = 30_000;
 
 /** 전송 전, 진행 중인 생성이 끝나기를 기다리는 폴링 간격. */
 const IDLE_POLL_MS = 3_000;
-
-/** 식별자를 못 잡았을 때, 축소 관측을 이만큼 연속으로 보면 수집 실패로 본다. */
-const SHRINK_TOLERANCE = 3;
-
-/** 고정한 노드가 이만큼 연속으로 안 보이면 화면이 갈린 것으로 본다 (가상화 유예). */
-const MISS_TOLERANCE = 3;
-
-/** 앵커를 이만큼 연속으로 못 잡으면 전송 시점 위치로 물러선다. */
-const UNKNOWN_TOLERANCE = 3;
 
 /**
  * 생성 네트워크가 이만큼 조용하면 (a) 스트림 사망 **후보**로 기록한다.
@@ -420,9 +245,6 @@ const UNKNOWN_TOLERANCE = 3;
  * 게시하게 되고, 그건 이슈 #1 이 애초에 경계한 조기 절단이다.
  */
 const STREAM_QUIET_LIMIT_MS = 180_000;
-
-/** 화면이 멎었을 때 진단 덤프를 남기는 주기 (같은 라운드 안에서). */
-const STALL_DUMP_EVERY_MS = 120_000;
 
 /** 스트리밍 판정에 쓰는 신호들. */
 export interface StreamSignals {
@@ -486,15 +308,14 @@ export interface StuckButtonSignals {
   inFlight: number;
   /** 생성 네트워크(POST · WebSocket 프레임)가 마지막으로 움직인 뒤 흘러간 시간 */
   quietMs: number;
-  /** 화면이 멈춰 있는 시간 (수집: 텍스트 불변 · 대기: 기다린 시간) */
+  /** 버튼이 남은 채 기다린 시간 */
   idleMs: number;
 }
 
 /**
- * 중지 버튼이 **어떤 살아 있는 생성에도 받침되지 않는가** — 순수 함수.
+ * 중지 버튼이 **어떤 살아 있는 생성에도 받침되지 않는가** — 순수 함수 (`waitUntilIdle`).
  *
- * `collectResponse` 와 `waitUntilIdle` 이 **같은 조건**을 쓴다. 둘 다 버튼 하나를
- * 유일한 권위로 삼다가, 버튼이 DOM 에 남는 순간 예산을 통째로 태운다.
+ * 버튼 하나를 유일한 권위로 삼으면, 버튼이 DOM 에 남는 순간 예산을 통째로 태운다.
  *
  * 네 조건을 모두 요구한다 — 하나라도 빼면 이슈 #1 이 경계한 조기 절단이 된다:
  *
@@ -518,42 +339,24 @@ export function judgeStuckButton(
 }
 
 /**
- * 서버에 응답 상태(`stream_status`)를 묻기 시작하는 시점과 간격.
- *
- * 탭 화면은 완료의 권위가 아니다 (2026-10 실측). 서버가 375~555초에 끝낸 답을 데몬 탭은
- * **전송 후 약 600초**에 웹앱이 스스로 다시 맞출 때까지 그리지 않았다 — 지연 47~228초,
- * 300초 넘는 라운드의 약 40%. 같은 기간 대조군은 서버 완료 2~10초 뒤에 화면에 떴다.
- * 서버 쪽 모양(소요·도구 호출·마지막 활동과의 간격)으로는 둘이 갈리지 않는다.
+ * 응답을 기다리는 동안 서버에 묻는 간격 (`stream_status` · 생성이 끝났으면 대화 기록).
+ * 서버가 끝낸 답을 받기까지 최대 이만큼 늦다 — 응답 시간(2~15분)에 비하면 무시할 수준이다.
  */
-const SERVER_STATUS_AFTER_MS = 60_000;
-const SERVER_STATUS_EVERY_MS = 30_000;
-/** 상태 조회 한 번의 상한 — 넘으면 null(종전 동작)로 돌아간다. */
+const SERVER_POLL_MS = 10_000;
+/** 서버 조회 한 번의 상한 — 넘으면 null 이다. */
 const SERVER_STATUS_TIMEOUT_MS = 10_000;
 /**
- * 서버 기록의 질문 시각(서버 시계)을 전송 시각(이 컴퓨터 시계)과 비교할 때의 여유.
- * 실측 차이는 몇 초다 (질문 create_time 이 전송 직후 기록됨). 직전 질문은 적어도 직전 답의
- * 생성 시간만큼 앞서므로 이 값으로 갈린다. 시계가 이보다 어긋나면 판정을 못 해 화면 답으로 돌아간다.
+ * 서버 기록을 이만큼 계속 못 읽으면 라운드를 실패로 접는다 — 화면 글자로 대신하지 않는다.
+ * 한두 번의 일시 실패는 넘긴다. 비공개 API 가 바뀌었으면 응답 예산(25분)을 다 기다리지 않고 바로 드러난다.
+ */
+const SERVER_UNREAD_LIMIT_MS = 120_000;
+/**
+ * 서버 기록의 질문 시각(서버 시계)을 전송 시각(이 컴퓨터 시계)과 비교할 때의 여유 — 기준 질문 id 가
+ * 없는 구버전 기록의 회수에서만 쓴다. 실측 차이는 몇 초다 (질문 create_time 이 전송 직후 기록됨).
  */
 const SERVER_CLOCK_SKEW_MS = 60_000;
-/**
- * 탭 수집이 예산을 이만큼 넘기고도 이만큼 한 바퀴도 못 돌면 탭이 멎은 것으로 보고 서버 감시가 대신 접는다.
- * 새로고침 한 번(최대 66초)보다 넉넉하게 잡는다 — 그건 멎은 게 아니다.
- */
-const TAB_STALL_MS = 120_000;
-
-/** 탭 수집(`collectFromTab`)과 서버 감시(`watchServer`)가 나눠 쓰는 값. */
-interface CollectShared {
-  /** 한쪽이 끝났다 — 다른 쪽은 더 하지 않는다 */
-  stopped: boolean;
-  /** 이번 수집에서 서버가 IS_STREAMING 이라고 답한 적이 있는가 — 서버 기록의 마지막 턴이 이번 생성이라는 근거 */
-  sawServerStreaming: boolean;
-  /** 이 질문을 보낸 시각 (이 컴퓨터 시계 · 모르면 null) — 서버 기록의 마지막 질문이 이번 것인지 가른다 */
-  sentAt: number | null;
-  /** 탭 수집의 예산 끝 (연장하면 늘어난다) */
-  deadline: number;
-  /** 탭 수집이 마지막으로 한 바퀴를 시작한 시각 */
-  lastPollAt: number;
-}
+/** 화면을 보조로 읽는 호출(한도 배너·진단 문구)의 상한 — 멎은 탭에서도 대기 루프가 멎지 않게. */
+const SCREEN_PEEK_TIMEOUT_MS = 15_000;
 
 /** 시간 안에 안 끝나면 TIMED_OUT — Playwright 의 페이지 호출에는 제한이 없어 멎은 탭에서 영영 기다린다. */
 const TIMED_OUT = Symbol('timed-out');
@@ -563,14 +366,9 @@ async function within<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED
   try { return await Promise.race([work, late]); } finally { clearTimeout(timer); }
 }
 
-/** 탭과 무관하게 쉰다 — 수집이 끝나면(abort) 바로 깨어나 던져, 끝난 수집의 타이머를 남기지 않는다. */
-function pause(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) return reject(new Error('수집이 끝났습니다'));
-    const stop = () => { clearTimeout(timer); reject(new Error('수집이 끝났습니다')); };
-    const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, ms);
-    signal.addEventListener('abort', stop, { once: true });
-  });
+/** 탭과 무관하게 쉰다 — `page.waitForTimeout` 은 멎은 탭에서 돌아오지 않는다. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** 페이지 안에서 로그인 토큰으로 비공개 API 를 부른다 — 토큰은 페이지 밖으로 나오지 않는다. 실패는 null. */
@@ -588,18 +386,6 @@ async function fetchServerInPage({ path, ms }: { path: string; ms: number }): Pr
   } catch {
     return null;
   }
-}
-
-/**
- * 답 자리에 답 대신 그려진 ChatGPT 화면 오류 문구인가.
- *
- * 2026-10-12 실측: 특정 PR 만 매번(3/3) 답이 27자 "This response couldn’t load" 로 끝났다
- * (lolchess_base#113·#116·#117 — 크기와 무관, 같은 시각 더 큰 diff 는 정상). 직전에 답 글자가
- * 잠깐 그려졌다가(41자) 노드가 교체되며 이 문구가 됐다 — 답은 왔는데 화면이 못 그린 모양이다.
- * 이걸 답으로 받으면 "리뷰 JSON 없음" 으로 실패하고, 재시도가 같은 대화에 같은 질문을 또 보낸다.
- */
-export function isUnloadedAnswer(text: string): boolean {
-  return /^This response couldn[’']t load\.?$/i.test(text.trim());
 }
 
 /** 서버 기록의 메시지 하나에서 쓰는 모양만. */
@@ -628,7 +414,9 @@ export interface ServerConversation {
  * 추론 요약·도구 호출(content_type 이 text 가 아니거나 받는 쪽이 all 이 아닌 것)은 답이 아니다.
  * 마지막 질문을 만나면 멈춘다 — 그 앞의 답은 직전 라운드의 것이다.
  */
-function lastExchange(conv: ServerConversation): { question: ServerMessage | null; answer: ServerMessage | null; text: string | null } {
+function lastExchange(conv: ServerConversation): {
+  questionId: string | null; question: ServerMessage | null; answer: ServerMessage | null; text: string | null;
+} {
   const nodes = conv.mapping ?? {};
   const seen = new Set<string>();
   let answer: ServerMessage | null = null;
@@ -637,56 +425,60 @@ function lastExchange(conv: ServerConversation): { question: ServerMessage | nul
     seen.add(id);
     const m = nodes[id].message;
     const role = m?.author?.role;
-    if (role === 'user') return { question: m ?? null, answer, text };
+    if (role === 'user') return { questionId: id, question: m ?? null, answer, text };
     if (answer || role !== 'assistant' || (m?.recipient ?? 'all') !== 'all' || m?.content?.content_type !== 'text') continue;
     const body = (m.content.parts ?? []).filter((p): p is string => typeof p === 'string').join('');
     if (body.trim()) { answer = m; text = body; }
   }
-  return { question: null, answer, text };
+  return { questionId: null, question: null, answer, text };
 }
 
-/** 서버 기록에서 **마지막 질문 뒤의 최종 답** 본문 (없으면 null · 순수 함수 · 이번 질문인지는 보지 않는다). */
-export function pickServerAnswer(conv: ServerConversation): string | null {
-  return lastExchange(conv).text;
+/**
+ * 이번 질문을 가르는 기준. `askedBefore` 는 **보내기 전** 서버 기록의 마지막 질문 id 다 (null = 새 대화).
+ * 구버전 기록에는 없어서 그때만 전송 시각(`sentAt`)으로 가른다.
+ */
+export interface AskedAfter {
+  askedBefore?: string | null;
+  sentAt?: number | null;
 }
 
 /** 서버 기록이 이번 질문에 대해 말해 주는 것. */
 export type ServerVerdict =
   | { kind: 'answer'; text: string } // 이번 질문의 끝난 답 — 이걸 쓴다
-  | { kind: 'pending' } // 서버가 아직 생성 중이다 — 화면이 끝났다고 해도 받지 않는다
-  | { kind: 'unknown'; reason: string }; // 서버로 판정하지 못했다 — 종전대로 화면 답을 쓴다
+  | { kind: 'pending' } // 서버가 아직 생성 중이다
+  | { kind: 'unknown'; reason: string }; // 기록에 이번 답이 (아직) 없다 — 무엇이 없는지
 
 /**
  * 서버 기록에 **이번 질문의 끝난 답**이 있는가 (순수 함수).
  *
- * 화면은 답의 권위가 아니다. 노드 교체로 남의 답을 읽고(9차가 7차의 답을 게시), 답 대신
+ * 화면은 답의 출처가 아니다. 노드 교체로 남의 답을 읽고(9차가 7차의 답을 게시), 답 대신
  * "This response couldn’t load" 를 그리고, 서버가 마친 답을 수백 초 늦게 그렸다. 화면 쪽
- * 증상은 하나씩 막아 왔지만 같은 근원에서 계속 새로 나왔다 — 그래서 답은 서버 기록에서 읽는다.
+ * 증상은 하나씩 막아 왔지만 같은 근원에서 계속 새로 나왔다 — 그래서 답은 서버 기록에서만 읽는다.
  *
- *  - **이번 질문인가.** 마지막 질문이 전송 뒤에 만들어졌거나(서버 시각 · `SERVER_CLOCK_SKEW_MS`),
- *    이번 수집에서 서버가 생성 중이라고 한 적이 있다. 질문 본문은 서버가 마크다운으로 이스케이프해
- *    저장하므로(`\## 대상 PR`) 보낸 글과 비교하지 않는다.
+ *  - **이번 질문인가.** 마지막 질문이 보내기 전의 마지막 질문(`askedBefore`)이 아니다. 시각이나 "생성 중을
+ *    봤다" 로는 가르지 않는다 — 앞 라운드가 빨리 끝나 두 질문이 1분 안에 나가면 직전 질문도 시각 여유
+ *    안에 들고, 전송 직후의 상태 API·기록은 아직 직전 턴의 COMPLETE·끝난 답을 보여준다 (#68 리뷰).
+ *    질문 본문은 서버가 마크다운으로 이스케이프해 저장하므로(`\## 대상 PR`) 보낸 글과 비교하지 않는다.
+ *    기준이 없는 구버전 기록만 전송 시각으로 가른다 (회수 경로라 이번 질문은 이미 기록에 있다).
  *  - **끝났는가.** 최종 답이 `finished_successfully` 이고 `end_turn` 이다 — 도구 호출 앞의 중간 답이 아니다.
  *
- * 서버가 생성 중이면 pending 이다. 그 밖(조회 실패·기록 모양이 다름·이번 질문이 아직 없음)은 unknown 이고,
- * 호출부는 종전 동작(화면 답)으로 돌아간다 — 비공개 API 라 바뀔 수 있고, 그때 받던 답까지 잃으면 안 된다.
+ * 서버가 생성 중이면 pending, 그 밖은 unknown 이다 (이유를 단다 — 끝내 답이 없을 때 오류에 실린다).
  */
-export function judgeServerAnswer(
-  conv: ServerConversation | null,
-  status: string | null,
-  seen: { sentAt: number | null; sawStreaming: boolean },
-): ServerVerdict {
+export function judgeServerAnswer(conv: ServerConversation | null, status: string | null, seen: AskedAfter): ServerVerdict {
   if (status === 'IS_STREAMING') return { kind: 'pending' };
   if (!conv) return { kind: 'unknown', reason: '서버 기록 조회 실패' };
-  const { question, answer, text } = lastExchange(conv);
-  const askedAt = typeof question?.create_time === 'number' ? question.create_time * 1000 : Number.NaN;
-  if (!seen.sawStreaming && !(seen.sentAt !== null && askedAt >= seen.sentAt - SERVER_CLOCK_SKEW_MS)) {
-    return { kind: 'unknown', reason: seen.sentAt === null ? '전송 시각을 모름' : '기록의 마지막 질문이 이번 전송이 아님' };
+  const { questionId, question, answer, text } = lastExchange(conv);
+  if (seen.askedBefore !== undefined) {
+    if (!questionId || questionId === seen.askedBefore) return { kind: 'unknown', reason: '기록에 이번 질문이 아직 없음' };
+  } else {
+    const askedAt = typeof question?.create_time === 'number' ? question.create_time * 1000 : Number.NaN;
+    if (!(seen.sentAt != null && askedAt >= seen.sentAt - SERVER_CLOCK_SKEW_MS)) {
+      return { kind: 'unknown', reason: seen.sentAt == null ? '이번 질문을 가를 기준이 없음' : '기록의 마지막 질문이 이번 전송이 아님' };
+    }
   }
   if (!text || answer?.status !== 'finished_successfully' || answer.end_turn !== true) {
     return { kind: 'unknown', reason: '기록에 끝난 답 없음' };
   }
-  if (isUnloadedAnswer(text)) return { kind: 'unknown', reason: '기록의 답도 오류 문구' };
   return { kind: 'answer', text };
 }
 
@@ -823,6 +615,8 @@ export class ChatGPTDriver {
   private lastNetAt = 0;
   /** 이 탭을 더 쓰지 않는다 — 다음 라운드 전에 `ensureAlive` 가 새 탭으로 갈아 끼운다 (`retirePage`). */
   private pageRetired = false;
+  /** 서버 조회 사이에 쉰다 — 탭과 무관한 타이머라 탭이 멎어도 돈다. */
+  private nap = sleep;
 
   constructor(config: AppConfig) {
     validateProjectUrl(config.chatgptProjectUrl);
@@ -1355,11 +1149,13 @@ export class ChatGPTDriver {
    *
    * 1. 붙여넣기로 입력하고 전체 내용을 검증
    * 2. 전송 버튼 클릭
-   * 3. 어시스턴트 메시지가 안정될 때까지 폴링
+   * 3. 서버 기록에서 이번 질문의 끝난 답을 받는다
+   *
+   * `onSent` 의 `askedBefore` 는 보내기 전 서버 기록의 마지막 질문 id 다 — 회수(`collectFrom`)에 그대로 넘긴다.
    */
   async sendAndCollect(
     prompt: string,
-    onSent?: (conversationUrl: string | null, reasoning: string) => void,
+    onSent?: (conversationUrl: string | null, reasoning: string, askedBefore: string | null) => void,
     attachment?: PromptAttachment,
   ): Promise<string> {
     const p = this.requirePage();
@@ -1371,18 +1167,13 @@ export class ChatGPTDriver {
     // 사고가 났다 — 보내기 전에 반드시 확인한다.
     await this.waitUntilIdle(p);
 
-    // ── 기존 어시스턴트 메시지 수 기록 ──
-    // 이어가는 대화에서는 지난 응답들이 순차적으로 렌더링되므로, 개수가 멎기 전에
-    // 세면 실제보다 작게 잡힌다. 그러면 collectResponse 가 "새 응답이 이미 도착했다"
-    // 고 오인해 직전 라운드의 응답을 그대로 반환한다.
-    const before = await this.countSettledMessages(p);
-
-    // ── 직전 질문의 식별자 기록 ──
-    // 전송 후 우리 질문이 화면에 그려지기까지 몇 초가 걸린다. 그 사이 "마지막
-    // 질문 뒤의 답" 은 **직전 라운드의 답**이므로, 그것을 이번 응답으로 고정하지
-    // 않도록 지금의 마지막 질문을 기억해 둔다.
+    // ── 직전 질문의 식별자 기록 (전송 확인의 기준) ──
+    // 이어가는 대화에서는 지난 턴들이 순차적으로 렌더링되므로, 화면이 멎기 전에 세면
+    // 실제보다 작게 잡혀 아직 보내지 않은 질문을 "보냈다" 로 볼 수 있다. 멎을 때까지 기다린다.
+    await this.countSettledMessages(p);
     const lastUserBefore = await this.lastUserMessageId(p);
     const beforeUserCount = await this.countUserMessages(p);
+    const askedBefore = await this.serverLastQuestion(p);
 
     // ── 프롬프트 입력 ──
     this.assertProjectPage(p);
@@ -1396,7 +1187,6 @@ export class ChatGPTDriver {
       throw new Error(`추론 강도를 최대로 맞추지 못했습니다 — 전송하지 않습니다: ${String(cause?.message ?? cause).split('\n')[0]}`, { cause });
     }), false);
     console.log(chalk.dim(`  추론: ${reasoning}`));
-    let sentAt = 0;
     try {
       if (attachment) {
         await this.inputStep(`고정 diff 첨부 (${attachment.buffer.length}바이트)`, async () => {
@@ -1423,7 +1213,6 @@ export class ChatGPTDriver {
       // 이번 라운드의 생성만 근거로 쓴다.
       this.sawGeneration = false;
       this.assertProjectPage(p);
-      sentAt = Date.now(); // 서버 기록의 질문 시각과 맞대어 이번 질문인지 가른다 (judgeServerAnswer)
       await this.inputStep('전송 버튼', () => this.clickSend(p));
       if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, input, lastUserBefore, beforeUserCount)))) {
         throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
@@ -1446,10 +1235,10 @@ export class ChatGPTDriver {
     // **응답을 기다리기 전에** 알린다. 대기 구간이 2~15분이라 그 사이에 프로세스가
     // 죽으면, 여기서 안 남겨둔 URL 은 영영 잃는다. 그러면 다음 라운드가 대화가 없는
     // 줄 알고 새 창을 열어 **같은 질문을 다시 보낸다** (대화 한도를 그냥 버린다).
-    if (onSent) onSent(await this.waitForConversationUrl(p), reasoning);
+    if (onSent) onSent(await this.waitForConversationUrl(p), reasoning, askedBefore);
 
-    // ── 응답 수집 ──
-    return this.collectResponse(p, before, lastUserBefore, this.cfg.responseTimeoutMs, sentAt);
+    // ── 응답 수집 (서버 기록) ──
+    return this.collectResponse(p, this.cfg.responseTimeoutMs, { askedBefore });
   }
 
   /** 화면에 그려져 있는 질문들 (역할·식별자만 — 본문은 크므로 읽지 않는다). */
@@ -1535,15 +1324,23 @@ export class ChatGPTDriver {
   }
 
   /**
-   * 이미 보낸 프롬프트의 응답을 기준점부터 수집한다 (재전송 없이).
-   *
-   * 기준점을 findRound 가 준 값으로 쓰는 것이 핵심이다. 여기서 다시 세면 스트리밍
-   * 중인 대상 노드가 기준에 포함돼 영영 오지 않을 다음 메시지를 기다리게 된다.
-   * 완료 판정(스트리밍 종료 + 내용 안정)은 collectResponse 가 그대로 맡는다 —
-   * 그래서 스트리밍 중인 부분 응답을 완성본으로 오인하지 않는다.
+   * 이미 보낸 프롬프트의 응답을 받는다 (재전송 없이 · 서버 기록). 이미 와 있으면 첫 조회에서,
+   * 생성 중이면 끝까지 기다린다. `asked` 는 그 전송의 기준이다 (`pendingSend.askedBefore` · 구버전은 `at`).
    */
-  async collectFrom(assistantBefore: number, timeoutMs = this.cfg.responseTimeoutMs, sentAt: number | null = null): Promise<string> {
-    return this.collectResponse(this.requirePage(), assistantBefore, null, timeoutMs, sentAt);
+  async collectFrom(timeoutMs = this.cfg.responseTimeoutMs, asked: AskedAfter = {}): Promise<string> {
+    return this.collectResponse(this.requirePage(), timeoutMs, asked);
+  }
+
+  /**
+   * 보내기 전 서버 기록의 마지막 질문 id — 답을 받을 때 이번 질문을 가르는 기준이다 (`judgeServerAnswer`).
+   * 새 대화(프로젝트 화면)면 null 이다. 이어 쓰는 대화의 기록을 못 읽으면 **보내지 않는다** — 기준 없이
+   * 보내면 직전 답을 이번 답으로 받을 수 있고, 어차피 답도 서버 기록에서만 받으므로 한도만 쓴다.
+   */
+  private async serverLastQuestion(page: Page): Promise<string | null> {
+    if (!parseConversationUrl(page.url())) return null;
+    const conv = await this.serverConversation(page);
+    if (!conv) throw new Error(`서버 기록을 읽지 못해 보내지 않습니다 — 이번 답을 직전 답과 가를 기준이 없습니다 (대화 ${page.url()})`);
+    return lastExchange(conv).questionId;
   }
 
   /**
@@ -1873,545 +1670,113 @@ export class ChatGPTDriver {
   }
 
   /**
-   * 응답을 받는다 — 탭 화면 수집(`collectFromTab`)과 서버 감시(`watchServer`) 중 먼저 끝나는 쪽.
-   * 어느 쪽이든 **답 본문은 서버 기록에서** 읽는다 (`judgeServerAnswer`). 화면 글자는 서버로 판정하지
-   * 못할 때의 폴백이다.
+   * 응답을 받는다 — **서버 기록에서만** (`judgeServerAnswer`). 화면은 답의 출처가 아니다.
    *
-   * 둘을 따로 돌리는 이유: 탭에 대한 Playwright 호출은 제한 시간이 없어, 탭이 멎으면 수집 루프가
-   * 통째로 멎는다. 2026-10-13 lolchess_base#137 은 루프 한 바퀴가 51분, 다음이 18분 걸렸다 — 같은
-   * 시각 옆 탭의 라운드 둘은 정상이었고 브라우저의 CPU·메모리도 멀쩡했다. 서버 확인이 그 루프
-   * 안에 있어 같이 멎었고, 서버가 마친 답(화면 "Response complete")을 72분 만에 타임아웃으로 버렸다.
+   * 화면 수집은 증상이 매번 다른 사고를 냈다: 남의 노드를 읽어 7차의 답을 9차로 게시했고, 답 대신
+   * "This response couldn’t load" 를 그렸고, 서버가 375~555초에 끝낸 답을 약 600초까지 그리지 않았고
+   * (300초 넘는 라운드의 약 40%), 탭의 Playwright 호출이 멎어 루프 한 바퀴가 51분 걸렸다
+   * (lolchess_base#137). 서버 기록에는 그 모든 경우에 답이 있었다.
    *
-   * @param sentAt 이 질문을 보낸 시각 — 모르면 서버 기록이 이번 질문의 것인지는 이번 수집에서 서버가
-   *   생성 중이라고 한 적이 있을 때만 안다.
+   * 그래서 탭과 무관한 타이머로 서버에 묻는다: 생성 중이면 기다리고, 이번 질문의 끝난 답이 기록에
+   * 있으면 받는다. 탭이 멎어도 `serverJson` 이 잠깐 연 다른 탭으로 묻는다.
+   *
+   *  - 아무것도 오고 있지 않으면(서버 생성 중 아님 · 기록에 이번 답 없음 · 생성 요청 없음)
+   *    `ENDED_QUIET_MS` 뒤에 `GenerationEndedError` — 한도 배너가 보이면 `QuotaLimitError`.
+   *  - 서버 기록을 계속 못 읽으면 `SERVER_UNREAD_LIMIT_MS` 뒤에 실패한다 — 화면 글자로 대신하지 않는다.
+   *  - 예산이 다 됐는데 서버가 생성 중이면 같은 예산을 더 준다 (`MAX_RESPONSE_EXTENSIONS`). 끝내 못 받으면
+   *    `ResponseTimeoutError` — 기록에 끝난 답이 없으니 게시할 것도 없다 (잘린 답을 게시하지 않는다).
+   *
+   * @param asked 이번 질문을 가르는 기준 — 보내기 전 마지막 질문 id (`AskedAfter`).
    */
-  private async collectResponse(
-    page: Page,
-    messageCountBefore: number,
-    afterUserId: string | null = null,
-    timeout = this.cfg.responseTimeoutMs,
-    sentAt: number | null = null,
-  ): Promise<string> {
-    const shared: CollectShared = {
-      stopped: false, sawServerStreaming: false, sentAt,
-      deadline: Date.now() + timeout, lastPollAt: Date.now(),
-    };
-    const stop = new AbortController();
-    const fromTab = this.collectFromTab(page, messageCountBefore, afterUserId, timeout, shared);
-    let serverWon = false;
-    const fromServer = this.watchServer(page, shared, stop.signal).then((answer) => { serverWon = true; return answer; });
-    // 진 쪽의 늦은 결과·오류는 버린다.
-    fromTab.catch(() => {});
-    fromServer.catch(() => {});
-    try {
-      return await Promise.race([fromTab, fromServer]);
-    } finally {
-      shared.stopped = true;
-      stop.abort();
-      // 서버가 먼저 답했으면 탭 수집이 멈출 때까지 잠깐 본다. 안 멈추면 멎은 탭이다 — 다음 라운드가
-      // 그 탭을 쓰지 않게 하고, 늦게 깨어난 루프가 새 라운드의 화면을 건드리지 못하게 한다.
-      if (serverWon && (await within(fromTab.catch(() => ''), 15_000)) === TIMED_OUT) this.retirePage();
-    }
-  }
-
-  /**
-   * 탭과 **따로** 서버에 응답 상태를 묻고, 서버가 마치면 그 답을 서버 기록에서 읽는다.
-   *
-   * 탭 화면은 완료의 권위가 아니다 (2026-10 실측). 서버가 375~555초에 끝낸 답을 데몬 탭은
-   * 전송 후 약 600초에 웹앱이 스스로 다시 맞출 때까지 그리지 않았다. 예전에는 그때 탭을
-   * 새로고침했고, 그 뒤에는 서버 COMPLETE 후 15초를 탭에 먼저 주었다. 이제는 탭을 기다리지 않는다 —
-   * 어느 쪽이 먼저 끝나든 본문은 같은 서버 기록에서 온다.
-   *
-   * 이어 쓰는 대화는 전송 직후에 직전 턴의 COMPLETE 가 남아 있을 수 있다 — 그 기록의 답은
-   * `judgeServerAnswer` 가 이번 질문의 것이 아니라고 거른다. 조회 실패(null)는 아무 일도 하지 않는다.
-   *
-   * 탭 수집이 멎어 자기 예산을 지키지 못하면 여기서 대신 타임아웃으로 접는다 (회수는 호출부가 맡는다).
-   */
-  private async watchServer(page: Page, s: CollectShared, signal: AbortSignal): Promise<string> {
-    await pause(SERVER_STATUS_AFTER_MS, signal);
-    for (;;) {
-      const status = await this.serverStreamStatus(page);
-      if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
-      if (status === 'IS_STREAMING') {
-        if (!s.sawServerStreaming) console.log(chalk.dim('  서버 응답 상태: 생성 중 (stream_status) — 끝나면 서버 기록에서 답을 읽습니다.'));
-        s.sawServerStreaming = true;
-      } else if (status === 'COMPLETE') {
-        const conv = await this.serverConversation(page);
-        if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
-        const verdict = judgeServerAnswer(conv, status, { sentAt: s.sentAt, sawStreaming: s.sawServerStreaming });
-        if (verdict.kind === 'answer') {
-          console.log(chalk.green(`  ✓ 응답 수신 완료 (서버 기록 · ${verdict.text.length.toLocaleString()}자)`));
-          return verdict.text;
-        }
-      }
-      if (Date.now() > s.deadline + TAB_STALL_MS && Date.now() - s.lastPollAt > TAB_STALL_MS) {
-        this.retirePage();
-        throw new ResponseTimeoutError(
-          `탭이 ${Math.round((Date.now() - s.lastPollAt) / 60_000)}분째 응답하지 않아 예산 안에 응답을 받지 못했습니다 — ` +
-            '탭을 새로 열고 같은 대화를 다시 확인합니다.',
-        );
-      }
-      await pause(SERVER_STATUS_EVERY_MS, signal);
-    }
-  }
-
-  /**
-   * 어시스턴트 응답이 완전히 스트리밍 될 때까지 탭 화면을 폴링한다.
-   * 3회 연속 동일 텍스트이면 완료로 간주.
-   */
-  private async collectFromTab(
-    page: Page,
-    messageCountBefore: number,
-    afterUserId: string | null,
-    timeout: number,
-    shared: CollectShared,
-  ): Promise<string> {
-    const sel = this.cfg.selectors;
-
+  private async collectResponse(page: Page, timeout: number, asked: AskedAfter): Promise<string> {
     // 여기서부터는 기다리기만 한다 — 차례를 넘겨 옆 탭이 진입·입력을 시작하게 한다.
     this.endTurn();
-
-    // 응답 시작을 **따로 기다리지 않는다.** 예전에는 여기서 60초 안에 어시스턴트
-    // 노드가 안 뜨면 실패로 던졌는데, 추론 모드는 첫 노드가 뜨기까지 몇 분이 걸린다
-    // ("Worked for 8m30s"). 정상 응답을 절단하고 라운드를 버린 뒤 같은 질문을 다시
-    // 보내게 되므로, 이 프로젝트에서 가장 비싼 실패 방향이다.
-    //
-    // 예산은 responseTimeoutMs 하나로 통일한다. 아래 루프가 노드가 없는 동안에도
-    // 빈 문자열을 읽으며 돌고, 완료 조건이 "내용이 있고 안정" 이라 조기 종료하지
-    // 않는다. 한도 감지는 루프 안에서 주기적으로 한다 (예전엔 60초 catch 에만
-    // 있어서, 그 시점을 넘기면 한도를 영영 못 봤다).
     progress.phase('waiting');
-    console.log(chalk.dim('  응답 대기 중...'));
+    console.log(chalk.dim('  응답 대기 중... (서버 기록)'));
 
-    // **기다린 그 노드를 읽는다.** `.last()` 로 읽으면 안 된다 — 기다리는 대상과
-    // 읽는 대상이 갈리면 **엉뚱한 메시지를 응답으로 저장해 게시한다.** 실제로 9차
-    // 라운드가 7차의 응답을 그대로 게시했다 (관측 길이가 845자로 272초 고정되다가
-    // 341자로 급감 — 스트리밍이면 있을 수 없는 변화다).
-    //
-    // 위치는 **매 폴링마다 화면에서 다시 판정한다** (anchorAnswer). 전송 시점의
-    // 개수(messageCountBefore)를 그대로 위치로 쓰면, 그 뒤 ChatGPT 가 화면 밖
-    // 메시지를 떼어내는 순간 그 위치는 아무것도 가리키지 않게 되고 응답이 화면에
-    // 다 나와 있는데도 "0자" 로 예산을 전부 태운다 (#75 6차 · 15분 타임아웃).
-    //
-    // 판정된 노드는 즉시 **식별자로 고정**해 DOM 이 흔들려도 같은 메시지만 읽는다.
-    // 고정 후 노드가 계속 사라져 있으면 수집을 실패시킨다 — 다른 메시지를 대신
-    // 읽어 게시하는 것보다 낫다.
-    let bound: BoundTarget | null = null;
-    /** 앵커는 답 노드를 찾았는데 식별자가 없을 때 쓰는 위치. */
-    let readyNth: number | null = null;
-    /** 앵커 판별이 계속 안 돼 전송 시점 위치로 물러섰는가. */
-    let fellBack = false;
-    let anchorNoted = false;
-    let redrawNoted = false;
-    /** 앵커를 연속으로 못 잡은 횟수 — 위치 기반으로 물러설지 판단한다. */
-    let unknowns = 0;
-
-    /**
-     * 지금 읽어야 할 노드. **모르면 null 이다** — 그때는 아무것도 읽지 않는다.
-     *
-     * 대상이 정해지기 전에 위치로 아무 메시지나 읽으면, 그 값이 3회 안정 관측을
-     * 통과해 직전 라운드의 답이 이번 응답으로 저장된다.
-     */
-    const targetLocator = (): Locator | null => {
-      if (bound) return page.locator(messageByIdSelector(bound.id));
-      if (readyNth !== null) return page.locator(sel.assistantMessage).nth(readyNth);
-      if (fellBack) return page.locator(sel.assistantMessage).nth(messageCountBefore);
-      return null;
-    };
-
-    // 셀렉터를 일반화한 형태다 (findRound 와 같은 이유) — 역할을 나눠 읽어야
-    // "마지막 질문 뒤" 를 판정할 수 있다.
-    const readMessages = async (): Promise<MessageRef[] | null> => {
-      try {
-        return await page.evaluate(readMessagesInPage, null);
-      } catch {
-        return null; // 네비게이션 중 등
-      }
-    };
-
-    /**
-     * 아직 고정 전이면 대상을 찾아 고정한다.
-     *
-     * 한 번 고정한 뒤에는 `judgeRebind` 만이 대상을 바꾼다 — 같은 질문의 답으로
-     * 갈아 끼우는 경우뿐이다.
-     */
-    const bindTarget = (msgs: MessageRef[] | null): BoundTarget | null => {
-      const anchor: AnswerAnchor = msgs
-        ? anchorAnswer(msgs, afterUserId)
-        : { status: 'unknown' };
-
-      unknowns = anchor.status === 'unknown' ? unknowns + 1 : 0;
-
-      // 답 노드가 아직 없다 — 여기서 위치로 물러서면 직전 라운드의 답을 읽는다.
-      if (anchor.status === 'pending') return null;
-
-      if (anchor.status === 'ready') {
-        if (!anchorNoted && anchor.nth !== messageCountBefore) {
-          anchorNoted = true;
-          console.log(
-            chalk.dim(
-              `  응답 위치가 전송 시점과 다릅니다 (${messageCountBefore} → ${anchor.nth}) — 화면 기준으로 따라갑니다.`,
-            ),
-          );
-        }
-        // 따옴표가 섞이면 셀렉터가 깨진다 — 그때는 위치로 읽고 축소 방어가 맡는다.
-        if (anchor.id && !/["\\]/.test(anchor.id)) {
-          readyNth = null;
-          return { id: anchor.id, userId: anchor.userId, nth: anchor.nth };
-        }
-        readyNth = anchor.nth;
-        return null;
-      }
-
-      // 앵커 판별 불가 (셀렉터 커스터마이즈 등) — 종전대로 전송 시점 기준 위치.
-      // 전송 직후 우리 질문이 아직 안 그려진 한순간도 여기로 떨어지는데, 그때
-      // 물러서면 직전 라운드의 답을 고정한다. 계속 못 잡을 때만 물러선다.
-      if (unknowns >= UNKNOWN_TOLERANCE && !fellBack) {
-        fellBack = true;
-        // 개편 화면에서 실제로 여기로 떨어졌다 — 다음에 원인을 짚을 근거를 남긴다.
-        console.log(chalk.dim(`  답 위치를 화면에서 못 잡아 전송 시점 위치로 읽습니다 (메시지 ${msgs ? msgs.map((m) => m.role[0] ?? '?').join('') || '없음' : '조회 실패'})`));
-      }
-      return null;
-    };
-
-    // 메시지 컨테이너 전체를 읽으면 "Edit"·복사 버튼 같은 UI 텍스트가 섞인다.
-    // 본문(.markdown)이 있으면 그쪽을 읽는다. 한 메시지 안에 본문 블록이 여러 개면
-    // (산문 + 코드블록 + 산문) **전부 이어 붙인다** — 마지막 하나만 집으면 JSON 이
-    // 앞에 있을 때 통째로 잃는다.
-    /** 위치로 읽은 노드의 표식 (이번 읽기 · 마지막으로 받아들인 읽기). */
-    let readStamp: string | null = null;
-    let lastStamp: string | null = null;
-    const readTarget = async (): Promise<string> => {
-      const target = targetLocator();
-      if (!target) return ''; // 어느 노드가 이번 답인지 아직 모른다
-      // 위치로 읽을 때는 그 노드에 표식을 찍어 **같은 노드인지** 안다. 개편 화면은 완료 때
-      // 코드블록을 다시 그리며 글자가 줄어드는데, 같은 노드의 축소는 정상이다.
-      readStamp = bound ? null : await Promise.resolve().then(() => target.evaluate((el) => {
-        let s = el.getAttribute('data-pr-review-anchor');
-        if (!s) { s = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; el.setAttribute('data-pr-review-anchor', s); }
-        return s;
-      })).catch(() => null);
-      const bodies = target.locator(sel.messageContent);
-      if ((await bodies.count().catch(() => 0)) > 0) {
-        const parts = await bodies.allInnerTexts().catch(() => [] as string[]);
-        return parts.join('\n').trim();
-      }
-      return target.innerText().catch(() => '');
-    };
-
-    let lastText = '';
-    let stable = 0;
-    let shrinks = 0;
-    let misses = 0;
-    let recoveries = 0;
-    let lastLogAt = Date.now();
-    let lastLoggedPhase = '';
-    let lastQuotaCheckAt = Date.now();
-    let lastChangeAt = Date.now();
-    let stallNoted = false;
-    let emptySince: number | null = null;
-    // **이번** 빈 구간을 새로고침으로 재확인했는가. 배너 복구 횟수(recoveries)와 따로 둔다 —
-    // 앞서 다른 중단을 복구한 이력으로 이번 중단을 새로고침 없이 종료로 확정하면, 다시
-    // 읽으면 회수할 수 있던 답을 버리고 같은 질문을 재전송한다 (#51 리뷰).
-    let emptyReloaded = false;
     const t0 = Date.now();
+    let deadline = t0 + timeout;
     let extensions = 0;
+    let sawStreaming = false;
+    let quietSince: number | null = null;
+    let unreadSince: number | null = null;
+    let lastQuotaCheckAt = t0;
+    let lastLogAt = t0;
+    let lastPhase = '';
     const span = (ms: number): string => ms < 60_000 ? `${Math.ceil(ms / 1000)}초` : `${Math.round(ms / 60_000)}분`;
-    /** 예산이 다 됐을 때 — 생성이 확실히 진행 중이면 같은 예산을 한 번 더 준다 (MAX_RESPONSE_EXTENSIONS). */
-    const extend = async (): Promise<boolean> => {
-      if (extensions >= MAX_RESPONSE_EXTENSIONS) return false;
-      if (!(await this.isStreaming(page)) || this.stallEvidence(true) !== 'generating') return false;
-      extensions++;
-      shared.deadline += timeout;
-      console.log(chalk.yellow(
-        `  ⏳ ${span(Date.now() - t0)} 지났지만 생성이 아직 진행 중입니다 — ` +
-          `${span(timeout)} 더 기다립니다 (연장 ${extensions}/${MAX_RESPONSE_EXTENSIONS}).`,
-      ));
-      return true;
-    };
-    /** 대화를 새로고침하고 수집 상태를 처음부터 다시 잡는다 (연결 중단 · 낡은 탭 복구 공용). */
-    const reloadConversation = async (): Promise<void> => {
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
-      await page.waitForTimeout(6_000);
-      stable = 0;
-      lastText = '';
-      emptySince = null;
-      // 화면을 통째로 다시 그렸다 — 고정을 풀고 새 DOM 에서 다시 앵커를 잡는다.
-      // (그대로 두면 새 노드의 id 가 달라졌을 때 "사라졌다" 로 라운드를 버린다.)
-      bound = null;
-      readyNth = null;
-      fellBack = false;
-      unknowns = 0;
-      misses = 0;
-    };
-    /**
-     * 화면은 끝났다 — 답을 정한다. 서버가 아직 생성 중이면 받지 않고 null 이다 (화면이 남의 노드를
-     * 끝난 답으로 읽은 경우가 정확히 이 모양이다). 서버에 다시 묻는 건 서버 감시 주기에 한 번이다.
-     */
-    let settleRetryAt = 0;
-    let pendingNoted = false;
-    const settle = async (): Promise<string | null> => {
-      if (Date.now() < settleRetryAt) return null;
-      const answer = await this.settleAnswer(page, lastText, shared);
-      if (answer !== null) return answer;
-      settleRetryAt = Date.now() + SERVER_STATUS_EVERY_MS;
-      if (!pendingNoted) {
-        pendingNoted = true;
-        console.log(chalk.yellow('  ⚠ 화면은 답을 마쳤지만 서버는 아직 생성 중입니다 (stream_status) — 화면의 답을 받지 않고 기다립니다.'));
-      }
-      return null;
+    // 한도는 화면 배너로만 알 수 있다 — 답이 아니라 실패 신호라 화면을 본다 (멎은 탭에서도 제한 시간 안에).
+    const quota = async (): Promise<void> => {
+      const hit = await within(this.detectQuotaLimit(page).catch(() => null), SCREEN_PEEK_TIMEOUT_MS);
+      if (hit && hit !== TIMED_OUT) throw new QuotaLimitError(`한도 감지: "${hit}"`);
     };
 
-    while (!shared.stopped && (Date.now() < shared.deadline || await extend())) {
-      await page.waitForTimeout(3_000);
-      if (shared.stopped) break;
-      shared.lastPollAt = Date.now();
+    // 첫 조회는 바로 한다 — 회수 경로에서는 답이 이미 와 있을 수 있다.
+    for (let first = true; ; first = false) {
+      if (!first) await this.nap(SERVER_POLL_MS);
+      const status = await this.serverStreamStatus(page);
+      const streaming = status === 'IS_STREAMING';
+      if (streaming && !sawStreaming) console.log(chalk.dim('  서버: 생성 중 (stream_status) — 끝나면 기록에서 답을 읽습니다.'));
+      sawStreaming ||= streaming;
+      const conv = streaming ? null : await this.serverConversation(page);
+      const verdict = judgeServerAnswer(conv, status, asked);
+      if (verdict.kind === 'answer') {
+        console.log(chalk.green(`  ✓ 응답 수신 완료 (서버 기록 · ${verdict.text.length.toLocaleString()}자 · ${span(Date.now() - t0)})`));
+        return verdict.text;
+      }
+      const reason = verdict.kind === 'unknown' ? verdict.reason : '생성 중';
 
-      const msgs = await readMessages();
-
-      if (bound) {
-        // 고정한 노드가 안 보인다. ChatGPT 가 임시 식별자로 그린 답 노드를 서버
-        // 식별자로 갈아 끼우는 구간이 여기다 — **같은 질문의 답이면 따라간다.**
-        // 확인이 안 될 때만 유예를 쓰고, 유예를 다 쓰면 라운드를 접는다. 위치로
-        // 물러서서 아무 메시지나 읽으면 그게 바로 낡은 응답 게시다.
-        const decision = judgeRebind(msgs ?? [], bound);
-        if (decision.action === 'rebind') {
-          bound = { id: decision.id, userId: bound.userId, nth: bound.nth };
-          console.log(chalk.dim('  응답 노드가 교체됐습니다 — 같은 질문의 답으로 다시 고정합니다.'));
-        } else if (decision.action === 'wait') {
-          // 답 노드가 잠시 사라졌다 (추론 중 다시 그리는 구간). 고정은 그대로 두고
-          // 기다린다 — 아래로 흘려보내야 생성 중 판정·정체 진단·경과 표시가 산다.
-          // 죽은 노드를 읽으면 빈 문자열이라 완료로 오인될 일도 없다.
-          if (!redrawNoted) {
-            redrawNoted = true;
-            console.log(chalk.dim('  답 노드가 다시 그려지는 중입니다 — 같은 질문이므로 기다립니다.'));
-          }
-        } else if (decision.action === 'hold') {
-          if (++misses >= MISS_TOLERANCE) {
-            throw new Error(
-              `수집 중이던 응답 노드가 사라졌습니다 (대화 화면이 바뀐 것으로 보입니다 · ${decision.reason}).`,
-            );
-          }
-          console.log(
-            chalk.dim(`  응답 노드가 안 보입니다 (${misses}/${MISS_TOLERANCE} · ${decision.reason})`),
-          );
-          continue;
-        }
-        misses = 0;
-      } else {
-        bound = bindTarget(msgs);
+      // 기록을 못 읽는다 — 화면 글자로 대신하지 않는다. 한두 번의 일시 실패는 넘긴다.
+      const unread = !streaming && conv === null;
+      unreadSince = unread ? (unreadSince ?? Date.now()) : null;
+      if (unreadSince !== null && Date.now() - unreadSince >= SERVER_UNREAD_LIMIT_MS) {
+        throw new Error(`서버 기록을 ${span(Date.now() - unreadSince)}째 읽지 못합니다 — 화면의 답은 쓰지 않습니다 `
+          + `(대화 ${page.url()}). 로그인·네트워크를 확인하세요.`);
       }
 
-      const cur = await readTarget();
-
-      // 식별자를 못 잡아 위치로 읽는 중이라면, **짧아진 값을 채택하지 않는다.**
-      // 생성 중인 응답은 길어지기만 하므로 축소는 다른 노드를 읽었다는 신호다.
-      // (경고만 하고 덮어쓰면 그 값이 3회 안정 관측을 통과해 그대로 게시된다.)
-      const sameNode = readStamp !== null && readStamp === lastStamp;
-      if (!bound && !sameNode && lastText.length > 0 && cur.length < lastText.length) {
-        shrinks++;
-        console.log(
-          chalk.yellow(
-            `  ⚠ 읽은 응답이 짧아졌습니다 (${lastText.length.toLocaleString()} → ` +
-              `${cur.length.toLocaleString()}자) — 다른 노드로 보고 채택하지 않습니다 ` +
-              `(${shrinks}/${SHRINK_TOLERANCE}).`,
-          ),
-        );
-        stable = 0;
-        if (shrinks >= SHRINK_TOLERANCE) {
-          throw new Error('읽는 응답 노드가 계속 바뀝니다 — 낡은 응답을 게시하지 않기 위해 중단합니다.');
-        }
-        continue;
-      }
-      shrinks = 0;
-      lastStamp = readStamp;
-
-      // **덮어쓰기 전에** 변경 여부를 잡는다. 아래에서 lastText = cur 을 해버리면
-      // 그 뒤에는 언제나 같아 보여서, 정상 스트리밍도 "변화 없음" 으로 기록된다.
-      const changed = cur !== lastText;
-      if (changed) {
-        lastChangeAt = Date.now();
-        stallNoted = false;
-      }
-
-      if (cur.length > 0 && !changed) {
-        stable++;
-      } else {
-        stable = 0;
-        lastText = cur;
-      }
-
-      // 대기 판정은 **종전 그대로** 중지 버튼만 본다. 네트워크 관측은 근거를
-      // 남기는 용도이고, 무트래픽 시간으로 대기를 끊으면 오래 걸리는 추론의
-      // 부분 응답을 완성본으로 게시하게 된다 (이슈 #1 이 경계한 조기 절단).
-      const streaming = await this.isStreaming(page);
-      // 생성 표시도, 생성 요청도, 답 본문도 없다 — 아무것도 오고 있지 않다.
-      const empty = !streaming && !lastText && this.netInFlight === 0;
-      emptySince = empty ? (emptySince ?? Date.now()) : null;
-      // 생성이 다시 움직였다 — 앞선 새로고침은 다음 빈 구간의 종료 근거가 아니다.
-      if (!empty) emptyReloaded = false;
-      // 본문이 없다는 이유만으로 추론 중이라고 단정하지 않는다. 중지 버튼이
-      // 보여 주는 생성 상태와 실제 답변 본문의 수신 여부를 따로 설명한다.
-      const phase = streaming
-        ? lastText ? '답변 수신 중' : '생성 중 · 본문 대기'
-        : lastText ? '완료 확인 중' : '응답 대기 · 생성 표시 없음';
-
-      // ── 정체 진단 (이슈 #1) ──
-      // 여기서 관측하는 것은 답변 본문뿐이다. 추론 UI 전체를 관측한 것처럼
-      // "화면 변화 없음"으로 경고하지 않는다. 생성 활동이 확인되면 정상 대기다.
-      const stalledMs = Date.now() - lastChangeAt;
-      const evidence = this.stallEvidence(streaming);
-      if (
-        streaming &&
-        stalledMs > STALL_DUMP_EVERY_MS &&
-        evidence !== 'generating' &&
-        !stallNoted
-      ) {
-        stallNoted = true;
-        const reason = evidence === 'network-quiet' ? '생성 통신도 오래 관측되지 않음' : '생성 통신 관측 없음';
-        console.log(
-          chalk.yellow(
-            `  ⚠ 답변 본문 ${Math.round(stalledMs / 1000)}초째 미갱신 · ${reason} · 생성 중지 표시는 유지됨 — 계속 기다립니다.`,
-          ),
-        );
-      }
-
-      // 아직 아무것도 안 나왔고 생성 중도 아니면 한도에 막힌 것일 수 있다.
-      // 예전에는 이 검사가 "60초 시작 타임아웃" catch 에만 있어서, 그 시점을
-      // 넘기면 한도를 영영 못 보고 15분을 기다렸다.
-      if (!streaming && !lastText && Date.now() - lastQuotaCheckAt > QUOTA_RECHECK_MS) {
+      // 아무것도 오고 있지 않다 — 서버가 생성 중이 아니고, 기록에 이번 답이 없고, 생성 요청도 없다.
+      // ChatGPT 에서 중지·연결 끊김·한도가 이 모습이다.
+      const quiet = !streaming && !unread && this.netInFlight === 0;
+      quietSince = quiet ? (quietSince ?? Date.now()) : null;
+      if (!streaming && Date.now() - lastQuotaCheckAt >= QUOTA_RECHECK_MS) {
         lastQuotaCheckAt = Date.now();
-        const quota = await this.detectQuotaLimit(page);
-        if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
+        await quota();
       }
-
-      // 터미널은 상태 전환 또는 2분마다 한 줄, UI 는 폴링마다 갱신한다 — 이 구간이 2~15분
-      // 이라 "멈춘 건지 도는 건지" 를 실시간으로 보여주는 게 관측의 핵심이다.
-      // (이슈 #1 의 원인 미상 타임아웃도 여기 기록이 남아야 나중에 짚을 수 있다.)
-      progress.stream(phase, lastText.length);
-
-      // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일 — 본문은 서버 기록에서 (settle)
-      if (!streaming && lastText.trim().length > 0 && stable >= SETTLE_STABLE_READS) {
-        const answer = await settle();
-        if (answer !== null) {
-          console.log(chalk.green(`  ✓ 응답 수신 완료 (${answer.length.toLocaleString()}자)`));
-          return answer;
-        }
-      }
-
-      // 중지 버튼이 끝내 안 사라지는 경우의 완료 (#109).
-      //
-      // 버튼은 종전대로 1차 권위다 — 위 조건이 성립하면 여기까지 오지 않는다.
-      // 다만 버튼 하나가 유일한 권위이면, 그것이 DOM 에 남는 순간 완료가 영원히
-      // 성립하지 않아 완성된 응답을 통째로 버린다. 다른 근거가 모두 "끝났다" 를
-      // 가리킬 때만 버튼을 고장으로 인정한다 (판정 근거는 judgeStuckButton).
-      if (
-        streaming &&
-        lastText.trim().length > 0 &&
-        judgeStuckButton({
-          sawGeneration: this.sawGeneration,
-          inFlight: this.netInFlight,
-          quietMs: this.lastNetAt ? Date.now() - this.lastNetAt : Number.POSITIVE_INFINITY,
-          idleMs: Date.now() - lastChangeAt,
-        })
-      ) {
-        const answer = await settle();
-        if (answer !== null) {
-          console.log(
-            chalk.yellow(
-              `  ⚠ 중지 버튼이 ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 남아 있는데 ` +
-                '생성 통신과 답변 본문 갱신이 없습니다 — 버튼 고장으로 보고 완료 처리합니다.',
-            ),
-          );
-          console.log(chalk.green(`  ✓ 응답 수신 완료 (${answer.length.toLocaleString()}자)`));
-          return answer;
-        }
-      }
-
-      // 서버는 끝났는데 탭만 생성 중인 경우는 서버 감시(watchServer)가 서버 기록에서 읽는다.
-
-      // "Connection interrupted" — 스트림이 끊긴 상태. 서버에는 응답이 완성돼 있으므로
-      // 대화를 새로고침하면 완성본을 가져올 수 있다.
-      // 배너가 없어도 생성이 답 없이 끝났으면 같은 복구를 탄다. 화면 문구를 같이 남겨
-      // 무엇이 떠 있었는지(연결 해제·오류 안내 등) 로그만 보고 알 수 있게 한다.
-      const banner = streaming ? null : await this.interruptedBanner(page);
-      const interrupt = banner
-        ?? (emptySince !== null && Date.now() - emptySince >= EMPTY_END_MS
-          ? `답 없이 생성이 끝남 · 화면 "${await this.screenHint(page)}"` : null);
-      if (interrupt) {
-        // 답 없는 종료는 한 번만 새로고침한다 — 다시 30초를 봐도 없으면 오는 게 없다.
-        // 배너처럼 세 번 하면 회수 예산(150초)을 다 써서 타임아웃으로 접히고, 그러면
-        // 회수 루프가 끝나지 않는다.
-        // 배너는 수집 전체에서 세 번까지, 답 없는 종료는 **그 빈 구간마다** 한 번이다.
-        const limit = banner ? MAX_RELOAD_RECOVERIES : 1;
-        const used = banner ? recoveries : Number(emptyReloaded);
-        if (used >= limit) {
-          // **무엇이 걸렸는지 남긴다.** 이게 없으면 오탐일 때 원인을 짚을 수 없다.
-          if (banner) {
-            throw new Error(
-              `연결 중단이 반복됩니다 (${recoveries}회 복구 시도 · 감지 문구 "${interrupt}"). ` +
-                '브라우저 창에서 상태를 확인하세요.',
-            );
-          }
-          throw new GenerationEndedError(
-            `생성이 답 없이 끝났습니다 — 새로고침 후에도 중지 버튼도 답도 없습니다 (${interrupt}). 다음 재시도에 응답을 다시 확인합니다.`,
-          );
-        }
-        if (banner) recoveries++;
-        else emptyReloaded = true;
-        console.log(
-          chalk.yellow(
-            `  ⚠ 연결 중단 감지 ("${interrupt}") — 대화를 새로고침해 완성된 응답을 가져옵니다 ` +
-              `(${used + 1}/${limit})`,
-          ),
+      if (quietSince !== null && Date.now() - quietSince >= ENDED_QUIET_MS) {
+        await quota();
+        throw new GenerationEndedError(
+          `생성이 답 없이 끝났습니다 — 서버가 생성 중이 아니고 기록에 이번 답이 없습니다 `
+            + `(${reason} · 화면 "${await this.screenHint(page)}"). 다음 재시도에 응답을 다시 확인합니다.`,
         );
-        await reloadConversation();
+      }
+
+      // 대시보드는 폴링마다, 터미널은 상태 전환 또는 2분마다 한 줄 — 2~15분 대기가 멈춘 건지 도는 건지 보인다.
+      const phase = streaming ? '생성 중' : unread ? '서버 기록 조회 실패' : '답 확인 중';
+      progress.stream(phase, 0);
+      if (phase !== lastPhase || Date.now() - lastLogAt > 120_000) {
+        lastLogAt = Date.now();
+        lastPhase = phase;
+        console.log(chalk.dim(`    …${Math.round((Date.now() - t0) / 1000)}초 경과 · ${phase}`));
+      }
+
+      if (Date.now() < deadline) continue;
+      // 예산이 다 됐다 — 서버가 생성 중이라고 하면(또는 생성 요청이 살아 있으면) 같은 예산을 더 준다.
+      if (extensions < MAX_RESPONSE_EXTENSIONS && (streaming || this.netInFlight > 0)) {
+        extensions++;
+        deadline += timeout;
+        console.log(chalk.yellow(
+          `  ⏳ ${span(Date.now() - t0)} 지났지만 생성이 아직 진행 중입니다 — ` +
+            `${span(timeout)} 더 기다립니다 (연장 ${extensions}/${MAX_RESPONSE_EXTENSIONS}).`,
+        ));
         continue;
       }
-
-      // 같은 상태는 2분에 한 번만 알리고, 상태 전환은 바로 알린다.
-      if (phase !== lastLoggedPhase || Date.now() - lastLogAt > 120_000) {
-        lastLogAt = Date.now();
-        lastLoggedPhase = phase;
-        const sec = Math.round((Date.now() - t0) / 1000);
-        console.log(
-          chalk.dim(`    …${sec}초 경과 · ${phase}${lastText ? ` · ${lastText.length.toLocaleString()}자` : ''}`),
-        );
-      }
+      await quota();
+      console.log(chalk.dim(`  응답 타임아웃 진단 · 서버=${status ?? '조회 실패'} · 기록=${reason} · 생성 요청 ${this.netInFlight}건 · 화면 "${await this.screenHint(page)}"`));
+      throw new ResponseTimeoutError(streaming
+        ? `${span(deadline - t0)} 안에 응답이 끝나지 않았습니다 (서버가 아직 생성 중). 끝나지 않은 답은 게시하지 않습니다 — `
+          + 'responseTimeoutMs 를 늘리거나 다음 라운드에서 다시 시도합니다.'
+        : `${span(deadline - t0)} 동안 응답을 받지 못했습니다 (${reason}). `
+          + '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.');
     }
-
-    if (shared.stopped) return ''; // 서버 감시가 먼저 답했다 — 이 값은 쓰이지 않는다
-    // 아래 마무리(한도·진단·서버 기록 확인)도 움직이는 중이다 — 서버 감시의 백스톱이 앞질러 접지 않게.
-    shared.lastPollAt = Date.now();
-
-    // ── 예산 소진 ──
-    // **아직 생성 중인지**로 가른다. 글자가 좀 쌓였다는 것만으로 "받았다" 고 보면,
-    // 15분 직전에 JSON 을 쓰기 시작한 응답이 잘린 채 파서로 넘어가 ReviewRejected
-    // 로 둔갑한다. 원인은 타임아웃인데 표기는 붉은 "리뷰 실패" 가 되어, 이 구분이
-    // 느린 생성에서 통째로 우회된다.
-    const stillGenerating = await this.isStreaming(page);
-    const duration = span(shared.deadline - t0); // 연장까지 포함한 전체 예산
-
-    if (!stillGenerating && lastText.trim().length > 0) {
-      // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
-      // 완성본일 가능성이 높으므로 복구용으로 쓴다 — 종전 동작. 서버가 아직 생성 중이면 아래 타임아웃이다.
-      const answer = await this.settleAnswer(page, lastText, shared);
-      if (answer !== null) {
-        console.log(chalk.yellow('  ⚠ 예산 소진 — 생성은 끝나 있어 지금 받은 답을 사용합니다.'));
-        return answer;
-      }
-    }
-
-    const quota = await this.detectQuotaLimit(page);
-    if (quota) throw new QuotaLimitError(`한도 감지: "${quota}"`);
-    console.log(chalk.dim(`  응답 타임아웃 진단 · 근거=${this.stallEvidence(stillGenerating)} · 중지버튼 ${await this.dumpStopButtons(page)} · 화면 "${await this.screenHint(page)}"`));
-    throw new ResponseTimeoutError(
-      lastText.trim().length > 0
-        ? `${duration} 안에 응답이 끝나지 않았습니다 (${lastText.length.toLocaleString()}자까지 생성). ` +
-          '잘린 응답은 게시하지 않습니다 — responseTimeoutMs 를 늘리거나 다음 라운드에서 다시 시도합니다.'
-        : `${duration} 동안 응답을 받지 못했습니다. ` +
-          '브라우저 창에서 ChatGPT 상태를 확인하거나 responseTimeoutMs 를 늘려보세요.',
-    );
   }
 
   /**
@@ -2467,32 +1832,6 @@ export class ChatGPTDriver {
     });
   }
 
-  /**
-   * 중지 버튼 셀렉터에 **무엇이 걸렸는지** 덤프한다 (이슈 #1 다음 단계 1).
-   *
-   * 오탐(받아쓰기 중지 등 다른 버튼)인지 진짜 생성 중지 버튼인지는 이걸 봐야 갈린다.
-   * 재현될 때 자동으로 남게 해 두지 않으면 사람이 그 순간에 붙어 있어야 한다.
-   */
-  private async dumpStopButtons(page: Page): Promise<string> {
-    try {
-      const info = await page.evaluate((selector) => {
-        return [...document.querySelectorAll(selector)].map((el) => {
-          const r = (el as HTMLElement).getBoundingClientRect();
-          return {
-            tag: el.tagName.toLowerCase(),
-            testid: el.getAttribute('data-testid'),
-            aria: el.getAttribute('aria-label'),
-            disabled: (el as HTMLButtonElement).disabled ?? null,
-            visible: r.width > 0 && r.height > 0,
-          };
-        });
-      }, this.cfg.selectors.stopButton);
-      return info.length === 0 ? '(매칭 없음)' : JSON.stringify(info);
-    } catch {
-      return '(덤프 실패)';
-    }
-  }
-
   /** 생성 중지 버튼이 있으면 아직 스트리밍 중. */
   private async isStreaming(page: Page): Promise<boolean> {
     try {
@@ -2505,9 +1844,9 @@ export class ChatGPTDriver {
   /**
    * 서버가 아는 이 대화의 응답 상태 — `IS_STREAMING` · `COMPLETE` (모르면 null).
    *
-   * 비공개 엔드포인트라 셀렉터처럼 깨질 수 있다. 실패는 전부 null 로 떨어뜨려 호출부가
-   * 종전 동작(탭 화면 기준)으로 남게 한다. 토큰은 이 페이지 안에서만 쓴다.
-   * 전송 직후의 임시 주소(/c/WEB:…)는 조회되지 않으므로 실제 id 일 때만 묻는다.
+   * 비공개 엔드포인트라 셀렉터처럼 깨질 수 있다. 실패는 전부 null 이다 — 수집이 그 시간을 세어
+   * `SERVER_UNREAD_LIMIT_MS` 에서 접는다. 토큰은 이 페이지 안에서만 쓴다.
+   * 전송 직후의 임시 주소(/c/WEB:…)는 조회되지 않으므로 실제 id 일 때만 묻는다 (그동안은 null).
    */
   private async serverStreamStatus(page: Page): Promise<string | null> {
     const status = (await this.serverJson(page, '/stream_status', SERVER_STATUS_TIMEOUT_MS) as { status?: unknown } | null)?.status;
@@ -2559,57 +1898,11 @@ export class ChatGPTDriver {
   }
 
   /**
-   * 화면이 끝났다고 본 답을 정한다 — **서버 기록의 이번 답이 있으면 그것**이다 (`judgeServerAnswer`).
-   * 서버가 아직 생성 중이면 null 이다 (받지 않는다). 서버로 판정하지 못하면 화면 글자를 쓰고 이유를 남긴다 —
-   * 그 줄이 계속 보이면 서버 우선이 꺼져 있다는 뜻이다 (비공개 API 의 모양이 바뀌었을 수 있다).
-   *
-   * 화면이 답 대신 오류 문구를 그렸으면(`isUnloadedAnswer`) 이번 질문 확인 없이라도 서버 기록의 마지막 답을
-   * 쓴다 (종전 동작). 서버에도 없으면 던진다 — 그 문구를 답으로 넘기면 "리뷰 JSON 없음" 으로 원인이 가려진다.
-   * 어느 답이든 파서의 형식·대상 SHA 검증을 그대로 거친다.
-   */
-  private async settleAnswer(page: Page, text: string, s: CollectShared): Promise<string | null> {
-    const status = await this.serverStreamStatus(page);
-    if (status === 'IS_STREAMING') s.sawServerStreaming = true;
-    const conv = status === 'IS_STREAMING' ? null : await this.serverConversation(page);
-    const verdict = judgeServerAnswer(conv, status, { sentAt: s.sentAt, sawStreaming: s.sawServerStreaming });
-    if (verdict.kind === 'pending') return null;
-    if (verdict.kind === 'answer') {
-      if (verdict.text !== text) console.log(chalk.dim(`  답 본문은 서버 기록에서 읽었습니다 (화면 ${text.length.toLocaleString()}자 → ${verdict.text.length.toLocaleString()}자).`));
-      return verdict.text;
-    }
-    if (!isUnloadedAnswer(text)) {
-      console.log(chalk.yellow(`  ⚠ 서버 기록으로 답을 확인하지 못해(${verdict.reason}) 화면의 답을 씁니다.`));
-      return text;
-    }
-    const answer = conv ? pickServerAnswer(conv) : null;
-    if (!answer || isUnloadedAnswer(answer)) {
-      throw new Error(`ChatGPT 화면이 답 대신 "${text.trim()}" 를 띄웠고 서버 기록에서도 답을 찾지 못했습니다`
-        + ` (${conv ? '기록에 최종 답 없음' : '기록 조회 실패'}) — 대화에서 직접 확인하세요: ${page.url()}`);
-    }
-    console.log(chalk.yellow(`  ⚠ 화면이 답을 그리지 못했습니다 ("${text.trim()}") — 서버 기록에서 ${answer.length.toLocaleString()}자를 읽었습니다.`));
-    return answer;
-  }
-
-  /**
-   * "Connection interrupted" 배너 감지 — 걸린 문구를 돌려준다 (없으면 null).
-   *
-   * 쿼터 감지와 **같은 수집**(`uiTextTail`)을 쓴다. 대화 메시지를 포함해서 보면
-   * 리뷰 본문의 한 문장이 배너로 오인되고, 그 문장은 새로고침해도 남으므로
-   * 복구 시도가 전부 즉시 실패한다 (INTERRUPT_PATTERNS 주석 참고).
-   */
-  private async interruptedBanner(page: Page): Promise<string | null> {
-    return matchInterrupt(await this.uiTextTail(page));
-  }
-
-  /**
    * 화면 크롬(메시지 제외)의 끝부분 — 실패할 때 무엇이 떠 있었는지 남긴다.
-   * 진단이 깨져도 오류 분류(타임아웃 등)가 바뀌면 안 되므로 던지지 않는다.
+   * 진단이 깨져도 오류 분류(타임아웃 등)가 바뀌면 안 되므로 던지지 않는다. 멎은 탭에서도 제한 시간 안에 돌아온다.
    */
   private async screenHint(page: Page): Promise<string> {
-    try {
-      return (await this.uiTextTail(page)).replace(/\s+/g, ' ').trim().slice(-200);
-    } catch {
-      return '(수집 실패)';
-    }
+    const tail = await within(this.uiTextTail(page).catch(() => null), SCREEN_PEEK_TIMEOUT_MS);
+    return typeof tail === 'string' ? tail.replace(/\s+/g, ' ').trim().slice(-200) : '(수집 실패)';
   }
 }

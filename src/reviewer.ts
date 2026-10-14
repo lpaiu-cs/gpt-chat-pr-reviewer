@@ -987,12 +987,11 @@ async function reclaimRound(
 
   console.log(chalk.dim('  이 라운드 질문이 대화에 이미 있습니다 — 재질문 없이 응답만 회수합니다.'));
   progress.phase('waiting');
-  // 기준점을 findRound 가 준 값으로 넘긴다. 완료 판정(스트리밍 종료 + 안정)은
-  // collectResponse 가 하므로, 이미 와 있는 답이면 즉시, 생성 중이면 끝까지 기다린다.
-  // 전송 시각은 서버 기록의 마지막 질문이 이 전송 뒤의 것인지 가르는 데 쓴다 (judgeServerAnswer).
-  const raw = await driver.collectFrom(baseline, ctx.pendingSend?.recoverAfter
+  // 답은 서버 기록에서 받는다 — 이미 와 있으면 즉시, 생성 중이면 끝까지 기다린다.
+  // 보내기 전의 마지막 질문 id 로 이 전송 뒤의 답인지 가른다 (구버전 기록은 전송 시각 · judgeServerAnswer).
+  const raw = await driver.collectFrom(ctx.pendingSend?.recoverAfter
     ? Math.min(cfg.responseTimeoutMs, RESPONSE_RECOVERY_WAIT_MS) : cfg.responseTimeoutMs,
-  Number.isFinite(sentAt) ? sentAt : null);
+  { askedBefore: ctx.pendingSend?.askedBefore, sentAt: Number.isFinite(sentAt) ? sentAt : null });
   const saved = saveResponse(cfg, ctx, round, raw, {
     conversationUrl: url,
     ...targetMeta(sent),
@@ -1223,7 +1222,7 @@ async function askChatGPT(
 
   progress.phase('prompt'); // collectResponse 가 곧 'waiting' 으로 넘긴다
   let conversationUrl: string | undefined;
-  const raw = await driver.sendAndCollect(prompt, (url, reasoning) => {
+  const raw = await driver.sendAndCollect(prompt, (url, reasoning, askedBefore) => {
     // **응답을 기다리기 전에** 저장한다. 여기가 이 변경의 핵심이다 — 대기 중에
     // 죽어도 다음 라운드가 그 대화로 복귀해 위의 중복 판별을 탈 수 있다.
     // 리뷰 대상도 같이 남긴다. 회수 판정은 "그때 그 diff 인가" 까지 봐야 한다.
@@ -1232,7 +1231,7 @@ async function askChatGPT(
     if (reasoning) target.reasoning = reasoning;
     if (!opts.dryRun) {
       rememberConversation(ctx, conversationUrl, round);
-      ctx.pendingSend = { round, ...target, at: new Date().toISOString(), marker };
+      ctx.pendingSend = { round, ...target, at: new Date().toISOString(), askedBefore, marker };
       saveContext(cfg, ctx);
     }
   }, attachment);

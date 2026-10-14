@@ -1,171 +1,94 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatGPTDriver, GenerationEndedError, ResponseTimeoutError } from '../src/chatgpt.js';
+import { ChatGPTDriver, GenerationEndedError, QuotaLimitError, ResponseTimeoutError } from '../src/chatgpt.js';
 import { loadConfig } from '../src/config.js';
 import { progress } from '../src/progress.js';
 import { VERSION } from '../src/version.js';
 
-test('회수 예산은 생성 중 부분 응답을 거부하고 고장난 중지 버튼의 120초 판정도 허용한다', async t => {
-  let now = 1000;
-  t.mock.method(Date, 'now', () => now);
-  const cfg = { ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 };
-  const driver = new ChatGPTDriver(cfg) as any;
-  let streaming = true;
-  driver.isStreaming = async () => streaming;
-  driver.interruptedBanner = async () => null;
-  driver.detectQuotaLimit = async () => null;
-  driver.dumpStopButtons = async () => 'fixture';
-  driver.page = {
-    waitForTimeout: async (ms: number) => { now += ms; },
-    evaluate: async () => [{ role: 'user', id: 'question' }, { role: 'assistant', id: 'answer' }],
-    locator: () => ({ locator: () => ({ count: async () => 1, allInnerTexts: async () => ['response'] }) }),
-  };
-  await assert.rejects(driver.collectFrom(0, 30_000), ResponseTimeoutError);
-  assert(now < 60_000);
-  assert.equal(cfg.responseTimeoutMs, 25 * 60_000);
-  driver.sawGeneration = true;
-  driver.netInFlight = 0;
-  driver.lastNetAt = 1000;
-  assert.equal(await driver.collectFrom(0, 150_000), 'response');
-  streaming = false;
-  assert.equal(await driver.collectFrom(0, 30_000), 'response');
+// 답은 서버 기록에서만 받는다 — 아래 탭은 서버 조회(`fetchServerInPage`) 말고는 아무것도 돌려주지 않는다.
+const CHAT = 'https://chatgpt.com/g/g-p-6aa1d12d5db88191870747513394cb0e-jadong-pr-ribyu/c/6acd33bf-39f0-83e8-add2-09d48b0af407';
+const sentAt = Date.parse('2026-10-14T22:20:58Z');
+
+/** 서버 기록 — 마지막 질문의 시각과 그 뒤의 최종 답 (2026-10-15 실측 모양을 줄였다). */
+const record = (askedAt: number, text = '{"summary":"ok"}', q = 'q') => ({
+  current_node: 'a',
+  mapping: {
+    [q]: { parent: null, message: { author: { role: 'user' }, create_time: askedAt / 1000, content: { content_type: 'text', parts: ['리뷰'] } } },
+    a: { parent: q, message: { author: { role: 'assistant' }, recipient: 'all', status: 'finished_successfully', end_turn: true,
+      content: { content_type: 'text', parts: [text] } } },
+  },
 });
 
-test('본문 전 생성 대기는 정상 진행으로 표시하고 관측 한계 경고는 한 번만 남긴다', async (t) => {
-  let now = 1_000;
+function rig(t: TestContext, server: (path: string, elapsed: number) => unknown, budget = 25 * 60_000) {
+  let now = sentAt;
   t.mock.method(Date, 'now', () => now);
   const logs: string[] = [];
+  t.mock.method(console, 'log', (line: unknown) => logs.push(String(line)));
+  const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: budget }) as any;
+  driver.nap = async (ms: number) => { now += ms; };
+  driver.detectQuotaLimit = async () => null;
+  driver.uiTextTail = async () => 'Something went wrong';
+  const page = {
+    url: () => CHAT,
+    evaluate: async (_fn: unknown, arg?: { path?: string }) =>
+      arg?.path ? server(arg.path, now - sentAt) : assert.fail('답을 화면에서 읽으면 안 된다'),
+    locator: () => assert.fail('답을 화면에서 읽으면 안 된다'),
+  };
+  // 보내기 전 기록의 마지막 질문은 prev 였다
+  const collect = () => driver.collectResponse(page, budget, { askedBefore: 'prev' });
+  return { driver, collect, logs, elapsed: () => now - sentAt };
+}
+
+const status = (path: string, value: string) => path.endsWith('/stream_status') ? { status: value } : null;
+
+// 9차가 7차의 답을 게시했던 모양 — 화면은 남의 노드를 끝난 답으로 읽었다. 이제 화면은 답의 출처가 아니다.
+test('서버가 생성 중이면 기다렸다가, 끝나면 기록의 이번 답을 받는다', async (t) => {
   const phases: string[] = [];
-  t.mock.method(console, 'log', (line: string) => logs.push(line));
   t.mock.method(progress, 'stream', (phase: string) => phases.push(phase));
-  for (const tracked of [true, false]) {
-    logs.length = 0;
-    phases.length = 0;
-    let step = 0;
-    const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 300_000 }) as any;
-    driver.sawGeneration = tracked;
-    driver.isStreaming = async () => step <= 81;
-    driver.interruptedBanner = async () => null;
-    const page = {
-      waitForTimeout: async (ms: number) => {
-        now += ms;
-        step++;
-        if (tracked) driver.lastNetAt = now - 2_000;
-      },
-      evaluate: async () => [
-        { role: 'user', id: 'question' },
-        ...(step >= 81 ? [{ role: 'assistant', id: 'answer' }] : []),
-      ],
-      locator: () => ({ locator: () => ({
-        count: async () => 1,
-        allInnerTexts: async () => ['complete answer'],
-      }) }),
-    };
-    assert.equal(await driver.collectResponse(page, 0, null), 'complete answer');
-    assert.ok(phases.includes('생성 중 · 본문 대기'));
-    assert.ok(phases.includes('답변 수신 중'));
-    assert.ok(phases.includes('완료 확인 중'));
-    assert.equal(logs.filter(line => line.includes('⚠') && line.includes('미갱신')).length, tracked ? 0 : 1);
-    assert.equal(logs.filter(line => line.includes('본문 대기')).length, 2);
-    assert.ok(logs.every(line => !line.includes('화면 변화 없음')));
-  }
+  const r = rig(t, (path, ms) => status(path, ms < 90_000 ? 'IS_STREAMING' : 'COMPLETE') ?? record(sentAt + 1_000));
+  assert.equal(await r.collect(), '{"summary":"ok"}');
+  assert.ok(r.elapsed() >= 90_000, `${r.elapsed()}ms`);
+  assert.ok(phases.includes('생성 중'));
+  // 터미널에는 폴링마다가 아니라 상태가 바뀔 때만 한 줄
+  assert.equal(r.logs.filter(line => line.includes('경과')).length, 1);
   assert.equal(progress.state().snapshot.version, VERSION);
 });
 
-test('생성 표시도 답도 없으면 한 번 새로고침한 뒤 GenerationEndedError 로 접는다', async (t) => {
-  let now = 1_000;
-  t.mock.method(Date, 'now', () => now);
-  t.mock.method(console, 'log', () => {});
-  const make = (inFlight: number) => {
-    const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 }) as any;
-    driver.isStreaming = async () => false; // ChatGPT 에서 중지됨 — 버튼이 없다
-    driver.netInFlight = inFlight;
-    driver.interruptedBanner = async () => null;
-    driver.detectQuotaLimit = async () => null;
-    driver.dumpStopButtons = async () => 'fixture';
-    driver.uiTextTail = async () => 'Something went wrong';
-    return driver;
-  };
-  let reloads = 0;
-  const page = {
-    waitForTimeout: async (ms: number) => { now += ms; },
-    reload: async () => { reloads++; },
-    evaluate: async () => [{ role: 'user', id: 'question' }],
-    locator: () => ({ locator: () => ({ count: async () => 0, allInnerTexts: async () => [] }) }),
-  };
-
-  await assert.rejects(make(0).collectResponse(page, 0, null),
-    (e: Error) => e instanceof GenerationEndedError && e.message.includes('Something went wrong'));
-  assert.equal(reloads, 1);
+test('직전 턴의 답만 기록에 있으면 받지 않는다 — 아무것도 오지 않으면 생성 종료, 한도 배너면 한도', async (t) => {
+  // 앞 라운드가 빨리 끝나 직전 질문이 30초 전에 나갔다 — 시각으로는 못 가른다 (#68 리뷰)
+  const stale = (path: string) => status(path, 'COMPLETE') ?? record(sentAt - 30_000, '직전 라운드의 답', 'prev');
+  const ended = rig(t, stale);
+  await assert.rejects(ended.collect(), (e: Error) => e instanceof GenerationEndedError && e.message.includes('Something went wrong'));
   // 회수 경로의 예산(150초) 안에 끝나야 회수 루프가 타임아웃으로 다시 돌지 않는다.
-  assert.ok(now - 1_000 < 150_000, `${now - 1_000}ms`);
+  assert.ok(ended.elapsed() < 150_000, `${ended.elapsed()}ms`);
+
+  const quota = rig(t, stale);
+  quota.driver.detectQuotaLimit = async () => "You've reached your limit";
+  await assert.rejects(quota.collect(), QuotaLimitError);
 
   // 생성 요청이 아직 날아가는 중이면 끝난 게 아니다 — 예산까지 기다린다.
-  reloads = 0;
-  await assert.rejects(make(1).collectResponse(page, 0, null, 60_000), ResponseTimeoutError);
-  assert.equal(reloads, 0);
+  const inFlight = rig(t, stale, 60_000);
+  inFlight.driver.netInFlight = 1;
+  await assert.rejects(inFlight.collect(), ResponseTimeoutError);
 });
 
-test('앞선 중단을 복구한 이력으로 이번 빈 구간을 새로고침 없이 종료로 확정하지 않는다 (#51 리뷰)', async (t) => {
-  let now = 1_000;
-  t.mock.method(Date, 'now', () => now);
-  t.mock.method(console, 'log', () => {});
-  let reloads = 0;
-  let resumeUntil = 0;
-  const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 }) as any;
-  // 30초 생성 → 배너로 끊김 → 새로고침 뒤 30초 더 생성 → 배너 없이 버튼·답이 사라진다.
-  driver.isStreaming = async () => now < 31_000 || (reloads === 1 && now < resumeUntil);
-  driver.interruptedBanner = async () => (reloads === 0 && now >= 31_000 ? 'Connection interrupted' : null);
-  driver.detectQuotaLimit = async () => null;
-  driver.dumpStopButtons = async () => 'fixture';
-  driver.uiTextTail = async () => '';
-  const page = {
-    waitForTimeout: async (ms: number) => { now += ms; },
-    reload: async () => { reloads++; if (reloads === 1) resumeUntil = now + 36_000; },
-    evaluate: async () => [{ role: 'user', id: 'question' }],
-    locator: () => ({ locator: () => ({ count: async () => 0, allInnerTexts: async () => [] }) }),
-  };
-  await assert.rejects(driver.collectResponse(page, 0, null), GenerationEndedError);
-  // 배너 복구 1회 + 이번 빈 구간의 재확인 1회. 이력만 보고 바로 던지면 1이다.
-  assert.equal(reloads, 2);
+test('서버 기록을 계속 못 읽으면 화면 글자로 대신하지 않고 실패한다 — 한두 번의 실패는 넘긴다', async (t) => {
+  const down = rig(t, () => null);
+  await assert.rejects(down.collect(), (e: Error) =>
+    !(e instanceof ResponseTimeoutError) && !(e instanceof GenerationEndedError) && /서버 기록을 .*읽지 못합니다/.test(e.message));
+  assert.ok(down.elapsed() >= 120_000 && down.elapsed() < 150_000, `${down.elapsed()}ms`);
+
+  const flaky = rig(t, (path, ms) => ms < 20_000 ? null : status(path, 'COMPLETE') ?? record(sentAt));
+  assert.equal(await flaky.collect(), '{"summary":"ok"}');
 });
 
-test('예산이 다 돼도 생성이 확실히 진행 중이면 예산을 더 주고, 버튼만 남은 고장은 연장하지 않는다', async (t) => {
-  let now = 1_000;
-  t.mock.method(Date, 'now', () => now);
-  t.mock.method(console, 'log', () => {});
+test('예산이 다 돼도 서버가 생성 중이면 같은 예산을 더 주되, 연장 2회에서 접는다', async (t) => {
   const budget = 25 * 60_000;
-  const make = (alive: boolean, answerAt: number) => {
-    const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: budget }) as any;
-    driver.isStreaming = async () => now < answerAt;
-    driver.sawGeneration = true;
-    driver.netInFlight = alive ? 1 : 0; // 고장 쪽은 생성 요청이 없다
-    driver.lastNetAt = 1_000;
-    driver.interruptedBanner = async () => null;
-    driver.detectQuotaLimit = async () => null;
-    driver.dumpStopButtons = async () => 'fixture';
-    driver.uiTextTail = async () => '';
-    const page = {
-      waitForTimeout: async (ms: number) => { now += ms; },
-      evaluate: async () => [{ role: 'user', id: 'q' }, ...(now >= answerAt ? [{ role: 'assistant', id: 'a' }] : [])],
-      locator: () => ({ locator: () => ({ count: async () => 1, allInnerTexts: async () => ['answer'] }) }),
-    };
-    return { driver, page };
-  };
-
   // 실측 39분 (sky-fishing#2, 1.8MB diff) — 25분 예산을 한 번 연장해 받는다.
-  const slow = make(true, 1_000 + 39 * 60_000);
-  assert.equal(await slow.driver.collectResponse(slow.page, 0, null), 'answer');
+  const slow = rig(t, (path, ms) => status(path, ms < 39 * 60_000 ? 'IS_STREAMING' : 'COMPLETE') ?? record(sentAt));
+  assert.equal(await slow.collect(), '{"summary":"ok"}');
 
-  // 버튼만 남고 생성 요청이 없다 (이슈 #1) — 연장하지 않고 예산에서 접는다.
-  now = 1_000;
-  const stuck = make(false, Number.POSITIVE_INFINITY);
-  await assert.rejects(stuck.driver.collectResponse(stuck.page, 0, null), ResponseTimeoutError);
-  assert.ok(now - 1_000 < budget + 10_000, `${now - 1_000}ms`);
-
-  // 생성 요청이 끝없이 살아 있어도 상한(연장 2회)에서 접는다.
-  now = 1_000;
-  const forever = make(true, Number.POSITIVE_INFINITY);
-  await assert.rejects(forever.driver.collectResponse(forever.page, 0, null), /75분/);
-  assert.ok(now - 1_000 >= 3 * budget && now - 1_000 < 3 * budget + 10_000, `${now - 1_000}ms`);
+  const forever = rig(t, path => status(path, 'IS_STREAMING') ?? record(sentAt));
+  await assert.rejects(forever.collect(), /75분/);
+  assert.ok(forever.elapsed() >= 3 * budget && forever.elapsed() < 3 * budget + 15_000, `${forever.elapsed()}ms`);
 });
