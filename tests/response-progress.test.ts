@@ -65,7 +65,7 @@ test('본문 전 생성 대기는 정상 진행으로 표시하고 관측 한계
     assert.ok(phases.includes('생성 중 · 본문 대기'));
     assert.ok(phases.includes('답변 수신 중'));
     assert.ok(phases.includes('완료 확인 중'));
-    assert.equal(logs.filter(line => line.includes('⚠')).length, tracked ? 0 : 1);
+    assert.equal(logs.filter(line => line.includes('⚠') && line.includes('미갱신')).length, tracked ? 0 : 1);
     assert.equal(logs.filter(line => line.includes('본문 대기')).length, 2);
     assert.ok(logs.every(line => !line.includes('화면 변화 없음')));
   }

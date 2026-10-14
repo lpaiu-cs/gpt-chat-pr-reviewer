@@ -529,8 +529,12 @@ const SERVER_STATUS_AFTER_MS = 60_000;
 const SERVER_STATUS_EVERY_MS = 30_000;
 /** 상태 조회 한 번의 상한 — 넘으면 null(종전 동작)로 돌아간다. */
 const SERVER_STATUS_TIMEOUT_MS = 10_000;
-/** 서버가 끝났다고 한 뒤 탭이 따라올 여유 — 정상 지연(2~10초)과 비교도 안 되게 잡는다. */
-const STALE_TAB_GRACE_MS = 15_000;
+/**
+ * 서버 기록의 질문 시각(서버 시계)을 전송 시각(이 컴퓨터 시계)과 비교할 때의 여유.
+ * 실측 차이는 몇 초다 (질문 create_time 이 전송 직후 기록됨). 직전 질문은 적어도 직전 답의
+ * 생성 시간만큼 앞서므로 이 값으로 갈린다. 시계가 이보다 어긋나면 판정을 못 해 화면 답으로 돌아간다.
+ */
+const SERVER_CLOCK_SKEW_MS = 60_000;
 /**
  * 탭 수집이 예산을 이만큼 넘기고도 이만큼 한 바퀴도 못 돌면 탭이 멎은 것으로 보고 서버 감시가 대신 접는다.
  * 새로고침 한 번(최대 66초)보다 넉넉하게 잡는다 — 그건 멎은 게 아니다.
@@ -541,10 +545,10 @@ const TAB_STALL_MS = 120_000;
 interface CollectShared {
   /** 한쪽이 끝났다 — 다른 쪽은 더 하지 않는다 */
   stopped: boolean;
-  /** 이번 수집에서 서버가 IS_STREAMING 이라고 답한 적이 있는가 */
+  /** 이번 수집에서 서버가 IS_STREAMING 이라고 답한 적이 있는가 — 서버 기록의 마지막 턴이 이번 생성이라는 근거 */
   sawServerStreaming: boolean;
-  /** 그 뒤 서버가 COMPLETE 라고 답한 시각 (못 봤으면 null) */
-  completeSince: number | null;
+  /** 이 질문을 보낸 시각 (이 컴퓨터 시계 · 모르면 null) — 서버 기록의 마지막 질문이 이번 것인지 가른다 */
+  sentAt: number | null;
   /** 탭 수집의 예산 끝 (연장하면 늘어난다) */
   deadline: number;
   /** 탭 수집이 마지막으로 한 바퀴를 시작한 시각 */
@@ -598,39 +602,92 @@ export function isUnloadedAnswer(text: string): boolean {
   return /^This response couldn[’']t load\.?$/i.test(text.trim());
 }
 
+/** 서버 기록의 메시지 하나에서 쓰는 모양만. */
+interface ServerMessage {
+  author?: { role?: string };
+  recipient?: string;
+  /** 끝난 메시지는 finished_successfully (2026-10-15 실측) */
+  status?: string;
+  /** 턴을 끝내는 최종 답만 true — 도구 호출·추론 노드는 false */
+  end_turn?: boolean | null;
+  /** 서버 시계 · 초 단위 */
+  create_time?: number | null;
+  content?: { content_type?: string; parts?: unknown[] };
+}
+
 /** 서버 대화 기록(`/backend-api/conversation/<id>`)에서 쓰는 모양만. */
 export interface ServerConversation {
   current_node?: string;
-  mapping?: Record<string, {
-    parent?: string | null;
-    message?: {
-      author?: { role?: string };
-      recipient?: string;
-      content?: { content_type?: string; parts?: unknown[] };
-    } | null;
-  }>;
+  mapping?: Record<string, { parent?: string | null; message?: ServerMessage | null }>;
 }
 
 /**
- * 서버 기록에서 **마지막 질문 뒤의 최종 답** 본문 (없으면 null · 순수 함수).
+ * 현재 가지의 마지막 질문과 그 뒤의 최종 답 (순수 함수).
  *
  * 현재 가지(`current_node` 에서 부모로)만 걷는다 — 다시 생성한 옛 가지의 답을 집으면 안 된다.
  * 추론 요약·도구 호출(content_type 이 text 가 아니거나 받는 쪽이 all 이 아닌 것)은 답이 아니다.
  * 마지막 질문을 만나면 멈춘다 — 그 앞의 답은 직전 라운드의 것이다.
  */
-export function pickServerAnswer(conv: ServerConversation): string | null {
+function lastExchange(conv: ServerConversation): { question: ServerMessage | null; answer: ServerMessage | null; text: string | null } {
   const nodes = conv.mapping ?? {};
   const seen = new Set<string>();
+  let answer: ServerMessage | null = null;
+  let text: string | null = null;
   for (let id = conv.current_node; id && nodes[id] && !seen.has(id); id = nodes[id].parent ?? undefined) {
     seen.add(id);
     const m = nodes[id].message;
     const role = m?.author?.role;
-    if (role === 'user') return null;
-    if (role !== 'assistant' || (m?.recipient ?? 'all') !== 'all' || m?.content?.content_type !== 'text') continue;
-    const text = (m.content.parts ?? []).filter((p): p is string => typeof p === 'string').join('');
-    if (text.trim()) return text;
+    if (role === 'user') return { question: m ?? null, answer, text };
+    if (answer || role !== 'assistant' || (m?.recipient ?? 'all') !== 'all' || m?.content?.content_type !== 'text') continue;
+    const body = (m.content.parts ?? []).filter((p): p is string => typeof p === 'string').join('');
+    if (body.trim()) { answer = m; text = body; }
   }
-  return null;
+  return { question: null, answer, text };
+}
+
+/** 서버 기록에서 **마지막 질문 뒤의 최종 답** 본문 (없으면 null · 순수 함수 · 이번 질문인지는 보지 않는다). */
+export function pickServerAnswer(conv: ServerConversation): string | null {
+  return lastExchange(conv).text;
+}
+
+/** 서버 기록이 이번 질문에 대해 말해 주는 것. */
+export type ServerVerdict =
+  | { kind: 'answer'; text: string } // 이번 질문의 끝난 답 — 이걸 쓴다
+  | { kind: 'pending' } // 서버가 아직 생성 중이다 — 화면이 끝났다고 해도 받지 않는다
+  | { kind: 'unknown'; reason: string }; // 서버로 판정하지 못했다 — 종전대로 화면 답을 쓴다
+
+/**
+ * 서버 기록에 **이번 질문의 끝난 답**이 있는가 (순수 함수).
+ *
+ * 화면은 답의 권위가 아니다. 노드 교체로 남의 답을 읽고(9차가 7차의 답을 게시), 답 대신
+ * "This response couldn’t load" 를 그리고, 서버가 마친 답을 수백 초 늦게 그렸다. 화면 쪽
+ * 증상은 하나씩 막아 왔지만 같은 근원에서 계속 새로 나왔다 — 그래서 답은 서버 기록에서 읽는다.
+ *
+ *  - **이번 질문인가.** 마지막 질문이 전송 뒤에 만들어졌거나(서버 시각 · `SERVER_CLOCK_SKEW_MS`),
+ *    이번 수집에서 서버가 생성 중이라고 한 적이 있다. 질문 본문은 서버가 마크다운으로 이스케이프해
+ *    저장하므로(`\## 대상 PR`) 보낸 글과 비교하지 않는다.
+ *  - **끝났는가.** 최종 답이 `finished_successfully` 이고 `end_turn` 이다 — 도구 호출 앞의 중간 답이 아니다.
+ *
+ * 서버가 생성 중이면 pending 이다. 그 밖(조회 실패·기록 모양이 다름·이번 질문이 아직 없음)은 unknown 이고,
+ * 호출부는 종전 동작(화면 답)으로 돌아간다 — 비공개 API 라 바뀔 수 있고, 그때 받던 답까지 잃으면 안 된다.
+ */
+export function judgeServerAnswer(
+  conv: ServerConversation | null,
+  status: string | null,
+  seen: { sentAt: number | null; sawStreaming: boolean },
+): ServerVerdict {
+  if (status === 'IS_STREAMING') return { kind: 'pending' };
+  if (!conv) return { kind: 'unknown', reason: '서버 기록 조회 실패' };
+  const { question, answer, text } = lastExchange(conv);
+  const askedAt = typeof question?.create_time === 'number' ? question.create_time * 1000 : Number.NaN;
+  if (!seen.sawStreaming && !(seen.sentAt !== null && askedAt >= seen.sentAt - SERVER_CLOCK_SKEW_MS)) {
+    return { kind: 'unknown', reason: seen.sentAt === null ? '전송 시각을 모름' : '기록의 마지막 질문이 이번 전송이 아님' };
+  }
+  if (!text || answer?.status !== 'finished_successfully' || answer.end_turn !== true) {
+    return { kind: 'unknown', reason: '기록에 끝난 답 없음' };
+  }
+  if (isUnloadedAnswer(text)) return { kind: 'unknown', reason: '기록의 답도 오류 문구' };
+  return { kind: 'answer', text };
 }
 
 /** 복구 판정에 쓰는 신호들. */
@@ -1339,6 +1396,7 @@ export class ChatGPTDriver {
       throw new Error(`추론 강도를 최대로 맞추지 못했습니다 — 전송하지 않습니다: ${String(cause?.message ?? cause).split('\n')[0]}`, { cause });
     }), false);
     console.log(chalk.dim(`  추론: ${reasoning}`));
+    let sentAt = 0;
     try {
       if (attachment) {
         await this.inputStep(`고정 diff 첨부 (${attachment.buffer.length}바이트)`, async () => {
@@ -1365,6 +1423,7 @@ export class ChatGPTDriver {
       // 이번 라운드의 생성만 근거로 쓴다.
       this.sawGeneration = false;
       this.assertProjectPage(p);
+      sentAt = Date.now(); // 서버 기록의 질문 시각과 맞대어 이번 질문인지 가른다 (judgeServerAnswer)
       await this.inputStep('전송 버튼', () => this.clickSend(p));
       if (!(await this.inputStep('전송 확인', () => this.verifyPromptSent(p, input, lastUserBefore, beforeUserCount)))) {
         throw new Error('프롬프트가 전송되지 않았습니다 — 입력창·전송 버튼 상태를 확인하세요');
@@ -1390,7 +1449,7 @@ export class ChatGPTDriver {
     if (onSent) onSent(await this.waitForConversationUrl(p), reasoning);
 
     // ── 응답 수집 ──
-    return this.collectResponse(p, before, lastUserBefore);
+    return this.collectResponse(p, before, lastUserBefore, this.cfg.responseTimeoutMs, sentAt);
   }
 
   /** 화면에 그려져 있는 질문들 (역할·식별자만 — 본문은 크므로 읽지 않는다). */
@@ -1483,8 +1542,8 @@ export class ChatGPTDriver {
    * 완료 판정(스트리밍 종료 + 내용 안정)은 collectResponse 가 그대로 맡는다 —
    * 그래서 스트리밍 중인 부분 응답을 완성본으로 오인하지 않는다.
    */
-  async collectFrom(assistantBefore: number, timeoutMs = this.cfg.responseTimeoutMs): Promise<string> {
-    return this.collectResponse(this.requirePage(), assistantBefore, null, timeoutMs);
+  async collectFrom(assistantBefore: number, timeoutMs = this.cfg.responseTimeoutMs, sentAt: number | null = null): Promise<string> {
+    return this.collectResponse(this.requirePage(), assistantBefore, null, timeoutMs, sentAt);
   }
 
   /**
@@ -1815,20 +1874,26 @@ export class ChatGPTDriver {
 
   /**
    * 응답을 받는다 — 탭 화면 수집(`collectFromTab`)과 서버 감시(`watchServer`) 중 먼저 끝나는 쪽.
+   * 어느 쪽이든 **답 본문은 서버 기록에서** 읽는다 (`judgeServerAnswer`). 화면 글자는 서버로 판정하지
+   * 못할 때의 폴백이다.
    *
    * 둘을 따로 돌리는 이유: 탭에 대한 Playwright 호출은 제한 시간이 없어, 탭이 멎으면 수집 루프가
    * 통째로 멎는다. 2026-10-13 lolchess_base#137 은 루프 한 바퀴가 51분, 다음이 18분 걸렸다 — 같은
    * 시각 옆 탭의 라운드 둘은 정상이었고 브라우저의 CPU·메모리도 멀쩡했다. 서버 확인이 그 루프
    * 안에 있어 같이 멎었고, 서버가 마친 답(화면 "Response complete")을 72분 만에 타임아웃으로 버렸다.
+   *
+   * @param sentAt 이 질문을 보낸 시각 — 모르면 서버 기록이 이번 질문의 것인지는 이번 수집에서 서버가
+   *   생성 중이라고 한 적이 있을 때만 안다.
    */
   private async collectResponse(
     page: Page,
     messageCountBefore: number,
     afterUserId: string | null = null,
     timeout = this.cfg.responseTimeoutMs,
+    sentAt: number | null = null,
   ): Promise<string> {
     const shared: CollectShared = {
-      stopped: false, sawServerStreaming: false, completeSince: null,
+      stopped: false, sawServerStreaming: false, sentAt,
       deadline: Date.now() + timeout, lastPollAt: Date.now(),
     };
     const stop = new AbortController();
@@ -1850,15 +1915,15 @@ export class ChatGPTDriver {
   }
 
   /**
-   * 탭과 **따로** 서버에 응답 상태를 묻고, 서버가 마친 답을 탭이 받아 오지 못하면 서버 기록에서 읽는다.
+   * 탭과 **따로** 서버에 응답 상태를 묻고, 서버가 마치면 그 답을 서버 기록에서 읽는다.
    *
    * 탭 화면은 완료의 권위가 아니다 (2026-10 실측). 서버가 375~555초에 끝낸 답을 데몬 탭은
    * 전송 후 약 600초에 웹앱이 스스로 다시 맞출 때까지 그리지 않았다. 예전에는 그때 탭을
-   * 새로고침했는데, 무거운 대화는 다시 여는 데만 2분이 넘게 걸렸다. 답은 이미 서버 기록에 있다 —
-   * 화면이 답 대신 "This response couldn’t load" 를 그릴 때 읽는 바로 그 기록이다 (`settleAnswer`).
+   * 새로고침했고, 그 뒤에는 서버 COMPLETE 후 15초를 탭에 먼저 주었다. 이제는 탭을 기다리지 않는다 —
+   * 어느 쪽이 먼저 끝나든 본문은 같은 서버 기록에서 온다.
    *
-   * **이번 생성을 IS_STREAMING 으로 본 뒤의 COMPLETE 만** 믿는다. 이어 쓰는 대화는 전송 직후에
-   * 직전 턴의 COMPLETE 가 남아 있을 수 있다. 조회 실패(null)는 아무 일도 하지 않는다 — 탭 수집만 남는다.
+   * 이어 쓰는 대화는 전송 직후에 직전 턴의 COMPLETE 가 남아 있을 수 있다 — 그 기록의 답은
+   * `judgeServerAnswer` 가 이번 질문의 것이 아니라고 거른다. 조회 실패(null)는 아무 일도 하지 않는다.
    *
    * 탭 수집이 멎어 자기 예산을 지키지 못하면 여기서 대신 타임아웃으로 접는다 (회수는 호출부가 맡는다).
    */
@@ -1868,22 +1933,15 @@ export class ChatGPTDriver {
       const status = await this.serverStreamStatus(page);
       if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
       if (status === 'IS_STREAMING') {
-        if (!s.sawServerStreaming) console.log(chalk.dim('  서버 응답 상태: 생성 중 (stream_status) — 탭이 늦으면 서버 기록에서 읽습니다.'));
+        if (!s.sawServerStreaming) console.log(chalk.dim('  서버 응답 상태: 생성 중 (stream_status) — 끝나면 서버 기록에서 답을 읽습니다.'));
         s.sawServerStreaming = true;
-        s.completeSince = null;
-      } else if (status === 'COMPLETE' && s.sawServerStreaming) {
-        s.completeSince ??= Date.now();
-        if (Date.now() - s.completeSince >= STALE_TAB_GRACE_MS) {
-          const conv = await this.serverConversation(page);
-          const answer = conv ? pickServerAnswer(conv) : null;
-          if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
-          if (answer && !isUnloadedAnswer(answer)) {
-            console.log(chalk.yellow(
-              `  ⚠ 서버는 응답을 마쳤는데(stream_status=COMPLETE) 탭이 ${Math.round((Date.now() - s.completeSince) / 1000)}초째 ` +
-                `받아 오지 못했습니다 — 서버 기록에서 ${answer.length.toLocaleString()}자를 읽었습니다.`,
-            ));
-            return answer;
-          }
+      } else if (status === 'COMPLETE') {
+        const conv = await this.serverConversation(page);
+        if (s.stopped) throw new Error('탭 수집이 먼저 끝났습니다');
+        const verdict = judgeServerAnswer(conv, status, { sentAt: s.sentAt, sawStreaming: s.sawServerStreaming });
+        if (verdict.kind === 'answer') {
+          console.log(chalk.green(`  ✓ 응답 수신 완료 (서버 기록 · ${verdict.text.length.toLocaleString()}자)`));
+          return verdict.text;
         }
       }
       if (Date.now() > s.deadline + TAB_STALL_MS && Date.now() - s.lastPollAt > TAB_STALL_MS) {
@@ -2086,6 +2144,23 @@ export class ChatGPTDriver {
       unknowns = 0;
       misses = 0;
     };
+    /**
+     * 화면은 끝났다 — 답을 정한다. 서버가 아직 생성 중이면 받지 않고 null 이다 (화면이 남의 노드를
+     * 끝난 답으로 읽은 경우가 정확히 이 모양이다). 서버에 다시 묻는 건 서버 감시 주기에 한 번이다.
+     */
+    let settleRetryAt = 0;
+    let pendingNoted = false;
+    const settle = async (): Promise<string | null> => {
+      if (Date.now() < settleRetryAt) return null;
+      const answer = await this.settleAnswer(page, lastText, shared);
+      if (answer !== null) return answer;
+      settleRetryAt = Date.now() + SERVER_STATUS_EVERY_MS;
+      if (!pendingNoted) {
+        pendingNoted = true;
+        console.log(chalk.yellow('  ⚠ 화면은 답을 마쳤지만 서버는 아직 생성 중입니다 (stream_status) — 화면의 답을 받지 않고 기다립니다.'));
+      }
+      return null;
+    };
 
     while (!shared.stopped && (Date.now() < shared.deadline || await extend())) {
       await page.waitForTimeout(3_000);
@@ -2215,10 +2290,13 @@ export class ChatGPTDriver {
       // (이슈 #1 의 원인 미상 타임아웃도 여기 기록이 남아야 나중에 짚을 수 있다.)
       progress.stream(phase, lastText.length);
 
-      // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일
+      // 완료 조건: 생성이 끝났고, 내용이 있고, 여러 번 동일 — 본문은 서버 기록에서 (settle)
       if (!streaming && lastText.trim().length > 0 && stable >= SETTLE_STABLE_READS) {
-        console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
-        return this.settleAnswer(page, lastText);
+        const answer = await settle();
+        if (answer !== null) {
+          console.log(chalk.green(`  ✓ 응답 수신 완료 (${answer.length.toLocaleString()}자)`));
+          return answer;
+        }
       }
 
       // 중지 버튼이 끝내 안 사라지는 경우의 완료 (#109).
@@ -2237,14 +2315,17 @@ export class ChatGPTDriver {
           idleMs: Date.now() - lastChangeAt,
         })
       ) {
-        console.log(
-          chalk.yellow(
-            `  ⚠ 중지 버튼이 ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 남아 있는데 ` +
-              '생성 통신과 답변 본문 갱신이 없습니다 — 버튼 고장으로 보고 완료 처리합니다.',
-          ),
-        );
-        console.log(chalk.green(`  ✓ 응답 수신 완료 (${lastText.length.toLocaleString()}자)`));
-        return this.settleAnswer(page, lastText);
+        const answer = await settle();
+        if (answer !== null) {
+          console.log(
+            chalk.yellow(
+              `  ⚠ 중지 버튼이 ${Math.round((Date.now() - lastChangeAt) / 1000)}초째 남아 있는데 ` +
+                '생성 통신과 답변 본문 갱신이 없습니다 — 버튼 고장으로 보고 완료 처리합니다.',
+            ),
+          );
+          console.log(chalk.green(`  ✓ 응답 수신 완료 (${answer.length.toLocaleString()}자)`));
+          return answer;
+        }
       }
 
       // 서버는 끝났는데 탭만 생성 중인 경우는 서버 감시(watchServer)가 서버 기록에서 읽는다.
@@ -2313,9 +2394,12 @@ export class ChatGPTDriver {
 
     if (!stillGenerating && lastText.trim().length > 0) {
       // 생성은 끝났는데 안정 판정만 못 받은 경우다 (내용이 계속 흔들렸다).
-      // 완성본일 가능성이 높으므로 복구용으로 쓴다 — 종전 동작.
-      console.log(chalk.yellow('  ⚠ 예산 소진 — 생성은 끝나 있어 현재 텍스트를 사용합니다.'));
-      return this.settleAnswer(page, lastText);
+      // 완성본일 가능성이 높으므로 복구용으로 쓴다 — 종전 동작. 서버가 아직 생성 중이면 아래 타임아웃이다.
+      const answer = await this.settleAnswer(page, lastText, shared);
+      if (answer !== null) {
+        console.log(chalk.yellow('  ⚠ 예산 소진 — 생성은 끝나 있어 지금 받은 답을 사용합니다.'));
+        return answer;
+      }
     }
 
     const quota = await this.detectQuotaLimit(page);
@@ -2475,13 +2559,28 @@ export class ChatGPTDriver {
   }
 
   /**
-   * 화면이 답 대신 오류 문구를 그렸으면(`isUnloadedAnswer`) 서버 기록의 답으로 바꾼다.
-   * 서버에도 없으면 던진다 — 그 문구를 답으로 넘기면 "리뷰 JSON 없음" 으로 원인이 가려진다.
-   * 읽은 답도 파서의 형식·대상 SHA 검증을 그대로 거친다.
+   * 화면이 끝났다고 본 답을 정한다 — **서버 기록의 이번 답이 있으면 그것**이다 (`judgeServerAnswer`).
+   * 서버가 아직 생성 중이면 null 이다 (받지 않는다). 서버로 판정하지 못하면 화면 글자를 쓰고 이유를 남긴다 —
+   * 그 줄이 계속 보이면 서버 우선이 꺼져 있다는 뜻이다 (비공개 API 의 모양이 바뀌었을 수 있다).
+   *
+   * 화면이 답 대신 오류 문구를 그렸으면(`isUnloadedAnswer`) 이번 질문 확인 없이라도 서버 기록의 마지막 답을
+   * 쓴다 (종전 동작). 서버에도 없으면 던진다 — 그 문구를 답으로 넘기면 "리뷰 JSON 없음" 으로 원인이 가려진다.
+   * 어느 답이든 파서의 형식·대상 SHA 검증을 그대로 거친다.
    */
-  private async settleAnswer(page: Page, text: string): Promise<string> {
-    if (!isUnloadedAnswer(text)) return text;
-    const conv = await this.serverConversation(page);
+  private async settleAnswer(page: Page, text: string, s: CollectShared): Promise<string | null> {
+    const status = await this.serverStreamStatus(page);
+    if (status === 'IS_STREAMING') s.sawServerStreaming = true;
+    const conv = status === 'IS_STREAMING' ? null : await this.serverConversation(page);
+    const verdict = judgeServerAnswer(conv, status, { sentAt: s.sentAt, sawStreaming: s.sawServerStreaming });
+    if (verdict.kind === 'pending') return null;
+    if (verdict.kind === 'answer') {
+      if (verdict.text !== text) console.log(chalk.dim(`  답 본문은 서버 기록에서 읽었습니다 (화면 ${text.length.toLocaleString()}자 → ${verdict.text.length.toLocaleString()}자).`));
+      return verdict.text;
+    }
+    if (!isUnloadedAnswer(text)) {
+      console.log(chalk.yellow(`  ⚠ 서버 기록으로 답을 확인하지 못해(${verdict.reason}) 화면의 답을 씁니다.`));
+      return text;
+    }
     const answer = conv ? pickServerAnswer(conv) : null;
     if (!answer || isUnloadedAnswer(answer)) {
       throw new Error(`ChatGPT 화면이 답 대신 "${text.trim()}" 를 띄웠고 서버 기록에서도 답을 찾지 못했습니다`

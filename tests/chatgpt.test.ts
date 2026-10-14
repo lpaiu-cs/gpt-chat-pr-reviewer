@@ -12,6 +12,7 @@ import {
   judgeStuckButton,
   isOwnDraft,
   isUnloadedAnswer,
+  judgeServerAnswer,
   pickServerAnswer,
   matchInterrupt,
   type MessageRef,
@@ -242,7 +243,8 @@ test('collectResponse: 탭이 멎으면 서버 기록의 답을 받고, 그 탭�
   const statuses = ['COMPLETE', 'IS_STREAMING', 'COMPLETE'];
   const conv = { current_node: 'a', mapping: {
     u: { message: { author: { role: 'user' } } },
-    a: { parent: 'u', message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['{"summary":"ok"}'] } } },
+    a: { parent: 'u', message: { author: { role: 'assistant' }, status: 'finished_successfully', end_turn: true,
+      content: { content_type: 'text', parts: ['{"summary":"ok"}'] } } },
   } };
   const hung = new Promise<never>(() => {});
   let probes = 0;
@@ -387,4 +389,69 @@ test('pickServerAnswer: 현재 가지에서 마지막 질문 뒤의 최종 답�
   // 마지막 질문 뒤에 답이 아직 없으면 직전 라운드의 답으로 물러서지 않는다
   assert.equal(pickServerAnswer({ ...conv, current_node: 't2' }), null);
   assert.equal(pickServerAnswer({}), null);
+});
+
+// 서버 기록 우선 (2026-10-15 실측 모양: 질문 create_time · 도구 호출·결과·추론 노드 · 최종 답 end_turn)
+const sentAt = Date.parse('2026-10-14T22:20:58Z');
+const record = (askedAt: number, final: Record<string, unknown> = {}) => ({
+  current_node: 'a',
+  mapping: {
+    root: { parent: null, message: null },
+    q: { parent: 'root', message: { author: { role: 'user' }, recipient: 'all', status: 'finished_successfully', create_time: askedAt / 1000,
+      content: { content_type: 'text', parts: ['당신은 코드 리뷰어입니다.\\n\\n\## 대상 PR'] } } },
+    call: { parent: 'q', message: { author: { role: 'assistant' }, recipient: 'api_tool.call_tool', status: 'finished_successfully', end_turn: false,
+      content: { content_type: 'code', parts: [] } } },
+    out: { parent: 'call', message: { author: { role: 'tool' }, recipient: 'all', content: { content_type: 'multimodal_text', parts: ['Page: turn21'] } } },
+    think: { parent: 'out', message: { author: { role: 'assistant' }, recipient: 'all', end_turn: false, content: { content_type: 'thoughts', parts: [] } } },
+    a: { parent: 'think', message: { author: { role: 'assistant' }, recipient: 'all', status: 'finished_successfully', end_turn: true,
+      content: { content_type: 'text', parts: ['```json\n{"summary":"ok"}\n```'] }, ...final } },
+  },
+});
+
+test('judgeServerAnswer: 이번 질문의 끝난 답만 답으로 인정한다', () => {
+  const seen = { sentAt, sawStreaming: false };
+  assert.deepEqual(judgeServerAnswer(record(sentAt + 2_000), 'COMPLETE', seen), { kind: 'answer', text: '```json\n{"summary":"ok"}\n```' });
+  // 서버 시계가 조금 늦어 질문 시각이 전송보다 앞서도 같은 질문이다
+  assert.equal(judgeServerAnswer(record(sentAt - 30_000), 'COMPLETE', seen).kind, 'answer');
+  // 생성 중이면 기록을 보지 않고 기다린다 — 화면이 끝났다고 해도
+  assert.deepEqual(judgeServerAnswer(null, 'IS_STREAMING', seen), { kind: 'pending' });
+});
+
+test('judgeServerAnswer: 직전 턴의 기록·중간 답·모르는 모양은 판정하지 않는다 (화면 답으로 돌아간다)', () => {
+  const seen = { sentAt, sawStreaming: false };
+  // 이어 쓰는 대화에서 이번 질문이 기록에 오르기 전 — 마지막 질문은 직전 라운드의 것이다
+  assert.equal(judgeServerAnswer(record(sentAt - 5 * 60_000), 'COMPLETE', seen).kind, 'unknown');
+  // 이번 생성을 서버가 생성 중이라고 한 적이 있으면 마지막 턴이 이번 것이다 (전송 시각을 모르는 회수 경로)
+  assert.equal(judgeServerAnswer(record(sentAt - 5 * 60_000), 'COMPLETE', { sentAt: null, sawStreaming: true }).kind, 'answer');
+  assert.equal(judgeServerAnswer(record(sentAt), 'COMPLETE', { sentAt: null, sawStreaming: false }).kind, 'unknown');
+  // 도구 호출 앞의 중간 답·덜 끝난 답
+  assert.equal(judgeServerAnswer(record(sentAt, { end_turn: false }), 'COMPLETE', seen).kind, 'unknown');
+  assert.equal(judgeServerAnswer(record(sentAt, { status: 'in_progress' }), 'COMPLETE', seen).kind, 'unknown');
+  assert.equal(judgeServerAnswer(record(sentAt, { end_turn: undefined, status: undefined }), 'COMPLETE', seen).kind, 'unknown');
+  // 기록의 답도 화면 오류 문구 · 조회 실패
+  assert.equal(judgeServerAnswer(record(sentAt, { content: { content_type: 'text', parts: ['This response couldn’t load'] } }), 'COMPLETE', seen).kind, 'unknown');
+  assert.equal(judgeServerAnswer(null, null, seen).kind, 'unknown');
+});
+
+// 9차가 7차의 답을 게시했던 모양 — 화면은 남의 노드를 끝난 답으로 읽었다.
+test('collectResponse: 화면이 끝났다고 해도 서버가 생성 중이면 받지 않고, 끝나면 서버 기록의 이번 답을 쓴다', async (t) => {
+  let now = sentAt;
+  t.mock.method(Date, 'now', () => now);
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (line: string) => logs.push(line));
+  const driver = new ChatGPTDriver({ ...loadConfig('tests/__missing__.json'), responseTimeoutMs: 25 * 60_000 }) as any;
+  driver.isStreaming = async () => false;
+  driver.interruptedBanner = async () => null;
+  driver.detectQuotaLimit = async () => null;
+  const page = {
+    url: () => 'https://chatgpt.com/g/g-p-6aa1d12d5db88191870747513394cb0e-jadong-pr-ribyu/c/6acd33bf-39f0-83e8-add2-09d48b0af407',
+    waitForTimeout: async (ms: number) => { now += ms; },
+    evaluate: async (_fn: unknown, arg: { path?: string } | null) => !arg?.path
+      ? [u('prev'), a('old'), u('q'), a('a')]
+      : arg.path.endsWith('/stream_status') ? { status: now - sentAt < 90_000 ? 'IS_STREAMING' : 'COMPLETE' } : record(sentAt + 1_000),
+    locator: () => ({ locator: () => ({ count: async () => 1, allInnerTexts: async () => ['화면이 읽은 남의 답'] }) }),
+  };
+  assert.equal(await driver.collectResponse(page, 1, 'prev', 25 * 60_000, sentAt), '```json\n{"summary":"ok"}\n```');
+  assert.ok(now - sentAt >= 90_000, `${now - sentAt}ms`);
+  assert.equal(logs.filter(line => line.includes('서버는 아직 생성 중')).length, 1);
 });

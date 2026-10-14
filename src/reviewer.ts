@@ -989,8 +989,10 @@ async function reclaimRound(
   progress.phase('waiting');
   // 기준점을 findRound 가 준 값으로 넘긴다. 완료 판정(스트리밍 종료 + 안정)은
   // collectResponse 가 하므로, 이미 와 있는 답이면 즉시, 생성 중이면 끝까지 기다린다.
+  // 전송 시각은 서버 기록의 마지막 질문이 이 전송 뒤의 것인지 가르는 데 쓴다 (judgeServerAnswer).
   const raw = await driver.collectFrom(baseline, ctx.pendingSend?.recoverAfter
-    ? Math.min(cfg.responseTimeoutMs, RESPONSE_RECOVERY_WAIT_MS) : cfg.responseTimeoutMs);
+    ? Math.min(cfg.responseTimeoutMs, RESPONSE_RECOVERY_WAIT_MS) : cfg.responseTimeoutMs,
+  Number.isFinite(sentAt) ? sentAt : null);
   const saved = saveResponse(cfg, ctx, round, raw, {
     conversationUrl: url,
     ...targetMeta(sent),
