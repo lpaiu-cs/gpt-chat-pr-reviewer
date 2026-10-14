@@ -58,3 +58,13 @@ test('background delegates to ensure, opens its actual URL once, and supports no
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('global pr-review runs the source, not a possibly stale build', () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const pkg = JSON.parse(execFileSync(process.execPath, ['-p', 'JSON.stringify(require("./package.json"))'], { cwd: root, encoding: 'utf8' }));
+  const bin = pkg.bin['pr-review'];
+  assert.doesNotMatch(bin, /dist\//);
+  assert.ok(pkg.files.includes(bin.replace(/^\.\//, '')));
+  const out = execFileSync(process.execPath, [path.join(root, bin), '--version'], { cwd: root, encoding: 'utf8', windowsHide: true });
+  assert.equal(out.trim(), pkg.version);
+});
