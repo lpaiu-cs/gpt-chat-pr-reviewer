@@ -82,6 +82,25 @@ test('서버 기록을 계속 못 읽으면 화면 글자로 대신하지 않고
   assert.equal(await flaky.collect(), '{"summary":"ok"}');
 });
 
+// #68 리뷰: stream_status 만 429/500 으로 막히고 기록은 읽히는데, 추론이 진행 중이고 생성 요청은 이미 닫혔다.
+// 상태를 못 읽은 것을 COMPLETE 로 보면 60초 뒤 생성 종료로 접어 정상 응답을 버리고 같은 질문을 다시 보낸다.
+test('상태 조회만 실패하면 생성 종료로 단정하지 않는다 — 기록의 답이 끝나면 받고, 끝내 안 끝나면 타임아웃', async (t) => {
+  const unfinished = () => {
+    const r: any = record(sentAt);
+    Object.assign(r.mapping.a.message, { status: 'in_progress', end_turn: false });
+    return r;
+  };
+  const statusDown = (done: (ms: number) => boolean) => (path: string, ms: number) =>
+    path.endsWith('/stream_status') ? null : done(ms) ? record(sentAt) : unfinished();
+
+  const late = rig(t, statusDown(ms => ms >= 5 * 60_000));
+  assert.equal(await late.collect(), '{"summary":"ok"}');
+
+  const never = rig(t, statusDown(() => false), 10 * 60_000);
+  await assert.rejects(never.collect(), ResponseTimeoutError);
+  assert.ok(never.elapsed() >= 10 * 60_000, `${never.elapsed()}ms`);
+});
+
 test('예산이 다 돼도 서버가 생성 중이면 같은 예산을 더 주되, 연장 2회에서 접는다', async (t) => {
   const budget = 25 * 60_000;
   // 실측 39분 (sky-fishing#2, 1.8MB diff) — 25분 예산을 한 번 연장해 받는다.

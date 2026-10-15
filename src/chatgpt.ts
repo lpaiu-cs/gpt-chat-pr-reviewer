@@ -210,7 +210,7 @@ const CONVERSATION_URL_TIMEOUT_MS = 15_000;
 
 /**
  * 아무것도 오고 있지 않은 채 이만큼 지나면 생성이 답 없이 끝난 것으로 본다 (`GenerationEndedError`).
- * "아무것도" = 서버가 생성 중이 아니고, 기록에 이번 질문의 끝난 답이 없고, 생성 요청도 없다.
+ * "아무것도" = 서버가 COMPLETE 라고 하고(조회 실패는 아니다), 기록에 이번 질문의 끝난 답이 없고, 생성 요청도 없다.
  *
  * ChatGPT 에서 생성을 중지하거나 연결이 끊긴 경우가 이 모습이다. 모르면 응답 예산을 통째로
  * 기다린다 — sky-fishing#2 는 본문 0자인 채로 25분 예산 끝까지 기다렸다. 회수 예산(150초) 안에
@@ -1680,7 +1680,7 @@ export class ChatGPTDriver {
    * 그래서 탭과 무관한 타이머로 서버에 묻는다: 생성 중이면 기다리고, 이번 질문의 끝난 답이 기록에
    * 있으면 받는다. 탭이 멎어도 `serverJson` 이 잠깐 연 다른 탭으로 묻는다.
    *
-   *  - 아무것도 오고 있지 않으면(서버 생성 중 아님 · 기록에 이번 답 없음 · 생성 요청 없음)
+   *  - 아무것도 오고 있지 않으면(서버 COMPLETE · 기록에 이번 답 없음 · 생성 요청 없음)
    *    `ENDED_QUIET_MS` 뒤에 `GenerationEndedError` — 한도 배너가 보이면 `QuotaLimitError`.
    *  - 서버 기록을 계속 못 읽으면 `SERVER_UNREAD_LIMIT_MS` 뒤에 실패한다 — 화면 글자로 대신하지 않는다.
    *  - 예산이 다 됐는데 서버가 생성 중이면 같은 예산을 더 준다 (`MAX_RESPONSE_EXTENSIONS`). 끝내 못 받으면
@@ -1733,9 +1733,10 @@ export class ChatGPTDriver {
           + `(대화 ${page.url()}). 로그인·네트워크를 확인하세요.`);
       }
 
-      // 아무것도 오고 있지 않다 — 서버가 생성 중이 아니고, 기록에 이번 답이 없고, 생성 요청도 없다.
-      // ChatGPT 에서 중지·연결 끊김·한도가 이 모습이다.
-      const quiet = !streaming && !unread && this.netInFlight === 0;
+      // 아무것도 오고 있지 않다 — 서버가 COMPLETE 라고 하고, 기록에 이번 답이 없고, 생성 요청도 없다.
+      // ChatGPT 에서 중지·연결 끊김·한도가 이 모습이다. 상태를 못 읽은 것(null)은 COMPLETE 가 아니다 —
+      // stream_status 만 막힌 채 추론이 진행 중이면 끝난 것으로 접어 정상 응답을 버린다 (#68 리뷰).
+      const quiet = status === 'COMPLETE' && !unread && this.netInFlight === 0;
       quietSince = quiet ? (quietSince ?? Date.now()) : null;
       if (!streaming && Date.now() - lastQuotaCheckAt >= QUOTA_RECHECK_MS) {
         lastQuotaCheckAt = Date.now();
