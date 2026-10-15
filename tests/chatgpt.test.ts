@@ -3,62 +3,18 @@ import assert from 'node:assert/strict';
 import { parseGPTResponse } from '../src/parser.js';
 import { loadConfig } from '../src/config.js';
 import {
-  anchorAnswer,
   ChatGPTDriver,
   findRoundBaseline,
   judgePromptSent,
-  judgeRebind,
   judgeRevival,
   judgeStuckButton,
   isOwnDraft,
-  isUnloadedAnswer,
-  pickServerAnswer,
-  matchInterrupt,
+  judgeServerAnswer,
   type MessageRef,
 } from '../src/chatgpt.js';
 
 const u = (id: string): MessageRef => ({ role: 'user', id });
 const a = (id: string): MessageRef => ({ role: 'assistant', id });
-
-test('anchorAnswer: 마지막 질문 뒤의 첫 응답을 가리킨다', () => {
-  const got = anchorAnswer([u('u1'), a('a1'), u('u2'), a('a2')]);
-  assert.deepEqual(got, { status: 'ready', id: 'a2', userId: 'u2', nth: 1 });
-});
-
-test('anchorAnswer: 답 노드가 아직 없으면 pending — 직전 응답으로 물러서지 않는다', () => {
-  const got = anchorAnswer([u('u1'), a('a1'), u('u2')]);
-  assert.deepEqual(got, { status: 'pending', userId: 'u2', nth: 1 });
-});
-
-test('anchorAnswer: 우리 질문이 아직 안 그려졌으면 직전 턴에 고정하지 않는다', () => {
-  // 전송 직후의 화면 — 마지막 질문이 아직 전송 전의 그것이다.
-  const screen = [u('u1'), a('a1'), u('u2'), a('a2')];
-  assert.equal(anchorAnswer(screen, 'u2').status, 'pending');
-  // 우리 질문이 그려지면 그때 고정한다.
-  assert.deepEqual(anchorAnswer([...screen, u('u3'), a('a3')], 'u2'), {
-    status: 'ready',
-    id: 'a3',
-    userId: 'u3',
-    nth: 2,
-  });
-});
-
-test('anchorAnswer: 사용자 메시지가 없으면 unknown', () => {
-  assert.deepEqual(anchorAnswer([a('a1')]), { status: 'unknown' });
-  assert.deepEqual(anchorAnswer([]), { status: 'unknown' });
-});
-
-test('anchorAnswer: 화면 밖 메시지가 떨어져 나가도 현재 화면 기준 위치를 준다', () => {
-  // 전송 시점에는 어시스턴트가 3건이었지만(nth=3), 위쪽 두 턴이 떨어져 나간 화면.
-  // 여기서 전송 시점 값(3)을 그대로 쓰면 아무 노드도 가리키지 못해 "0자" 로 굳는다.
-  const got = anchorAnswer([a('a3'), u('u4'), a('a4')]);
-  assert.deepEqual(got, { status: 'ready', id: 'a4', userId: 'u4', nth: 1 });
-});
-
-test('anchorAnswer: id 가 없어도 위치는 준다', () => {
-  const got = anchorAnswer([u('u1'), { role: 'assistant', id: null }]);
-  assert.deepEqual(got, { status: 'ready', id: null, userId: 'u1', nth: 0 });
-});
 
 // ── 전송 확인 ──────────────────────────────────────────────
 
@@ -94,76 +50,6 @@ test('verifyPromptSent: 질문 노드로 못 가르면 입력창이 비었는지
   assert.equal(await sent(), false);
 });
 
-// ── 노드 교체 판정 ─────────────────────────────────────────
-
-const bound = { id: 'a2', userId: 'u2', nth: 1 };
-
-test('judgeRebind: 노드가 그대로면 그대로 읽는다', () => {
-  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2'), a('a2')], bound), { action: 'keep' });
-});
-
-test('judgeRebind: 같은 질문의 답이면 새 식별자로 다시 고정한다', () => {
-  // ChatGPT 가 임시 식별자(a2)로 그린 답 노드를 서버 식별자(srv-9)로 갈아 끼운 화면.
-  const got = judgeRebind([u('u1'), a('a1'), u('u2'), a('srv-9')], bound);
-  assert.deepEqual(got, { action: 'rebind', id: 'srv-9' });
-});
-
-test('judgeRebind: 앵커가 직전 턴으로 물러섰으면 따라가지 않는다', () => {
-  // 우리 질문(u2)이 화면 밖으로 밀려난 화면 — 여기서 a1 로 갈아타면 직전 라운드의
-  // 답을 이번 응답으로 게시하게 된다.
-  const got = judgeRebind([u('u1'), a('a1')], bound);
-  assert.deepEqual(got, { action: 'hold', reason: 'turn-moved' });
-});
-
-test('judgeRebind: 판별할 화면이 없으면 유예한다', () => {
-  assert.deepEqual(judgeRebind([], bound), { action: 'hold', reason: 'anchor-unknown' });
-});
-
-test('judgeRebind: 같은 질문의 답이 아직 없으면 기다린다 (18차 실패 경로)', () => {
-  // 추론 중 답 노드가 지워진 화면. 우리 질문(u2)이 여전히 마지막이므로 대기다 —
-  // 여기서 실패로 접으면, 같은 화면을 두고 고정 전에는 기다리고 고정 후에는
-  // 버리는 모순이 된다.
-  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2')], bound), { action: 'wait' });
-  // 식별자가 아직 안 붙은 답 노드도 같다 — 붙으면 그때 다시 고정한다.
-  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2'), { role: 'assistant', id: null }], bound), {
-    action: 'wait',
-  });
-});
-
-test('judgeRebind: 다른 질문이 마지막이면 그 답을 기다리지 않는다', () => {
-  // 우리 질문 뒤에 다른 질문이 들어온 화면 — 그 답은 우리 것이 아니다.
-  assert.deepEqual(judgeRebind([u('u1'), a('a1'), u('u2'), u('u3')], bound), {
-    action: 'hold',
-    reason: 'turn-moved',
-  });
-});
-
-test('judgeRebind: 질문에 식별자가 없으면 위치로 대조한다', () => {
-  const noId = { id: 'a2', userId: null, nth: 1 };
-  assert.deepEqual(
-    judgeRebind([{ role: 'user', id: null }, a('a1'), { role: 'user', id: null }, a('srv-9')], noId),
-    { action: 'rebind', id: 'srv-9' },
-  );
-  // 뒤로 물러선 앵커는 언제나 더 작은 nth 를 낸다 — 그래서 위치 대조로도 갈린다.
-  assert.deepEqual(judgeRebind([{ role: 'user', id: null }, a('a1')], noId), {
-    action: 'hold',
-    reason: 'turn-moved',
-  });
-});
-
-test('anchorAnswer 의 nth 는 findRoundBaseline 과 같은 기준이다', () => {
-  const msgs = [
-    { role: 'user', id: 'u1', text: '리뷰 라운드: 1차' },
-    { role: 'assistant', id: 'a1', text: '…' },
-    { role: 'user', id: 'u2', text: '리뷰 라운드: 2차' },
-    { role: 'assistant', id: 'a2', text: '…' },
-  ];
-  const baseline = findRoundBaseline(msgs, '리뷰 라운드: 2차');
-  const anchor = anchorAnswer(msgs);
-  assert.equal(anchor.status, 'ready');
-  assert.equal(baseline, anchor.status === 'ready' ? anchor.nth : -1);
-});
-
 test('재개 문구 대신 최신 답의 리뷰 형식과 대상으로 회수 여부를 판단한다', () => {
   const question = { role: 'user', text: '리뷰 라운드: 1차' };
   const head = 'a'.repeat(40), base = 'b'.repeat(40);
@@ -195,7 +81,7 @@ test('재개 문구 대신 최신 답의 리뷰 형식과 대상으로 회수 �
 // 관측: 응답은 392초에 1,014자로 완성됐는데 stop-button 이 visible·enabled 로
 // DOM 에 남아 완료 조건이 성립하지 않았고, 25분 예산을 태운 뒤 완성된 리뷰를
 // 버렸다. 아래는 그 경로를 끊되, 이슈 #1(조기 절단)을 되살리지 않는다는 계약이다.
-// collectResponse 와 waitUntilIdle 이 같은 조건을 쓴다.
+// 전송 전 가드(waitUntilIdle)가 이 조건을 쓴다.
 
 /** 관측된 그 순간의 신호 — 생성은 끝났고 네트워크도 오래 조용했다. */
 const stuck = {
@@ -238,11 +124,11 @@ test('collectResponse: 탭이 멎으면 서버 기록의 답을 받고, 그 탭�
   t.mock.method(console, 'log', () => {});
   const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
   driver.preparePage = async () => {};
-  // 이번 생성을 IS_STREAMING 으로 본 뒤의 COMPLETE 만 믿는다 — 첫 COMPLETE 를 직전 턴의 것으로 두지 않게.
-  const statuses = ['COMPLETE', 'IS_STREAMING', 'COMPLETE'];
+  const statuses = ['IS_STREAMING', 'COMPLETE'];
   const conv = { current_node: 'a', mapping: {
     u: { message: { author: { role: 'user' } } },
-    a: { parent: 'u', message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['{"summary":"ok"}'] } } },
+    a: { parent: 'u', message: { author: { role: 'assistant' }, status: 'finished_successfully', end_turn: true,
+      content: { content_type: 'text', parts: ['{"summary":"ok"}'] } } },
   } };
   const hung = new Promise<never>(() => {});
   let probes = 0;
@@ -262,8 +148,9 @@ test('collectResponse: 탭이 멎으면 서버 기록의 답을 받고, 그 탭�
       },
     }),
   };
+  driver.page = page;
   let answer: string | undefined;
-  const collecting = driver.collectResponse(page, 0, null).then((a: string) => { answer = a; });
+  const collecting = driver.collectFrom(25 * 60_000, { askedBefore: 'prev' }).then((a: string) => { answer = a; });
   for (let i = 0; i < 200 && answer === undefined; i++) {
     await new Promise(setImmediate);
     t.mock.timers.tick(5_000);
@@ -302,50 +189,6 @@ test('judgeRevival: 빌려 쓴 브라우저는 내가 다시 띄우지 않는다
   assert.equal(judgeRevival({ ctxAlive: false, pageAlive: false, owned: false }), 'give-up');
 });
 
-
-// ── 연결 중단 배너 ──────────────────────────────────────────
-//
-// 이 판정은 **라운드를 통째로 버린다**. 게다가 매치한 문자열이 대화 본문에 있으면
-// 새로고침해도 남으므로 복구 3회가 전부 즉시 실패하고, 재시도도 같은 자리에서
-// 같은 이유로 죽는다 — 되살아날 길이 없는 고착이다. 실제로 그렇게 두 PR 이 24회
-// 연속 실패했다. 그래서 오탐 쪽으로 기운 패턴은 여기서 막는다.
-
-test('matchInterrupt: 진짜 배너 문구는 잡는다', () => {
-  assert.equal(
-    matchInterrupt('Connection interrupted. Reload the page.'),
-    'Connection interrupted',
-  );
-  assert.equal(
-    matchInterrupt('...waiting for the complete answer...'),
-    'waiting for the complete answer',
-  );
-  assert.equal(matchInterrupt('연결이 중단되었습니다. 다시 시도하세요.'), '연결이 중단되었습니다');
-  // 2026-10 화면의 실측 문구 — 두 문장 중 어느 쪽만 보여도 잡는다.
-  assert.equal(matchInterrupt('연결이 해제되었습니다. 전체 답변을 기다리는 중입니다.'), '연결이 해제되었습니다');
-  assert.equal(matchInterrupt('… 전체 답변을 기다리는 중입니다.'), '전체 답변을 기다리는 중');
-});
-
-test('matchInterrupt: 리뷰 본문에 나올 법한 평범한 문장은 잡지 않는다', () => {
-  // 실패한 PR 이 정확히 이 주제였다 — "완전한 응답을 기다리지 않는다" 가 변경의 요지였고,
-  // 그걸 한국어로 리뷰하면 아래 같은 문장이 나온다.
-  for (const prose of [
-    'API 완전한 응답을 기다려야 하므로 지연이 생깁니다.',
-    '소켓 연결이 끊기면 재연결을 시도하세요.',
-    '연결이 중단될 때의 복구 경로가 없습니다.',
-    '완전한 답변을 기다리는 대신 스트리밍으로 바꾸는 편이 낫습니다.',
-    '세션 연결이 해제되면 재시도하세요.',
-    '전체 답변을 기다리지 않고 부분 응답을 그대로 씁니다.',
-    'The client keeps waiting for the complete response before rendering.',
-  ]) {
-    assert.equal(matchInterrupt(prose), null, prose);
-  }
-});
-
-test('matchInterrupt: 걸린 문구를 그대로 돌려준다 (오탐 진단의 유일한 근거)', () => {
-  const hit = matchInterrupt('앞부분 blah Connection Interrupted 뒷부분');
-  assert.equal(hit, 'Connection Interrupted'); // 원문 대소문자 그대로
-});
-
 test('isOwnDraft: 우리가 넣다 만 리뷰 프롬프트만 지울 대상으로 본다', () => {
   const template = loadConfig('tests/__missing__.json').promptTemplate;
   const head = template.split('{{')[0];
@@ -362,29 +205,59 @@ test('isOwnDraft: 우리가 넣다 만 리뷰 프롬프트만 지울 대상으�
   assert.equal(isOwnDraft('짧은 머리말 뒤 사람 글', [], '짧은 {{url}}'), false);
 });
 
-test('isUnloadedAnswer: 답 자리의 화면 오류 문구만 알아본다', () => {
-  assert.equal(isUnloadedAnswer('This response couldn’t load'), true);
-  assert.equal(isUnloadedAnswer(" This response couldn't load. \n"), true);
-  assert.equal(isUnloadedAnswer('{"summary":"This response couldn’t load"}'), false);
+// 서버 기록 우선 (2026-10-15 실측 모양: 질문 create_time · 도구 호출·결과·추론 노드 · 최종 답 end_turn)
+const sentAt = Date.parse('2026-10-14T22:20:58Z');
+const record = (askedAt: number, final: Record<string, unknown> = {}, q = 'q') => ({
+  current_node: 'a',
+  mapping: {
+    root: { parent: null, message: null },
+    [q]: { parent: 'root', message: { author: { role: 'user' }, recipient: 'all', status: 'finished_successfully', create_time: askedAt / 1000,
+      content: { content_type: 'text', parts: ['당신은 코드 리뷰어입니다.\\n\\n\## 대상 PR'] } } },
+    call: { parent: q, message: { author: { role: 'assistant' }, recipient: 'api_tool.call_tool', status: 'finished_successfully', end_turn: false,
+      content: { content_type: 'code', parts: [] } } },
+    out: { parent: 'call', message: { author: { role: 'tool' }, recipient: 'all', content: { content_type: 'multimodal_text', parts: ['Page: turn21'] } } },
+    think: { parent: 'out', message: { author: { role: 'assistant' }, recipient: 'all', end_turn: false, content: { content_type: 'thoughts', parts: [] } } },
+    a: { parent: 'think', message: { author: { role: 'assistant' }, recipient: 'all', status: 'finished_successfully', end_turn: true,
+      content: { content_type: 'text', parts: ['```json\n{"summary":"ok"}\n```'] }, ...final } },
+  },
 });
 
-test('pickServerAnswer: 현재 가지에서 마지막 질문 뒤의 최종 답만 고른다', () => {
-  const msg = (role: string, text: string, extra: Record<string, unknown> = {}) =>
-    ({ author: { role }, recipient: 'all', content: { content_type: 'text', parts: [text] }, ...extra });
-  const conv = {
-    current_node: 'a2',
-    mapping: {
-      u1: { parent: null, message: msg('user', '1차 질문') },
-      a1: { parent: 'u1', message: msg('assistant', '1차 답') },
-      u2: { parent: 'a1', message: msg('user', '2차 질문') },
-      t2: { parent: 'u2', message: { author: { role: 'assistant' }, content: { content_type: 'thoughts', parts: [] } } },
-      c2: { parent: 't2', message: msg('assistant', 'python(...)', { recipient: 'python' }) },
-      a2: { parent: 'c2', message: msg('assistant', '{"summary":"ok"}') },
-      old: { parent: 'u2', message: msg('assistant', '다시 생성되기 전 옛 답') },
-    },
-  };
-  assert.equal(pickServerAnswer(conv), '{"summary":"ok"}');
-  // 마지막 질문 뒤에 답이 아직 없으면 직전 라운드의 답으로 물러서지 않는다
-  assert.equal(pickServerAnswer({ ...conv, current_node: 't2' }), null);
-  assert.equal(pickServerAnswer({}), null);
+test('judgeServerAnswer: 보내기 전 마지막 질문 뒤의 끝난 답만 답으로 인정한다', () => {
+  const ok = { kind: 'answer', text: '```json\n{"summary":"ok"}\n```' };
+  // 이어 쓰는 대화 — 기록의 마지막 질문(q)이 보내기 전의 그것(prev)이 아니다
+  assert.deepEqual(judgeServerAnswer(record(sentAt + 2_000), 'COMPLETE', { askedBefore: 'prev' }), ok);
+  // 새 대화 — 보내기 전에는 질문이 없었다
+  assert.deepEqual(judgeServerAnswer(record(sentAt), 'COMPLETE', { askedBefore: null }), ok);
+  // 생성 중이면 기록을 보지 않고 기다린다
+  assert.deepEqual(judgeServerAnswer(null, 'IS_STREAMING', { askedBefore: 'prev' }), { kind: 'pending' });
+  // 구버전 기록(기준 id 없음)의 회수 — 전송 시각으로 가른다 (서버 시계가 조금 늦어도 같은 질문)
+  assert.deepEqual(judgeServerAnswer(record(sentAt - 30_000), 'COMPLETE', { sentAt }), ok);
+  assert.equal(judgeServerAnswer(record(sentAt - 5 * 60_000), 'COMPLETE', { sentAt }).kind, 'unknown');
+  assert.equal(judgeServerAnswer(record(sentAt), 'COMPLETE', {}).kind, 'unknown');
+});
+
+// #68 리뷰: 앞 라운드가 빨리 끝나 직전 질문이 30초 전에 나갔고, 전송 직후의 상태 API·기록은 아직 직전 턴의
+// COMPLETE·끝난 답이다. 시각 여유(60초)나 "생성 중을 봤다" 로 가르면 직전 답을 이번 답으로 게시한다.
+test('judgeServerAnswer: 1분 안에 나간 직전 질문의 끝난 답을 이번 답으로 받지 않는다', () => {
+  const previous = record(sentAt - 30_000, {}, 'prev');
+  assert.equal(judgeServerAnswer(previous, 'COMPLETE', { askedBefore: 'prev', sentAt }).kind, 'unknown');
+});
+
+test('judgeServerAnswer: 중간 답·덜 끝난 답·조회 실패는 답으로 보지 않는다', () => {
+  const seen = { askedBefore: 'prev' };
+  // 도구 호출 앞의 중간 답·덜 끝난 답
+  assert.equal(judgeServerAnswer(record(sentAt, { end_turn: false }), 'COMPLETE', seen).kind, 'unknown');
+  assert.equal(judgeServerAnswer(record(sentAt, { status: 'in_progress' }), 'COMPLETE', seen).kind, 'unknown');
+  assert.equal(judgeServerAnswer(record(sentAt, { end_turn: undefined, status: undefined }), 'COMPLETE', seen).kind, 'unknown');
+  // 조회 실패
+  assert.equal(judgeServerAnswer(null, null, seen).kind, 'unknown');
+});
+
+test('serverLastQuestion: 이어 쓰는 대화의 기록을 못 읽으면 보내지 않는다 — 새 대화는 기준이 null', async () => {
+  const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
+  const tab = (url: string, conv: unknown) => ({ url: () => url, evaluate: async () => conv });
+  const chat = 'https://chatgpt.com/g/g-p-1234/c/6acd33bf-39f0-83e8-add2-09d48b0af407';
+  assert.equal(await driver.serverLastQuestion(tab('https://chatgpt.com/g/g-p-1234/project', null)), null);
+  assert.equal(await driver.serverLastQuestion(tab(chat, record(sentAt))), 'q');
+  await assert.rejects(driver.serverLastQuestion(tab(chat, null)), /보내지 않습니다/);
 });

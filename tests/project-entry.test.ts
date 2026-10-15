@@ -118,8 +118,20 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
   const page = await browser.newPage();
   const entry = { url: 'https://chatgpt.com/g/g-p-1234/project', name: 'Reviews' };
   let deepLoads = 0;
+  const auth: string[] = [];
   await page.route('https://chatgpt.com/**', async (route) => {
-    if (new URL(route.request().url()).pathname !== '/') {
+    const path = new URL(route.request().url()).pathname;
+    // 답은 서버 기록에서 받는다 — 페이지 안의 fetch 가 세션 토큰을 받아 Bearer 로 묻는다.
+    if (path === '/api/auth/session') return route.fulfill({ json: { accessToken: 'token' } });
+    if (path.startsWith('/backend-api/conversation/abcd')) {
+      auth.push(route.request().headers().authorization ?? '');
+      return route.fulfill({ json: path.endsWith('/stream_status') ? { status: 'COMPLETE' } : { current_node: 'a2', mapping: {
+        u2: { message: { author: { role: 'user' }, create_time: Date.now() / 1000, content: { content_type: 'text', parts: ['리뷰 라운드: 2차'] } } },
+        a2: { parent: 'u2', message: { author: { role: 'assistant' }, recipient: 'all', status: 'finished_successfully', end_turn: true,
+          content: { content_type: 'text', parts: ['{"summary":"ok"}'] } } },
+      } } });
+    }
+    if (path !== '/') {
       deepLoads++;
       return route.fulfill({ status: 500, body: 'Try again' });
     }
@@ -141,17 +153,10 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
     assert.equal(await driver.countUserMessages(page), 2);
     const baseline = await driver.findRound('리뷰 라운드: 2차');
     assert.equal(baseline, 1);
-    page.waitForTimeout = async () => {}; // 폴링 간격만 없앤다 — 판정은 실제 화면으로 한다
-    assert.equal(await driver.collectFrom(baseline, 60_000), '{"summary":"ok"}');
+    assert.equal(await driver.collectFrom(60_000, { askedBefore: 'u1' }), '{"summary":"ok"}');
+    assert.deepEqual(auth, ['Bearer token', 'Bearer token']);
 
-    // 생성 중인 답은 식별자도 턴 키 조상도 없다(실측) — 우리가 찍은 표식으로 고정해야
-    // 위치 읽기의 축소 오인을 피한다. 같은 노드면 표식이 유지되고, 다시 그려지면 새로 찍힌다.
-    await page.evaluate(() => {
-      const unit = document.querySelector('[data-chatgpt-search-message-ids^="a2"]')!;
-      unit.setAttribute('data-chatgpt-search-message-ids', '');
-      unit.closest('[data-turn-key]')!.removeAttribute('data-turn-key');
-    });
-    const { readMessagesInPage, messageByIdSelector, readComposerInPage } = await import('../src/chatgpt.js');
+    const { readComposerInPage } = await import('../src/chatgpt.js');
 
     // 줄 중간 URL 이 링크 위젯이 되면 innerText 는 아이콘 자리에 줄바꿈을 그린다(platelog#3 실측).
     // 검증은 장식을 뺀 글자로 한다.
@@ -159,17 +164,10 @@ test('실제 Chrome: 개편 화면에서 진입·대화 복귀·라운드 찾기
     await editor.evaluate((el) => { el.innerHTML = '<p>로컬 (<span data-rich-text-generated-autolink=""><span aria-hidden="true" contenteditable="false" style="display:block">⊕</span>http://10.0.2.2:54321</span>, 디버그)<br>다음 줄<br class="ProseMirror-trailingBreak"></p>'; });
     assert.notEqual((await editor.innerText()).split('\n')[0], '로컬 (http://10.0.2.2:54321, 디버그)', 'innerText 는 줄을 가른다');
     assert.equal(await editor.evaluate(readComposerInPage), '로컬 (http://10.0.2.2:54321, 디버그)\n다음 줄\n');
-    await editor.evaluate((el) => { el.innerHTML = ''; });
-    const first = (await page.evaluate(readMessagesInPage, null)).at(-1)!;
-    assert.match(first.id!, /^anchor-/);
-    assert.equal((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '같은 노드는 같은 표식');
-    assert.equal(await page.locator(messageByIdSelector(first.id!)).innerText(), 'ChatGPT said:\n{"summary":"ok"}');
-    await page.evaluate(() => { const u = document.querySelector('[data-pr-review-anchor]')!; u.replaceWith(u.cloneNode(true) as Element); document.querySelector('[data-pr-review-anchor]')!.removeAttribute('data-pr-review-anchor'); });
-    assert.notEqual((await page.evaluate(readMessagesInPage, null)).at(-1)!.id, first.id, '다시 그린 노드는 새 표식');
   } finally { await browser.close(); }
 });
 
-test('실제 Chrome: 재개 답의 모든 본문 블록을 검증하고 생성 중이면 완료까지 수집한다', async () => {
+test('실제 Chrome: 재개 답의 모든 본문 블록으로 회수 여부를 가리고, 생성 중이면 기다리게 한다', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   const page = await browser.newPage();
   try {
@@ -182,7 +180,6 @@ test('실제 Chrome: 재개 답의 모든 본문 블록을 검증하고 생성 �
     };
     const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
     driver.page = page;
-    page.waitForTimeout = async () => {};
     for (const legacy of [true, false]) {
       const attrs = (role: string, id: string) => legacy
         ? `data-message-author-role="${role}" data-message-id="${id}"`
@@ -192,7 +189,6 @@ test('실제 Chrome: 재개 답의 모든 본문 블록을 검증하고 생성 �
         <div class="markdown">리뷰를 이어서 완료했습니다.</div><div class="markdown" id="answer">${raw}</div></div>`);
       driver.isStreaming = async () => false;
       assert.equal(await driver.findRound(marker, true, accept), 1);
-      assert.equal(await driver.collectFrom(1, 60_000), `리뷰를 이어서 완료했습니다.\n${raw}`);
       await page.locator('.markdown').evaluateAll(els => els.forEach(el => { el.textContent = ''; }));
       assert.equal(await driver.findRound(marker, true, accept), null, '끝난 빈 답은 기다리지 않는다');
       driver.isStreaming = async () => true;
@@ -201,25 +197,6 @@ test('실제 Chrome: 재개 답의 모든 본문 블록을 검증하고 생성 �
       driver.stallEvidence = () => 'network-quiet';
       assert.equal(await driver.findRound(marker, true, accept), null, '중지 버튼만 남은 고장으로 기다리지 않는다');
     }
-  } finally { await browser.close(); }
-});
-
-test('실제 Chrome: 위치로 읽는 답이 완료 때 같은 노드에서 줄어도 받아들인다', async () => {
-  // 실측(platelog#3): 새 대화의 생성 중 화면에서는 질문을 못 읽어 답 위치를 전송 시점 기준으로
-  // 읽었고, 완료 때 코드블록을 다시 그리며 977→963자로 줄자 "다른 노드" 로 보고 라운드를 버렸다.
-  const browser = await chromium.launch({ channel: 'chrome', headless: true });
-  const page = await browser.newPage();
-  try {
-    await page.setContent('<main><div data-chatgpt-search-unit-key="t:2:assistant"><div data-chatgpt-selection-message-id="a">```json {"summary":"ok"} ```</div></div></main>');
-    const driver = new ChatGPTDriver(loadConfig('tests/__missing__.json')) as any;
-    driver.page = page;
-    driver.isStreaming = async () => false;
-    // 질문이 안 보이는 화면이다 — 앵커를 못 잡아 위치로 물러선다.
-    let polls = 0;
-    page.waitForTimeout = async () => {
-      if (++polls === 5) await page.locator('[data-chatgpt-selection-message-id]').evaluate((el) => { el.textContent = '{"summary":"ok"}'; });
-    };
-    assert.equal(await driver.collectFrom(0, 60_000), '{"summary":"ok"}');
   } finally { await browser.close(); }
 });
 
