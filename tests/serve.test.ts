@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -67,4 +67,26 @@ test('global pr-review runs the source, not a possibly stale build', () => {
   assert.ok(pkg.files.includes(bin.replace(/^\.\//, '')));
   const out = execFileSync(process.execPath, [path.join(root, bin), '--version'], { cwd: root, encoding: 'utf8', windowsHide: true });
   assert.equal(out.trim(), pkg.version);
+});
+
+// #69 리뷰: `npm ci --omit=dev` 체크아웃에는 src 와 dist 가 다 있는데 tsx(개발 의존성)가 없다.
+test('global pr-review falls back to the build, with a warning, when tsx is not installed', (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'pr-review-bin-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // tsx 를 찾을 수 있는 곳이면(상위 node_modules) 이 상황을 만들 수 없다
+  for (let d = dir; ; d = path.dirname(d)) {
+    if (existsSync(path.join(d, 'node_modules', 'tsx'))) return t.skip(`tsx resolvable from ${d}`);
+    if (path.dirname(d) === d) break;
+  }
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  for (const [file, body] of [['src/cli.ts', 'console.log("src")'], ['dist/cli.js', 'console.log("dist")']]) {
+    mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    writeFileSync(path.join(dir, file), body);
+  }
+  mkdirSync(path.join(dir, 'scripts'));
+  copyFileSync(path.join(root, 'scripts', 'pr-review.mjs'), path.join(dir, 'scripts', 'pr-review.mjs'));
+  const run = spawnSync(process.execPath, [path.join(dir, 'scripts', 'pr-review.mjs')], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout.trim(), 'dist');
+  assert.match(run.stderr, /tsx 가 없어 소스 대신 빌드\(dist\)를 실행합니다/);
 });
